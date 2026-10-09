@@ -35,6 +35,43 @@ surprisingly well, most of the time.
 How the family actually works is in [`DESIGN.md`](DESIGN.md), for the
 grown-ups.
 
+## Feeding time
+
+The whole API, in one sitting:
+
+```python
+import yaml
+import resbie
+
+# Every knob with its default. The only thing it can't guess is where the
+# LiDAR sits on the IMU (LiDAR -> IMU, rotation row-major).
+config = resbie.DEFAULT_CONFIG | {
+    "calibration": {"translation": [0.0, 0.0, 0.1], "rotation": [1, 0, 0, 0, 1, 0, 0, 0, 1]}
+}
+yaml.safe_dump(config, open("resbie.yaml", "w"))
+
+baby = resbie.Resbie("resbie.yaml", map_point_stride=10)  # keep every 10th point for a map
+
+for msg in my_time_ordered_sensor_stream():  # bring your own sensors
+    if msg.is_imu:
+        baby.push_imu(msg.stamp, msg.acceleration, msg.angular_velocity)
+    else:  # stamp = earliest point; times relative to it (honest ones, please)
+        baby.push_lidar(msg.stamp, msg.points_xyzi, msg.relative_times)
+    print(baby.latest_pose())  # [t, x, y, z, qx, qy, qz, qw], or None while it's waking up
+
+baby.finish()  # bedtime: the last few sweeps get their poses
+
+poses = baby.trajectory()              # (N, 8), one pose per sweep
+keyframes = baby.keyframe_trajectory()  # loop-closed keyframes, if loop_closure.enable
+scans = baby.drain_map_scans()         # [(stamp, (M, 4) xyzi)] deskewed, to build a map
+diag = baby.sweep_diagnostics()        # how it felt about each sweep:
+print(resbie.DIAGNOSTIC_COLUMNS)       #   points matched, IMU-only updates, sigma, ...
+print(baby.status())                   # counters, biases, loop closures
+```
+
+Every call is synchronous: when a push returns, the thinking is done, and
+the same input always gives the same output.
+
 ## Raise one yourself
 
 Ask your coding agent of choice. resbie was raised by one, so it will

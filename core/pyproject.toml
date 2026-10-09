@@ -1,0 +1,28 @@
+[build-system]
+requires = ["scikit-build-core>=0.9", "pybind11>=2.11"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "resbie-offline"
+version = "0.1.0"
+description = "RESPLE's B-spline LiDAR-inertial filter on BIEVR's bump-image map"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.scikit-build]
+cmake.build-type = "RelWithDebInfo"
+install.strip = false
+wheel.packages = ["python/resbie"]
+
+[tool.uv]
+cache-keys = [
+  { file = "cpp/**" },
+  { file = "vendor/**" },
+  { file = "CMakeLists.txt" },
+  { git = { commit = true } },
+]

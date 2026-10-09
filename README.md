@@ -5,7 +5,7 @@
 > **RES**(PLE) + **BIE**(VR) = resbie. Nobody asked for this baby, and it's
 > here anyway.
 
-Two LiDAR-inertial odometry frameworks met in a vendor folder:
+Two LiDAR-inertial odometry frameworks met in a [vendor folder](https://github.com/cosama/resbie/tree/main/core/vendor):
 
 - **[RESPLE](https://github.com/ASIG-X/RESPLE)**: a continuous-time B-spline
   filter, the parent who keeps walking in the dark. Take away its points and

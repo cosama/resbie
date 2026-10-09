@@ -304,8 +304,79 @@ class Resbie {
 
 }  // namespace
 
+// Every default, as the nested dict a YAML config file would hold. The
+// single source of defaults; resbie.DEFAULT_CONFIG is this.
+py::dict defaultConfig() {
+  const resbie::Config c;
+  const bievr::LoopCloser::Config lc;
+  const auto vec = [](const Eigen::Vector3d& v) { return std::vector<double>{v.x(), v.y(), v.z()}; };
+  py::dict d;
+  d["calibration"] = py::dict(py::arg("translation") = std::vector<double>{0, 0, 0},
+                              py::arg("rotation") = std::vector<double>{1, 0, 0, 0, 1, 0, 0, 0, 1});
+  d["lidar"] = py::dict(py::arg("min_range_m") = c.min_range, py::arg("max_range_m") = c.max_range,
+                        py::arg("time_offset_s") = c.time_offset);
+  d["imu"] = py::dict(py::arg("normalized") = c.imu_normalized,
+                      py::arg("acc_noise_std") = vec(c.acc_noise_std),
+                      py::arg("gyro_noise_std") = vec(c.gyro_noise_std),
+                      py::arg("acc_bias_init_std") = vec(c.acc_bias_init_std),
+                      py::arg("gyro_bias_init_std") = vec(c.gyro_bias_init_std),
+                      py::arg("acc_bias_walk") = c.acc_bias_walk,
+                      py::arg("gyro_bias_walk") = c.gyro_bias_walk);
+  d["spline"] = py::dict(py::arg("knot_hz") = c.knot_hz, py::arg("iterations") = c.iterations,
+                         py::arg("init_std") = c.init_std, py::arg("pos_noise") = c.pos_noise,
+                         py::arg("ort_noise") = c.ort_noise,
+                         py::arg("new_pos_noise") = c.new_pos_noise,
+                         py::arg("new_ort_noise") = c.new_ort_noise);
+  d["points"] = py::dict(py::arg("downsample_m") = c.downsample,
+                         py::arg("informed_voxels") = c.informed_voxels,
+                         py::arg("per_update") = c.per_update,
+                         py::arg("noise_std_m") = c.point_noise_std,
+                         py::arg("huber_delta_m") = c.association.huber_delta,
+                         py::arg("gate_sigma") = c.gate_sigma);
+  d["map"] = py::dict(py::arg("pixel_size_m") = c.map.px_size,
+                      py::arg("voxel_size_m") = c.map.voxel_size,
+                      py::arg("normal_tolerance_deg") = c.map.norm_tol_deg,
+                      py::arg("smooth") = c.map.smooth, py::arg("weighted") = c.map.weighted,
+                      py::arg("max_size") = c.map.max_size,
+                      py::arg("init_min_voxels") = c.init_min_voxels);
+  const auto& sc = lc.scan_context;
+  d["loop_closure"] = py::dict(
+      py::arg("enable") = bievr::LoopClosureConfig{}.enable,
+      py::arg("max_speed_mps") = c.loop_closure_max_speed_mps,
+      py::arg("keyframe_meter_gap") = lc.keyframe_meter_gap,
+      py::arg("keyframe_deg_gap") = lc.keyframe_deg_gap,
+      py::arg("keyframe_filter_size") = lc.keyframe_filter_size,
+      py::arg("icp_filter_size") = lc.icp_filter_size, py::arg("sc_num_rings") = sc.num_rings,
+      py::arg("sc_num_sectors") = sc.num_sectors, py::arg("sc_max_radius") = sc.max_radius,
+      py::arg("sc_lidar_height") = sc.lidar_height,
+      py::arg("sc_num_exclude_recent") = sc.num_exclude_recent,
+      py::arg("sc_num_candidates") = sc.num_candidates,
+      py::arg("sc_search_ratio") = sc.search_ratio,
+      py::arg("sc_dist_threshold") = sc.dist_threshold,
+      py::arg("sc_tree_making_period") = sc.tree_making_period,
+      py::arg("history_keyframe_search_num") = lc.history_keyframe_search_num,
+      py::arg("icp_max_correspondence_distance") = lc.icp_max_correspondence_distance,
+      py::arg("icp_max_iterations") = lc.icp_max_iterations,
+      py::arg("icp_transformation_epsilon") = lc.icp_transformation_epsilon,
+      py::arg("icp_euclidean_fitness_epsilon") = lc.icp_euclidean_fitness_epsilon,
+      py::arg("icp_ransac_iterations") = lc.icp_ransac_iterations,
+      py::arg("loop_fitness_score_threshold") = lc.loop_fitness_score_threshold,
+      py::arg("use_sc_yaw_guess") = lc.use_sc_yaw_guess,
+      py::arg("sc_yaw_guess_min_deg") = lc.sc_yaw_guess_min_deg,
+      py::arg("prior_noise_score") = lc.prior_noise_score,
+      py::arg("odom_noise_rotation") = lc.odom_noise_rotation,
+      py::arg("odom_noise_translation") = lc.odom_noise_translation,
+      py::arg("loop_noise_score") = lc.loop_noise_score,
+      py::arg("loop_noise_cauchy_c") = lc.loop_noise_cauchy_c,
+      py::arg("isam_relinearize_threshold") = lc.isam_relinearize_threshold,
+      py::arg("isam_relinearize_skip") = lc.isam_relinearize_skip);
+  d["max_num_threads"] = c.max_num_threads;
+  return d;
+}
+
 PYBIND11_MODULE(_core, m) {
   m.doc() = "resbie: RESPLE spline filter on the BIEVR map";
+  m.def("default_config", &defaultConfig, "Every default, as a nested config dict.");
   py::class_<Resbie>(m, "Resbie")
       .def(py::init<const std::vector<std::string>&, size_t>(), py::arg("config_files"),
            py::arg("map_point_stride") = 0)

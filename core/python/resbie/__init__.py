@@ -1,10 +1,11 @@
 """Offline resbie session: RESPLE's B-spline filter on BIEVR's map.
 
-Configuration is one or more YAML files, later ones winning per key, in
-BIEVR's sectioned format (``calibration``, ``lidar``, ``map``, ``preprocess``,
-``optimization``, ``imu``, ``loop_closure``, ``max_num_threads``) plus a
-``resple:`` section with RESPLE's estimator parameters under RESPLE's names.
-See ``resbie.DEFAULT_CONFIG``.
+Configuration is one or more YAML files, later ones winning per key, with the
+sections ``calibration``, ``lidar``, ``imu``, ``spline``, ``points``, ``map``,
+``loop_closure`` and the top-level ``max_num_threads``. Noises are standard
+deviations in SI units. Unknown keys are an error. ``resbie.DEFAULT_CONFIG``
+holds every key with its default (read from the C++ loader, the single
+source of defaults); only ``calibration`` has to be set.
 
 Every call is synchronous: when ``push_imu``/``push_lidar`` return, all
 processing they triggered is done, so results depend only on the pushed data.
@@ -15,8 +16,9 @@ processing they triggered is done, so results depend only on the pushed data.
   stamped at the sweep's last point. A pose is reported once the spline over
   its sweep is final (about 50 ms of data later); ``finish()`` reports the
   rest with the current estimate.
-* The first sweep covering ``map.min_voxels_for_init`` voxels seeds the map at
-  the initial pose; the 15 IMU samples before it set the gravity direction.
+* The filter starts once the IMU has started and a sweep covers
+  ``map.init_min_voxels`` map voxels; the 15 IMU samples before it set the
+  gravity direction.
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ from typing import Any, Sequence
 
 import numpy as np
 
-from ._core import Resbie as _NativeResbie
+from ._core import Resbie as _NativeResbie, default_config
 
 __all__ = ["Resbie", "DEFAULT_CONFIG", "DIAGNOSTIC_COLUMNS"]
 
@@ -48,55 +50,8 @@ DIAGNOSTIC_COLUMNS = (
 
 PathLike = str | os.PathLike
 
-# Every key the loader reads, with its default. Sections other than `resple`
-# use BIEVR's key names; `resple` uses RESPLE's.
-DEFAULT_CONFIG: dict[str, Any] = {
-    "calibration": {  # T_IMU_LIDAR (LiDAR -> IMU), rotation row-major; required
-        "translation": [0.0, 0.0, 0.0],
-        "rotation": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-    },
-    "lidar": {"min_range_m": 0.5, "max_range_m": 100.0, "time_offset_s": 0.0},
-    "map": {
-        "pixel_size_m": 0.05,
-        "voxel_size_m": 0.5,
-        "normal_tolerance_deg": 3.0,
-        "smooth": True,
-        "weighted": True,
-        "max_size": 1500000,
-        "min_voxels_for_init": 100,
-    },
-    "preprocess": {
-        "downsample_resolution_m": 0.1,
-        "informed_sample_count": 300,
-    },
-    "optimization": {"huber_delta": 0.1},
-    "imu": {"normalized": -1.0},  # < 0 autodetect, 0 m/s^2, > 0 g
-    "resple": {
-        "knot_hz": 100,
-        "cov_P0": 0.02,
-        "cov_RCP_pos_old": 0.5,
-        "cov_RCP_ort_old": 0.5,
-        "cov_RCP_pos_new": 1.0,
-        "cov_RCP_ort_new": 1.0,
-        "std_sys_pos": 0.1,
-        "std_sys_ort": 0.1,
-        "cov_acc": [1.0, 1.0, 1.0],
-        "cov_gyro": [0.1, 0.1, 0.1],
-        "cov_ba": [0.2, 0.2, 0.2],
-        "cov_bg": [0.2, 0.2, 0.2],
-        "n_iter": 3,
-        "num_points_upd": 100,
-        "w_pt": 0.01,
-        "bias_rw_acc": 0.001,
-        "bias_rw_gyro": 0.0001,
-        "gate_chi2": 9.0,
-    },
-
-    # BIEVR's loop_closure keyframe, Scan Context, ICP and pose-graph keys, plus
-    # max_speed_mps (resbie's guard)
-    "loop_closure": {"enable": False, "max_speed_mps": 30.0},
-    "max_num_threads": 0,
-}
+# Every key the loader reads, with its default (from the C++ loader).
+DEFAULT_CONFIG: dict[str, Any] = default_config()
 
 
 class Resbie:

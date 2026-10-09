@@ -56,7 +56,9 @@ def test_static_sensor_stays_put(tmp_path):
     assert status["points_effective"] > 0.6 * status["points_measured"]
     traj = s.trajectory()
     assert np.all(np.diff(traj[:, 0]) > 0)
-    assert np.abs(traj[:, 1:4]).max() < 0.03
+    # 5 cm: at the default 0.2 m point filter the small synthetic room keeps
+    # only a few hundred points per sweep.
+    assert np.abs(traj[:, 1:4]).max() < 0.05
     assert len(s.drain_map_scans()) == status["poses"]
     assert s.drain_map_scans() == []
 
@@ -128,3 +130,21 @@ def test_blackout_is_bridged_by_imu(tmp_path):
     assert diag.shape == (len(traj), len(resbie.DIAGNOSTIC_COLUMNS))
     blackout = (diag[:, 0] > t0 + 4.2) & (diag[:, 0] < t0 + 5.4)
     assert np.all(diag[blackout, 3] == 0) and np.all(diag[blackout, 5] > 0)  # no matched point, IMU-only updates
+
+
+@pytest.mark.parametrize("extra", ["resple: {knot_hz: 50}\n", "points: {downsample: 0.3}\n"])
+def test_unknown_keys_raise(tmp_path, extra):
+    # Old (pre-schema) or misspelled keys must not silently fall back to defaults.
+    with pytest.raises(Exception):
+        resbie.Resbie(_config(tmp_path, extra=extra))
+
+
+def test_default_config_loads_as_is(tmp_path):
+    import json
+
+    path = tmp_path / "defaults.yaml"
+    path.write_text(json.dumps(resbie.DEFAULT_CONFIG))  # JSON is valid YAML
+    resbie.Resbie(str(path))
+    assert set(resbie.DEFAULT_CONFIG) == {
+        "calibration", "lidar", "imu", "spline", "points", "map", "loop_closure", "max_num_threads"
+    }

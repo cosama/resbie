@@ -21,6 +21,41 @@ struct LoopClosureConfig {
   LoopCloser::Config closer;
 };
 
+// resbie: every loop_closure key the loader below reads (for strict
+// validation of the YAML; keep in step with the loader).
+inline constexpr const char* kLoopClosureKeys[] = {
+    "enable",
+    "keyframe_meter_gap",
+    "keyframe_deg_gap",
+    "keyframe_filter_size",
+    "icp_filter_size",
+    "sc_num_rings",
+    "sc_num_sectors",
+    "sc_max_radius",
+    "sc_lidar_height",
+    "sc_num_exclude_recent",
+    "sc_num_candidates",
+    "sc_search_ratio",
+    "sc_dist_threshold",
+    "sc_tree_making_period",
+    "history_keyframe_search_num",
+    "icp_max_correspondence_distance",
+    "icp_max_iterations",
+    "icp_transformation_epsilon",
+    "icp_euclidean_fitness_epsilon",
+    "icp_ransac_iterations",
+    "loop_fitness_score_threshold",
+    "use_sc_yaw_guess",
+    "sc_yaw_guess_min_deg",
+    "prior_noise_score",
+    "odom_noise_rotation",
+    "odom_noise_translation",
+    "loop_noise_score",
+    "loop_noise_cauchy_c",
+    "isam_relinearize_threshold",
+    "isam_relinearize_skip",
+};
+
 inline bool loadLoopClosureConfig(const std::vector<std::string>& yaml_paths,
                                   LoopClosureConfig& config) {
   config_internal::MergedYaml yaml;

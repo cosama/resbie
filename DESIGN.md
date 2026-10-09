@@ -5,7 +5,7 @@ changed from upstream.
 
 ## What comes from where
 
-- **From RESPLE:** the estimator. A cubic B-spline over SE(3) at `knot_hz`
+- **From RESPLE:** the estimator. A cubic B-spline over SE(3) at `spline.knot_hz`
   (100 Hz), updated by an iterated EKF over the four active control points
   plus the IMU biases. IMU readings and LiDAR points are residuals in one
   update, and the spline's motion model holds the directions the LiDAR can't
@@ -30,7 +30,7 @@ that: `normvec = R_C_W^T (-dI/dx, -dI/dy, 1)` (not unit length) and
 place of the ikd-tree search. The filter re-associates on every converged
 iteration, so the bump-image linearization is refreshed for free.
 
-Huber weighting (BIEVR's `optimization.huber_delta`) enters as IRLS: a
+Huber weighting (`points.huber_delta_m`) enters as IRLS: a
 per-point variance scale `PointData::var_scale`.
 
 ## Data flow (`cpp/resbie/odometry.h`)
@@ -38,7 +38,7 @@ per-point variance scale `PointData::var_scale`.
 This is RESPLE's `processData` loop made synchronous, with no worker thread.
 Every push runs all processing the new data allows before returning.
 
-1. **Init.** The first sweep covering at least `map.min_voxels_for_init`
+1. **Init.** The first sweep covering at least `map.init_min_voxels`
    distinct map voxels seeds BIEVR's map at the initial pose (level, zero
    yaw). Gravity comes from the 15 IMU samples before it, as in RESPLE.
    Sparse sweeps before that (a drone on the ground) are dropped, since a
@@ -75,10 +75,10 @@ for continuing through areas with little or no LiDAR:
   Here the update runs IMU-only, and the spline steps knot by knot through
   any stretch the arrived sweeps show to be empty. Empty sweeps are passed in
   as gap markers.
-- **Mahalanobis point gate,** `zp^2 <= gate_chi2 (HPH' + R)` (3 sigma),
+- **Mahalanobis point gate,** `zp^2 <= gate_sigma^2 (HPH' + R)` (`points.gate_sigma`, 3),
   using RESPLE's own covariance. RESPLE's gate widened only when the filter
   was certain.
-- **Bias drift** (`resple.bias_rw_*`): RESPLE gives the biases no process
+- **Bias drift** (`imu.*_bias_walk`): RESPLE gives the biases no process
   noise, so they freeze.
 - **Diagnostics** (`sweep_diagnostics()`): per sweep, matched points,
   IMU-only updates, the smallest eigenvalues of the LiDAR information
@@ -91,8 +91,8 @@ for continuing through areas with little or no LiDAR:
 
 - `cpp/bindings.cpp`: pybind11 module `resbie._core`. Its API mirrors
   `bievr`'s, plus `finish()`.
-- `cpp/resbie/config.h`: YAML loader. It uses BIEVR's sections and keys
-  plus a `resple:` section with RESPLE's parameter names.
+- `cpp/resbie/config.h`: YAML loader, the single source of defaults (see
+  Configuration).
 - `cpp/resbie/odometry.h`: the synchronous driver.
 - `python/resbie/__init__.py`: the `Resbie` session and `DEFAULT_CONFIG`.
 - `vendor/resple`: edited copies of the RESPLE headers, from upstream
@@ -113,16 +113,40 @@ enumerate the delta:
 
 ## Point density
 
-`preprocess.downsample_resolution_m` decides how many points the filter
-measures. The map always gets the full sweep. Informed sampling keeps the
-300 most informative map voxels and *every* downsampled point inside them,
-so at 0.1 m the filter sees ~7 points per 0.5 m voxel (~2100 per sweep).
+`points.downsample_m` decides how many points the filter
+measures (default 0.25 m). The map always gets the full sweep. Informed
+sampling keeps the 300 most informative map voxels and *every* downsampled
+point inside them, so at 0.1 m the filter sees ~7 points per 0.5 m voxel
+(~2100 per sweep).
 Those points share one surface and, when point times are synthesized, one
 timing error, but the filter counts them as independent, and the flexible
 spline bends to fit them. With a partly occluded LiDAR whose synthesized
 times are off by tens of ms for half of each scan, that bent the heading by
-several degrees and doubled walls. Around 0.25 m (a few points per map voxel)
-keeps the map just as sharp and the trajectory honest.
+several degrees and doubled walls. At 0.25 m (a few points per map
+voxel) the map stays just as sharp and the trajectory honest. Much coarser
+(0.5 m) starves cluttered scenes such as forests: too few points per trunk.
+
+## Configuration
+
+One YAML schema, sections by function, standard deviations in SI units.
+Later files override earlier ones per key; unknown keys are errors.
+`resbie.DEFAULT_CONFIG` lists every key with its default (taken from the C++
+loader); only `calibration` must be set.
+
+| section | keys |
+|---|---|
+| `calibration` | `translation`, `rotation` (T_I_L, LiDAR to IMU, row-major) |
+| `lidar` | `min_range_m`, `max_range_m`, `time_offset_s` |
+| `imu` | `normalized`; `acc_noise_std`, `gyro_noise_std` (per sample); `acc_bias_init_std`, `gyro_bias_init_std`; `acc_bias_walk`, `gyro_bias_walk` (per sqrt(s)) |
+| `spline` | `knot_hz`, `iterations`, `init_std`; `pos_noise`, `ort_noise` (motion-model noise of settled control points, m/s and rad/s); `new_pos_noise`, `new_ort_noise` (newest control point) |
+| `points` | `downsample_m`, `informed_voxels`, `per_update`, `noise_std_m`, `huber_delta_m`, `gate_sigma` |
+| `map` | `pixel_size_m`, `voxel_size_m`, `normal_tolerance_deg`, `smooth`, `weighted`, `max_size`, `init_min_voxels` |
+| `loop_closure` | `enable`, `max_speed_mps`, and the closer's keyframe, Scan Context, ICP and pose-graph keys |
+| (top level) | `max_num_threads` |
+
+Noises and biases take one number (all axes) or three. RESPLE's parameters
+map one to one: `cov_*` variances become `*_std`, and `std_sys` times
+`sqrt(cov_RCP_*)` becomes `*_noise`.
 
 ## Building
 

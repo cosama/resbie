@@ -85,8 +85,8 @@ class Odometry {
   explicit Odometry(const Config& config)
       : cfg_(config), map_(config.map), dt_ns_(int64_t(1000000000) / config.knot_hz) {
     NUM_OF_THREAD = cfg_.max_num_threads > 0 ? cfg_.max_num_threads : omp_get_num_procs();
-    estimator_.n_iter = cfg_.n_iter;
-    estimator_.gate_chi2 = cfg_.gate_chi2;
+    estimator_.n_iter = cfg_.iterations;
+    estimator_.gate_chi2 = cfg_.gate_sigma * cfg_.gate_sigma;
     if (cfg_.imu_normalized == 0.0) acc_scale_ = 1.0;
     if (cfg_.imu_normalized > 0.0) acc_scale_ = kGravity;
   }
@@ -185,9 +185,10 @@ class Odometry {
         estimator_.propRCP(max_time_ns);
       }
       knots_at_last_update_ = spline_->numKnots();
-      for (PointData& p : pt_meas_) p.var_pt = cfg_.w_pt;
+      for (PointData& p : pt_meas_) p.var_pt = pointVariance();
       estimator_.updateIEKFLiDARInertial(pt_meas_, map_, cfg_.association, imu_meas_, gravity_,
-                                         cfg_.cov_acc, cfg_.cov_gyro);
+                                         cfg_.acc_noise_std.cwiseAbs2(),
+                                         cfg_.gyro_noise_std.cwiseAbs2());
       recordUpdate(max_time_ns);
       pt_meas_.clear();
       finalizeSweeps(false);
@@ -255,7 +256,7 @@ class Odometry {
     // if moving, and its smeared sweeps would seed the map.
     std::vector<size_t> occupied;
     bievr::voxelDownsample(sweep.points, occupied, cfg_.map.voxel_size);
-    if (occupied.size() < cfg_.min_voxels_for_init) {
+    if (occupied.size() < cfg_.init_min_voxels) {
       ++sweeps_dropped_init_;
       sweeps_.pop_front();
       return -1;
@@ -297,30 +298,31 @@ class Odometry {
   // random walk (RESPLE: none).
   void initFilter(int64_t start_t_ns, const Eigen::Quaterniond& q_init) {
     const double dt_s = double(dt_ns_) * 1e-9;
-    const double cov_P0 = cfg_.cov_P0 * dt_s * dt_s;
-    const double cov_sys_pos = cfg_.std_sys_pos * cfg_.std_sys_pos * dt_s * dt_s;
-    const double cov_sys_ort = cfg_.std_sys_ort * cfg_.std_sys_ort * dt_s * dt_s;
+    const double dt2 = dt_s * dt_s;
+    const double cov_P0 = cfg_.init_std * cfg_.init_std * dt2;
     Eigen::Matrix<double, 24, 24> cov_RCPs = cov_P0 * Eigen::Matrix<double, 24, 24>::Identity();
     Eigen::Matrix<double, 30, 30> Q = Eigen::Matrix<double, 30, 30>::Zero();
     Eigen::Matrix<double, 6, 6> Q_block_old = Eigen::Matrix<double, 6, 6>::Zero();
-    Q_block_old.topLeftCorner<3, 3>() = cfg_.cov_RCP_pos_old * cov_sys_pos * Eigen::Matrix3d::Identity();
-    Q_block_old.bottomRightCorner<3, 3>() = cfg_.cov_RCP_ort_old * cov_sys_ort * Eigen::Matrix3d::Identity();
+    Q_block_old.topLeftCorner<3, 3>() = cfg_.pos_noise * cfg_.pos_noise * dt2 * Eigen::Matrix3d::Identity();
+    Q_block_old.bottomRightCorner<3, 3>() = cfg_.ort_noise * cfg_.ort_noise * dt2 * Eigen::Matrix3d::Identity();
     Eigen::Matrix<double, 6, 6> Q_block_new = Eigen::Matrix<double, 6, 6>::Zero();
-    Q_block_new.topLeftCorner<3, 3>() = cfg_.cov_RCP_pos_new * cov_sys_pos * Eigen::Matrix3d::Identity();
-    Q_block_new.bottomRightCorner<3, 3>() = cfg_.cov_RCP_ort_new * cov_sys_ort * Eigen::Matrix3d::Identity();
+    Q_block_new.topLeftCorner<3, 3>() = cfg_.new_pos_noise * cfg_.new_pos_noise * dt2 * Eigen::Matrix3d::Identity();
+    Q_block_new.bottomRightCorner<3, 3>() = cfg_.new_ort_noise * cfg_.new_ort_noise * dt2 * Eigen::Matrix3d::Identity();
     Q.block<6, 6>(0, 0) = Q_block_old;
     Q.block<6, 6>(6, 6) = Q_block_old;
     Q.block<6, 6>(12, 12) = Q_block_old;
     Q.block<6, 6>(18, 18) = Q_block_new;
-    Q.block<3, 3>(24, 24) = cfg_.bias_rw_acc * cfg_.bias_rw_acc * dt_s * Eigen::Matrix3d::Identity();
-    Q.block<3, 3>(27, 27) = cfg_.bias_rw_gyro * cfg_.bias_rw_gyro * dt_s * Eigen::Matrix3d::Identity();
+    Q.block<3, 3>(24, 24) = cfg_.acc_bias_walk * cfg_.acc_bias_walk * dt_s * Eigen::Matrix3d::Identity();
+    Q.block<3, 3>(27, 27) = cfg_.gyro_bias_walk * cfg_.gyro_bias_walk * dt_s * Eigen::Matrix3d::Identity();
     Eigen::Matrix<double, 30, 30> cov_x = Eigen::Matrix<double, 30, 30>::Zero();
     cov_x.topLeftCorner<24, 24>() = cov_RCPs;
-    cov_x.block<3, 3>(24, 24) = cfg_.cov_ba.asDiagonal();
-    cov_x.block<3, 3>(27, 27) = cfg_.cov_bg.asDiagonal();
+    cov_x.block<3, 3>(24, 24) = cfg_.acc_bias_init_std.cwiseAbs2().asDiagonal();
+    cov_x.block<3, 3>(27, 27) = cfg_.gyro_bias_init_std.cwiseAbs2().asDiagonal();
     estimator_.setState(dt_ns_, start_t_ns, Eigen::Vector3d::Zero(), q_init, Q, cov_x);
     spline_ = estimator_.getSpline();
   }
+
+  double pointVariance() const { return cfg_.point_noise_std * cfg_.point_noise_std; }
 
   // collectMeasurements() would stop for lack of points.
   bool needPoints() const {
@@ -334,7 +336,7 @@ class Odometry {
     sweep.diag = carry_diag_;  // updates in the gap before this sweep
     carry_diag_ = SweepDiagnostics();
     std::vector<size_t> down;
-    bievr::voxelDownsample(sweep.points, down, cfg_.downsample_resolution);
+    bievr::voxelDownsample(sweep.points, down, cfg_.downsample);
     std::vector<size_t> selected;
     if (!down.empty()) {
       // Place the points with the spline, clamped to its span: the spline ends
@@ -348,7 +350,7 @@ class Odometry {
         world[i] = Association::pointBodyToWorld(t, spline_, sweep.points[down[i]]);
       }
       std::vector<size_t> informed;
-      bievr::sampleInformed(map_, world, informed, cfg_.informed_sample_count);
+      bievr::sampleInformed(map_, world, informed, cfg_.informed_voxels);
       selected.reserve(informed.size());
       for (size_t i : informed) selected.push_back(down[i]);
     }
@@ -356,7 +358,7 @@ class Odometry {
       return sweep.times[a] != sweep.times[b] ? sweep.times[a] < sweep.times[b] : a < b;
     });
     for (size_t i : selected) {
-      pt_buff_.emplace_back(Eigen::Vector3d(sweep.points[i]), sweep.times[i], cfg_.w_pt);
+      pt_buff_.emplace_back(Eigen::Vector3d(sweep.points[i]), sweep.times[i], pointVariance());
     }
     pending_final_.push_back(std::move(sweep));
   }
@@ -389,7 +391,7 @@ class Odometry {
     }
     if (spline_->numKnots() > 4) max_time_ns = spline_->maxTimeNs();
     int cnt = 0;
-    while (!pt_buff_.empty() && pt_buff_.front().time_ns <= max_time_ns && cnt < cfg_.num_points_upd) {
+    while (!pt_buff_.empty() && pt_buff_.front().time_ns <= max_time_ns && cnt < cfg_.per_update) {
       if (spline_->numKnots() < 10 || pt_buff_.front().time_ns >= spline_->maxTimeNs() - dt_ns_) {
         pt_meas_.push_back(pt_buff_.front());
       }

@@ -26,7 +26,8 @@ surprisingly well, most of the time.
   so if your LiDAR lies about time, resbie believes it and bends over
   backwards trying to make the lie work. Feed it honest point times.
 - **Overeager.** Give it too many points and it reads too much into them.
-  Keep `preprocess.downsample_resolution_m` around 0.25 m and it stays calm.
+  The default point filter (`points.downsample_m`, 0.25 m) keeps it calm;
+  going much finer is asking for trouble.
 - **Deterministic.** Same input, same output, bit for bit, however many
   threads you throw at it. Neither parent promised that out of the box,
   so this one it worked out on its own.

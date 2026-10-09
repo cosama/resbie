@@ -46,6 +46,31 @@ class MergedYaml {
     return default_value;
   }
 
+  // resbie: the winning node for `section.key` (null if no file sets it), and
+  // every "section.key" / top-level key the files set, for strict validation.
+  YAML::Node node(const std::string& section, const std::string& key) const {
+    for (auto it = nodes_.rbegin(); it != nodes_.rend(); ++it) {
+      if ((*it)[section] && (*it)[section][key]) return (*it)[section][key];
+    }
+    return YAML::Node();
+  }
+
+  std::vector<std::string> keys() const {
+    std::vector<std::string> out;
+    for (const YAML::Node& root : nodes_) {
+      if (!root.IsMap()) continue;
+      for (const auto& top : root) {
+        const std::string name = top.first.as<std::string>();
+        if (top.second.IsMap()) {
+          for (const auto& leaf : top.second) out.push_back(name + "." + leaf.first.as<std::string>());
+        } else {
+          out.push_back(name);
+        }
+      }
+    }
+    return out;
+  }
+
  private:
   std::vector<YAML::Node> nodes_;
 };

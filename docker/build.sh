@@ -5,12 +5,12 @@
 #
 #   docker/build.sh [image-tag]
 #
-# Default tag: ghcr.io/cosama/resbie_offline:latest.
+# Default tag: ghcr.io/cosama/resbie:latest.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
-tag="${1:-ghcr.io/cosama/resbie_offline:latest}"
+tag="${1:-ghcr.io/cosama/resbie:latest}"
 if [ "$#" -gt 0 ]; then shift; fi
 engine="${CONTAINER_ENGINE:-docker}"
 

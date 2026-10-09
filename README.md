@@ -1,3 +1,5 @@
+<p align="center"><img src="doc/logo.svg" alt="resbie: a baby beaver wearing a spinning LiDAR as a party hat" width="560"></p>
+
 # resbie
 
 > **RES**(PLE) + **BIE**(VR) = resbie. Nobody asked for this baby, and it's

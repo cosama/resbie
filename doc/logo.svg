@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 260" width="820" height="260" role="img" aria-labelledby="t d">
+  <title id="t">resbie</title>
+  <desc id="d">A baby beaver wearing a spinning LiDAR as a party hat, with a B-spline tail covered in a bump-image voxel grid.</desc>
+  <defs>
+    <linearGradient id="fur" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#b97a4a"/>
+      <stop offset="1" stop-color="#8a5530"/>
+    </linearGradient>
+    <linearGradient id="tail" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#6b4a3a"/>
+      <stop offset="1" stop-color="#4a3128"/>
+    </linearGradient>
+    <linearGradient id="puck" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#5c6670"/>
+      <stop offset="0.5" stop-color="#9aa6b2"/>
+      <stop offset="1" stop-color="#5c6670"/>
+    </linearGradient>
+    <clipPath id="tailclip">
+      <path d="M 40 205 C 20 175, 45 140, 85 150 C 125 160, 150 190, 135 215 C 120 240, 60 235, 40 205 Z"/>
+    </clipPath>
+  </defs>
+
+  <rect x="2" y="2" width="816" height="256" rx="28" fill="#fff8ef" stroke="#ead9c4" stroke-width="2"/>
+
+  <!-- laser rays from the puck -->
+  <g stroke="#ff4d6d" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="2 7" opacity="0.85">
+    <line x1="175" y1="32" x2="95" y2="8"/>
+    <line x1="175" y1="32" x2="88" y2="44"/>
+    <line x1="215" y1="32" x2="295" y2="8"/>
+    <line x1="215" y1="32" x2="302" y2="44"/>
+  </g>
+
+  <!-- tail: a cubic B-spline with its control polygon, bump-image voxels on top -->
+  <path d="M 40 205 C 20 175, 45 140, 85 150 C 125 160, 150 190, 135 215 C 120 240, 60 235, 40 205 Z" fill="url(#tail)"/>
+  <g clip-path="url(#tailclip)" stroke="#8c6a58" stroke-width="1.6" opacity="0.9">
+    <path d="M 10 160 h 160 M 10 176 h 160 M 10 192 h 160 M 10 208 h 160 M 10 224 h 160"/>
+    <path d="M 46 130 v 120 M 62 130 v 120 M 78 130 v 120 M 94 130 v 120 M 110 130 v 120 M 126 130 v 120"/>
+    <g fill="#9c7a66" stroke="none">
+      <circle cx="54" cy="184" r="3"/><circle cx="86" cy="168" r="2.5"/><circle cx="102" cy="200" r="3.5"/>
+      <circle cx="70" cy="216" r="2.5"/><circle cx="118" cy="184" r="2"/><circle cx="86" cy="216" r="2"/>
+    </g>
+  </g>
+  <polyline points="30,228 34,150 128,140 118,242" fill="none" stroke="#2bb3a3" stroke-width="2" stroke-dasharray="5 5"/>
+  <g fill="#2bb3a3" stroke="#fff" stroke-width="2">
+    <circle cx="30" cy="228" r="6"/><circle cx="34" cy="150" r="6"/>
+    <circle cx="128" cy="140" r="6"/><circle cx="118" cy="242" r="6"/>
+  </g>
+
+  <!-- body -->
+  <ellipse cx="195" cy="200" rx="62" ry="48" fill="url(#fur)"/>
+  <ellipse cx="195" cy="210" rx="36" ry="30" fill="#e8c7a0"/>
+
+  <!-- head -->
+  <circle cx="148" cy="88" r="16" fill="#8a5530"/><circle cx="148" cy="88" r="8" fill="#e09a8a"/>
+  <circle cx="242" cy="88" r="16" fill="#8a5530"/><circle cx="242" cy="88" r="8" fill="#e09a8a"/>
+  <circle cx="195" cy="122" r="58" fill="url(#fur)"/>
+
+  <!-- the party hat: a spinning LiDAR puck -->
+  <g>
+    <ellipse cx="195" cy="66" rx="30" ry="9" fill="#3d454d"/>
+    <rect x="165" y="34" width="60" height="32" fill="url(#puck)"/>
+    <rect x="165" y="44" width="60" height="9" fill="#1f2429"/>
+    <ellipse cx="195" cy="34" rx="30" ry="9" fill="#b8c2cc"/>
+    <circle cx="207" cy="48.5" r="3" fill="#ff4d6d"/>
+  </g>
+
+  <!-- face -->
+  <ellipse cx="195" cy="146" rx="34" ry="24" fill="#e8c7a0"/>
+  <circle cx="172" cy="112" r="10" fill="#fff"/><circle cx="218" cy="112" r="10" fill="#fff"/>
+  <circle cx="174" cy="114" r="6.5" fill="#221a14"/><circle cx="220" cy="114" r="6.5" fill="#221a14"/>
+  <circle cx="176.5" cy="111" r="2.4" fill="#fff"/><circle cx="222.5" cy="111" r="2.4" fill="#fff"/>
+  <ellipse cx="160" cy="138" rx="9" ry="5.5" fill="#f2a0a0" opacity="0.7"/>
+  <ellipse cx="230" cy="138" rx="9" ry="5.5" fill="#f2a0a0" opacity="0.7"/>
+  <ellipse cx="195" cy="134" rx="10" ry="7" fill="#3a2a20"/>
+  <path d="M 183 145 Q 195 153 207 145" fill="none" stroke="#3a2a20" stroke-width="3" stroke-linecap="round"/>
+  <rect x="187" y="149" width="8" height="12" rx="2" fill="#fffaf0" stroke="#d8cbb0" stroke-width="1"/>
+  <rect x="196" y="149" width="8" height="12" rx="2" fill="#fffaf0" stroke="#d8cbb0" stroke-width="1"/>
+
+  <!-- paws -->
+  <ellipse cx="165" cy="238" rx="16" ry="9" fill="#7a4a2a"/>
+  <ellipse cx="225" cy="238" rx="16" ry="9" fill="#7a4a2a"/>
+
+  <!-- wordmark -->
+  <text x="300" y="150" font-family="Nunito, 'Varela Round', 'Comic Neue', 'Trebuchet MS', sans-serif" font-size="104" font-weight="800" fill="#4a3128" textLength="300" lengthAdjust="spacingAndGlyphs">res<tspan fill="#2bb3a3">bie</tspan></text>
+  <text x="304" y="192" font-family="Nunito, 'Varela Round', 'Trebuchet MS', sans-serif" font-size="21" font-weight="600" fill="#8a7466" textLength="470" lengthAdjust="spacingAndGlyphs">splines from mum, bump images from dad</text>
+</svg>

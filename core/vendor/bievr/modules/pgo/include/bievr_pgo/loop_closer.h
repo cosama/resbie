@@ -6,7 +6,13 @@
 // resbie: synchronous only. addFrame() runs keyframing, loop detection, ICP and
 // iSAM2 inline, so offline replay is deterministic; BIEVR's worker threads,
 // GPS altitude factors and map bundle are removed (map export is the caller's job).
+// resbie: the graph also holds the IMU. Consecutive keyframes are linked by a
+// CombinedImuFactor (preintegrated raw IMU, bias random walk) with gravity
+// along world z, so roll and pitch are measured by gravity instead of being
+// whatever the odometry drifted to; the first keyframe's prior fixes only
+// yaw and position.
 
+#include <deque>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -15,6 +21,7 @@
 #include <pcl/point_types.h>
 
 #include <gtsam/geometry/Pose3.h>
+#include <gtsam/navigation/CombinedImuFactor.h>
 #include <gtsam/nonlinear/ISAM2.h>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
 #include <gtsam/nonlinear/Values.h>
@@ -59,6 +66,16 @@ class LoopCloser {
 
     double isam_relinearize_threshold = 0.01;
     int isam_relinearize_skip = 1;
+
+    // IMU (resbie fills these from its imu section): per-sample noise, bias
+    // random walk per sqrt(s), initial bias uncertainty; gravity in m/s^2.
+    double gravity = 9.81;
+    Eigen::Vector3d acc_noise_std = Eigen::Vector3d::Constant(1.0);
+    Eigen::Vector3d gyro_noise_std = Eigen::Vector3d::Constant(0.1);
+    double acc_bias_walk = 0.001;
+    double gyro_bias_walk = 0.0001;
+    Eigen::Vector3d acc_bias_init_std = Eigen::Vector3d::Constant(0.5);
+    Eigen::Vector3d gyro_bias_init_std = Eigen::Vector3d::Constant(0.5);
   };
 
   struct Keyframe {
@@ -79,6 +96,11 @@ class LoopCloser {
 
   // Keyframe gating, then (for a keyframe) every stage inline.
   void addFrame(uint64_t stamp, const Transform& T_W_I, const Pointcloud& cloud_body);
+  // One IMU sample in the IMU frame (acc in m/s^2), in time order and ahead of
+  // the keyframes it falls before.
+  void addImu(uint64_t stamp, const Eigen::Vector3d& acc, const Eigen::Vector3d& gyro);
+  // End of input: one batch optimization of the whole graph.
+  void finish();
 
   std::vector<Keyframe> keyframes() const;
   Stats stats() const;
@@ -87,7 +109,13 @@ class LoopCloser {
   struct PendingFrame {
     uint64_t stamp;
     Transform pose;
+    Eigen::Vector3d velocity;  // world frame, from the odometry
     Cloud::Ptr cloud;  // body frame, downsampled
+  };
+
+  struct ImuSample {
+    uint64_t stamp;
+    Eigen::Vector3d acc, gyro;
   };
 
   struct LoopCandidate {
@@ -103,6 +131,12 @@ class LoopCloser {
   std::optional<gtsam::Pose3> computeLoopConstraint(const LoopCandidate& candidate);
   void optimize();
   void initNoiseModels();
+  // Adds the factors linking keyframe `index` to the previous one: odometry,
+  // and the IMU preintegrated between their stamps.
+  void addMotionFactors(int index, const gtsam::Pose3& odom_delta, uint64_t stamp,
+                        const Eigen::Vector3d& velocity);
+  void readEstimate(const gtsam::Values& estimate);
+  boost::shared_ptr<gtsam::PreintegrationCombinedParams> makeImuParams(double dt) const;
 
   Config config_;
   double keyframe_rad_gap_;
@@ -110,6 +144,7 @@ class LoopCloser {
   // Keyframe gating state.
   bool has_previous_frame_ = false;
   Transform previous_pose_;
+  uint64_t previous_stamp_ = 0;
   double translation_accumulated_ = 0.0;
   double rotation_accumulated_ = 0.0;
 
@@ -125,9 +160,12 @@ class LoopCloser {
   std::unique_ptr<gtsam::ISAM2> isam_;
   bool graph_initialized_ = false;
 
-  gtsam::SharedNoiseModel prior_noise_;
   gtsam::SharedNoiseModel odom_noise_;
   gtsam::SharedNoiseModel loop_noise_;
+
+  std::deque<ImuSample> imu_;  // samples after the newest keyframe
+  boost::shared_ptr<gtsam::PreintegrationCombinedParams> imu_params_;  // set at the 2nd keyframe
+  gtsam::imuBias::ConstantBias bias_;  // newest keyframe's bias estimate
 
   size_t num_loops_ = 0;
   size_t num_rejected_ = 0;

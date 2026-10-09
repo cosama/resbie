@@ -74,6 +74,7 @@ struct Sweep {
 class Odometry {
  public:
   static constexpr int kInitImuSamples = 15;  // RESPLE initialization()
+  static constexpr double kGravity = 9.81;  // RESPLE's constant
 
   // Called once per sweep, in order, when the sweep's poses are final:
   // stamp = sweep end, T_W_I = pose at the sweep end, deskewed_I = every point
@@ -133,6 +134,7 @@ class Odometry {
   }
 
   bool initialized() const { return initialized_; }
+  double accScale() const { return acc_scale_; }  // m/s^2 per input unit; <= 0 until known
   const bievr::BIEVRMap& map() const { return map_; }
   Eigen::Vector3d accBias() const { return initialized_ ? estimator_.biasAcc() : Eigen::Vector3d::Zero(); }
   Eigen::Vector3d gyroBias() const { return initialized_ ? estimator_.biasGyro() : Eigen::Vector3d::Zero(); }
@@ -151,7 +153,6 @@ class Odometry {
   }
 
  private:
-  static constexpr double kGravity = 9.81;  // RESPLE's constant
 
   void process() {
     while (true) {

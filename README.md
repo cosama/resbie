@@ -28,6 +28,9 @@ surprisingly well, most of the time.
 - **Overeager.** Give it too many points and it reads too much into them.
   The default point filter (`points.downsample_m`, 0.25 m) keeps it calm;
   going much finer is asking for trouble.
+- **Knows which way is up.** A pose graph behind it listens to the
+  accelerometer the whole way, so even when the map drifts off level on a
+  staircase, what comes out is level again.
 - **Deterministic.** Same input, same output, bit for bit, however many
   threads you throw at it. Neither parent promised that out of the box,
   so this one it worked out on its own.

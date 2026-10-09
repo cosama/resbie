@@ -4,6 +4,8 @@
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/registration/icp.h>
 
+#include <gtsam/inference/Symbol.h>
+#include <gtsam/nonlinear/LevenbergMarquardtOptimizer.h>
 #include <gtsam/slam/BetweenFactor.h>
 #include <gtsam/slam/PriorFactor.h>
 
@@ -15,6 +17,17 @@
 
 namespace bievr {
 namespace {
+
+using gtsam::symbol_shorthand::B;  // IMU bias
+using gtsam::symbol_shorthand::V;  // velocity, world frame
+using gtsam::symbol_shorthand::X;  // pose
+
+// Conditioning only, never information: a velocity no IMU factor reaches.
+constexpr double kLooseVelocitySigma = 10.0;  // m/s
+// Roll and pitch are left to gravity: effectively unconstrained by the prior.
+constexpr double kFreeRotationVariance = 1.0;  // rad^2
+// GTSAM's integration noise (position from velocity); negligible by design.
+constexpr double kIntegrationVariance = 1e-8;
 
 gtsam::Pose3 toPose3(const Transform& t) {
   return gtsam::Pose3(gtsam::Rot3(t.linear()), gtsam::Point3(t.translation()));
@@ -47,10 +60,6 @@ LoopCloser::LoopCloser(Config config)
 
 void LoopCloser::initNoiseModels() {
   // gtsam::Pose3's tangent space is [rotation, translation].
-  gtsam::Vector6 prior_variance;
-  prior_variance.setConstant(config_.prior_noise_score);
-  prior_noise_ = gtsam::noiseModel::Diagonal::Variances(prior_variance);
-
   gtsam::Vector6 odom_variance;
   odom_variance << config_.odom_noise_rotation, config_.odom_noise_rotation,
       config_.odom_noise_rotation, config_.odom_noise_translation,
@@ -75,7 +84,13 @@ void LoopCloser::addFrame(uint64_t stamp, const Transform& T_W_I, const Pointclo
     is_keyframe = translation_accumulated_ > config_.keyframe_meter_gap ||
                   rotation_accumulated_ > keyframe_rad_gap_;
   }
+  Eigen::Vector3d velocity = Eigen::Vector3d::Zero();
+  if (has_previous_frame_ && stamp > previous_stamp_) {
+    velocity = (T_W_I.translation() - previous_pose_.translation()) /
+               (1e-9 * double(stamp - previous_stamp_));
+  }
   previous_pose_ = T_W_I;
+  previous_stamp_ = stamp;
   has_previous_frame_ = true;
   if (!is_keyframe) return;
 
@@ -85,6 +100,7 @@ void LoopCloser::addFrame(uint64_t stamp, const Transform& T_W_I, const Pointclo
   PendingFrame frame;
   frame.stamp = stamp;
   frame.pose = T_W_I;
+  frame.velocity = velocity;
   frame.cloud = Cloud::Ptr(new Cloud());
   const auto& data = cloud_body.data();
   frame.cloud->resize(data.cols());
@@ -102,8 +118,8 @@ void LoopCloser::addFrame(uint64_t stamp, const Transform& T_W_I, const Pointclo
     const int current = static_cast<int>(scan_context_.size()) - 1;
     const LoopCandidate candidate{match.index, current, match.yaw_diff_rad};
     if (const auto constraint = computeLoopConstraint(candidate)) {
-      graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(candidate.from, candidate.to, *constraint,
-                                                    loop_noise_));
+      graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(X(candidate.from), X(candidate.to),
+                                                    *constraint, loop_noise_));
       ++num_loops_;
     } else {
       ++num_rejected_;
@@ -123,11 +139,15 @@ void LoopCloser::integrateKeyframe(PendingFrame frame) {
   const gtsam::Pose3 pose = toPose3(frame.pose);
 
   const int index = static_cast<int>(keyframe_clouds_.size());
-  gtsam::Pose3 previous_odom_pose;
-  if (index > 0) previous_odom_pose = keyframe_odom_poses_.back();
+  gtsam::Pose3 odom_delta;  // previous keyframe -> this one, by the odometry
+  gtsam::Pose3 initial = pose;
+  if (index > 0) {
+    odom_delta = keyframe_odom_poses_.back().between(pose);
+    initial = keyframe_poses_.back() * odom_delta;  // continue from the corrected estimate
+  }
   keyframe_clouds_.push_back(downsampled);
   keyframe_odom_poses_.push_back(pose);
-  keyframe_poses_.push_back(pose);
+  keyframe_poses_.push_back(initial);
   keyframe_stamps_.push_back(frame.stamp);
 
   // Scan Context wants the body-frame cloud, at the same resolution the
@@ -139,14 +159,85 @@ void LoopCloser::integrateKeyframe(PendingFrame frame) {
   }
   scan_context_.add(sc_cloud);
 
+  // Odometry velocity, rotated like the correction of the pose it belongs to.
+  const Eigen::Vector3d velocity =
+      initial.rotation().matrix() * pose.rotation().matrix().transpose() * frame.velocity;
   if (!graph_initialized_) {
-    graph_.add(gtsam::PriorFactor<gtsam::Pose3>(0, pose, prior_noise_));
-    initial_estimate_.insert(0, pose);
+    // Gauge: fix yaw and position. Roll and pitch stay free for gravity, so the
+    // prior's rotation covariance is loose about the world x and y axes (Pose3
+    // perturbs rotation in the body frame: world = R * body).
+    const Eigen::Matrix3d R = pose.rotation().matrix();
+    const double tight = config_.prior_noise_score, relaxed = kFreeRotationVariance;
+    gtsam::Matrix6 cov = gtsam::Matrix6::Zero();
+    cov.topLeftCorner<3, 3>() = R.transpose() * Eigen::Vector3d(relaxed, relaxed, tight).asDiagonal() * R;
+    cov.bottomRightCorner<3, 3>() = tight * Eigen::Matrix3d::Identity();
+    graph_.add(gtsam::PriorFactor<gtsam::Pose3>(X(0), pose,
+                                                gtsam::noiseModel::Gaussian::Covariance(cov)));
+    graph_.add(gtsam::PriorFactor<gtsam::Vector3>(
+        V(0), velocity, gtsam::noiseModel::Isotropic::Sigma(3, kLooseVelocitySigma)));
+    gtsam::Vector6 bias_std;
+    bias_std << config_.acc_bias_init_std, config_.gyro_bias_init_std;
+    graph_.add(gtsam::PriorFactor<gtsam::imuBias::ConstantBias>(
+        B(0), bias_, gtsam::noiseModel::Diagonal::Sigmas(bias_std)));
     graph_initialized_ = true;
   } else {
-    graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(index - 1, index,
-                                                  previous_odom_pose.between(pose), odom_noise_));
-    initial_estimate_.insert(index, pose);
+    addMotionFactors(index, odom_delta, frame.stamp, velocity);
+  }
+  initial_estimate_.insert(X(index), initial);
+  initial_estimate_.insert(V(index), velocity);
+  initial_estimate_.insert(B(index), bias_);
+  // Samples up to this keyframe now belong to the factors ending at it.
+  while (!imu_.empty() && imu_.front().stamp <= frame.stamp) imu_.pop_front();
+}
+
+void LoopCloser::addImu(uint64_t stamp, const Eigen::Vector3d& acc, const Eigen::Vector3d& gyro) {
+  if (keyframe_stamps_.empty() || stamp <= keyframe_stamps_.back()) return;
+  if (!imu_.empty() && stamp <= imu_.back().stamp) return;
+  imu_.push_back({stamp, acc, gyro});
+}
+
+// GTSAM wants continuous noise densities: a per-sample standard deviation
+// sigma at sample interval dt is sigma^2 * dt. Gravity points down world z.
+boost::shared_ptr<gtsam::PreintegrationCombinedParams> LoopCloser::makeImuParams(double dt) const {
+  auto p = gtsam::PreintegrationCombinedParams::MakeSharedU(config_.gravity);
+  p->accelerometerCovariance = config_.acc_noise_std.cwiseAbs2().asDiagonal() * dt;
+  p->gyroscopeCovariance = config_.gyro_noise_std.cwiseAbs2().asDiagonal() * dt;
+  p->integrationCovariance = kIntegrationVariance * gtsam::I_3x3;
+  p->biasAccCovariance = config_.acc_bias_walk * config_.acc_bias_walk * gtsam::I_3x3;
+  p->biasOmegaCovariance = config_.gyro_bias_walk * config_.gyro_bias_walk * gtsam::I_3x3;
+  return p;
+}
+
+void LoopCloser::addMotionFactors(int index, const gtsam::Pose3& odom_delta, uint64_t stamp,
+                                  const Eigen::Vector3d& velocity) {
+  graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(X(index - 1), X(index), odom_delta, odom_noise_));
+
+  if (!imu_params_ && imu_.size() >= 2) {
+    imu_params_ = makeImuParams(1e-9 * double(imu_.back().stamp - imu_.front().stamp) /
+                                double(imu_.size() - 1));
+  }
+  gtsam::PreintegratedCombinedMeasurements pim(imu_params_, bias_);
+  uint64_t t = keyframe_stamps_[index - 1];
+  for (const ImuSample& s : imu_) {
+    if (s.stamp > stamp) break;
+    pim.integrateMeasurement(s.acc, s.gyro, 1e-9 * double(s.stamp - t));
+    t = s.stamp;
+  }
+  if (imu_params_ && pim.deltaTij() > 0) {
+    graph_.add(gtsam::CombinedImuFactor(X(index - 1), V(index - 1), X(index), V(index), B(index - 1),
+                                        B(index), pim));
+  } else {
+    // No IMU between them (a gap in the IMU stream): the bias still drifts by
+    // its random walk over the interval, and the velocity is left loose.
+    const double sqrt_dt = std::sqrt(1e-9 * double(stamp - keyframe_stamps_[index - 1]));
+    gtsam::Vector6 walk;
+    walk << gtsam::Vector3::Constant(config_.acc_bias_walk * sqrt_dt),
+        gtsam::Vector3::Constant(config_.gyro_bias_walk * sqrt_dt);
+    graph_.add(gtsam::BetweenFactor<gtsam::imuBias::ConstantBias>(
+        B(index - 1), B(index), gtsam::imuBias::ConstantBias(),
+        gtsam::noiseModel::Diagonal::Sigmas(walk.cwiseMax(1e-9))));  // walk 0: near-rigid, not singular
+    graph_.add(gtsam::PriorFactor<gtsam::Vector3>(
+        V(index), velocity, gtsam::noiseModel::Isotropic::Sigma(3, kLooseVelocitySigma)));
   }
 }
 
@@ -236,9 +327,23 @@ void LoopCloser::optimize() {
   isam_->update();
   graph_.resize(0);
   initial_estimate_.clear();
-  const gtsam::Values estimate = isam_->calculateEstimate();
-  for (size_t i = 0; i < keyframe_poses_.size() && i < estimate.size(); ++i) {
-    keyframe_poses_[i] = estimate.at<gtsam::Pose3>(i);
+  readEstimate(isam_->calculateEstimate());
+}
+
+void LoopCloser::finish() {
+  if (!graph_initialized_) return;
+  optimize();
+  readEstimate(gtsam::LevenbergMarquardtOptimizer(isam_->getFactorsUnsafe(),
+                                                  isam_->calculateEstimate())
+                   .optimize());
+}
+
+void LoopCloser::readEstimate(const gtsam::Values& estimate) {
+  for (size_t i = 0; i < keyframe_poses_.size(); ++i) {
+    if (estimate.exists(X(i))) keyframe_poses_[i] = estimate.at<gtsam::Pose3>(X(i));
+  }
+  if (!keyframe_poses_.empty() && estimate.exists(B(keyframe_poses_.size() - 1))) {
+    bias_ = estimate.at<gtsam::imuBias::ConstantBias>(B(keyframe_poses_.size() - 1));
   }
 }
 

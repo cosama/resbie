@@ -148,3 +148,26 @@ def test_default_config_loads_as_is(tmp_path):
     assert set(resbie.DEFAULT_CONFIG) == {
         "calibration", "lidar", "imu", "spline", "points", "map", "loop_closure", "max_num_threads"
     }
+
+
+def _tilt_deg(q):
+    qx, qy = q[..., 0], q[..., 1]
+    return np.degrees(2 * np.arcsin(np.clip(np.hypot(qx, qy), 0, 1)))
+
+
+def test_graph_levels_the_odometry(tmp_path):
+    # The pose graph (on by default) adds IMU factors between keyframes, with
+    # gravity along world z. Here the odometry drifts in tilt by ~1 degree; the
+    # graph keyframes must come out level, more level than the odometry, and
+    # horizontally where the odometry is. A gravity sign or frame error would
+    # break all three. The first keyframe is excused: without any rotation in
+    # this test, tilt and accelerometer bias cannot be told apart there yet.
+    s = _run(_config(tmp_path), seconds=8.0, velocity=(0.5, 0.0, 0.0))
+    kf, odom = s.keyframe_trajectory(), s.trajectory()
+    assert len(kf) >= 3
+    odom_at_kf = odom[np.searchsorted(odom[:, 0], kf[:, 0])]
+    assert np.allclose(kf[:, 0], odom_at_kf[:, 0])
+    assert np.abs(kf[:, 1:3] - odom_at_kf[:, 1:3]).max() < 0.02
+    tilt_kf, tilt_odom = _tilt_deg(kf[1:, 4:6]), _tilt_deg(odom_at_kf[1:, 4:6])
+    assert tilt_kf.max() < 0.5, tilt_kf
+    assert tilt_kf.mean() < tilt_odom.mean(), (tilt_kf, tilt_odom)

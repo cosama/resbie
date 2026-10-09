@@ -17,7 +17,7 @@ namespace bievr {
 // resbie: only the keys the synchronous closer uses (no publishing, GPS,
 // worker rates or map bundle).
 struct LoopClosureConfig {
-  bool enable = false;
+  bool enable = true;  // resbie: the graph (gravity, loops) runs by default
   LoopCloser::Config closer;
 };
 

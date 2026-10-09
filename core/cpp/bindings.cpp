@@ -63,7 +63,16 @@ class Resbie {
       throw std::invalid_argument("resbie rejected the loop_closure configuration");
     }
     if (loop_closure_config.enable) {
-      loop_closer_ = std::make_unique<bievr::LoopCloser>(loop_closure_config.closer);
+      // The graph's IMU factors use resbie's IMU model.
+      auto& lc = loop_closure_config.closer;
+      lc.gravity = resbie::Odometry::kGravity;
+      lc.acc_noise_std = config_.acc_noise_std;
+      lc.gyro_noise_std = config_.gyro_noise_std;
+      lc.acc_bias_walk = config_.acc_bias_walk;
+      lc.gyro_bias_walk = config_.gyro_bias_walk;
+      lc.acc_bias_init_std = config_.acc_bias_init_std;
+      lc.gyro_bias_init_std = config_.gyro_bias_init_std;
+      loop_closer_ = std::make_unique<bievr::LoopCloser>(lc);
     }
 
     odometry_->setObserver([this](int64_t stamp, const bievr::Transform& T_W_I,
@@ -79,7 +88,12 @@ class Resbie {
     const Eigen::Vector3d w = toV3(gyro, "angular_velocity");
     py::gil_scoped_release release;
     std::lock_guard<std::mutex> lock(mutex_);
-    return odometry_->addImu(t, a, w);
+    const bool accepted = odometry_->addImu(t, a, w);
+    // The graph integrates the same samples, in m/s^2 (known once initialized).
+    if (accepted && loop_closer_ && odometry_->accScale() > 0) {
+      loop_closer_->addImu(static_cast<uint64_t>(t), a * odometry_->accScale(), w);
+    }
+    return accepted;
   }
 
   bool pushLidar(double stamp, const Array& points, const Array& times) {
@@ -140,6 +154,7 @@ class Resbie {
     py::gil_scoped_release release;
     std::lock_guard<std::mutex> lock(mutex_);
     odometry_->finish();
+    if (loop_closer_) loop_closer_arena_.execute([&] { loop_closer_->finish(); });
   }
 
   py::object latestPose() {

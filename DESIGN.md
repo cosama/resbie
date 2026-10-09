@@ -87,6 +87,32 @@ for continuing through areas with little or no LiDAR:
   (`loop_closure.max_speed_mps`) never become keyframes, so a diverged run
   cannot stall the synchronous closer.
 
+## The pose graph (on by default)
+
+The filter tracks against its own map, so once that map is built slightly
+tilted (it happens on stairs), the accelerometer can disagree for minutes
+without being able to rotate it back. The graph downstream fixes the
+outputs:
+
+- One node per keyframe (every `keyframe_meter_gap` or `keyframe_deg_gap`)
+  with pose, velocity and IMU bias.
+- Between consecutive keyframes: the odometry's relative pose, and a GTSAM
+  `CombinedImuFactor` from every raw IMU sample in between (preintegrated,
+  bias random walk, gravity along world z). The noise comes from the `imu`
+  section; the per-sample standard deviations become GTSAM's continuous
+  densities at the measured IMU rate.
+- The first keyframe's prior fixes only yaw and position (the gauge); roll
+  and pitch are left to gravity.
+- Loop closures (Scan Context + ICP) add relative poses as before.
+- iSAM2 updates incrementally per keyframe (loop search uses the corrected
+  map); `finish()` runs one batch optimization of the whole graph.
+
+`keyframe_trajectory()` returns the optimized keyframes; carrying their
+correction to every pose (blend by distance and angle between keyframes)
+gives a gravity-aligned, loop-closed trajectory. Tilt and accelerometer bias
+separate only when the sensor rotates; a sensor that never turns keeps
+some ambiguity at the start.
+
 ## Layout
 
 - `cpp/bindings.cpp`: pybind11 module `resbie._core`. Its API mirrors
@@ -109,7 +135,8 @@ enumerate the delta:
 - **BIEVR:** the samplers return indices so per-point times survive; sort
   tie-breaks; the config loader is reduced to its YAML helpers; the LM
   registration is removed from `ls_optimizer.h`; the loop closer is
-  synchronous only (no worker threads, GPS or map bundle).
+  synchronous only (no worker threads, GPS or map bundle) and carries the
+  IMU (velocity and bias states, CombinedImuFactor, gravity-only prior).
 
 ## Point density
 
@@ -141,7 +168,7 @@ loader); only `calibration` must be set.
 | `spline` | `knot_hz`, `iterations`, `init_std`; `pos_noise`, `ort_noise` (motion-model noise of settled control points, m/s and rad/s); `new_pos_noise`, `new_ort_noise` (newest control point) |
 | `points` | `downsample_m`, `informed_voxels`, `per_update`, `noise_std_m`, `huber_delta_m`, `gate_sigma` |
 | `map` | `pixel_size_m`, `voxel_size_m`, `normal_tolerance_deg`, `smooth`, `weighted`, `max_size`, `init_min_voxels` |
-| `loop_closure` | `enable`, `max_speed_mps`, and the closer's keyframe, Scan Context, ICP and pose-graph keys |
+| `loop_closure` | `enable` (the whole graph, default on), `max_speed_mps`, and the closer's keyframe, Scan Context, ICP and pose-graph keys |
 | (top level) | `max_num_threads` |
 
 Noises and biases take one number (all axes) or three. RESPLE's parameters

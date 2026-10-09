@@ -32,8 +32,10 @@ COPY core /src/core
 
 RUN python3 -m venv /opt/build-venv \
     && /opt/build-venv/bin/pip install --no-cache-dir --upgrade pip wheel \
+    # rosbags pinned: 0.11.6 decompresses MCAP zstd chunks without their
+    # header size and fails on recordings whose frames don't carry it.
     && /opt/build-venv/bin/pip wheel --no-cache-dir --wheel-dir /wheelhouse \
-        ./core "rosbags>=0.11" "ruamel.yaml"
+        ./core "rosbags==0.11.5" "ruamel.yaml"
 
 FROM ubuntu:${UBUNTU_VERSION} AS runtime
 

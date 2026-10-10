@@ -208,9 +208,6 @@ inline bool loadConfig(const std::vector<std::string>& yaml_paths, Config& c) {
       !ci::getPositive(yaml, "spline", "new_ort_noise", c.new_ort_noise, c.new_ort_noise)) {
     return false;
   }
-  if (1000000000 % c.knot_hz != 0) {
-    LOG(W, "spline.knot_hz " << c.knot_hz << " does not divide 1 s; knot spacing is rounded.");
-  }
 
   // --- points ---
   int informed = static_cast<int>(c.informed_voxels);

@@ -263,6 +263,16 @@ class Odometry {
       return -1;
     }
 
+    // Each knot interval needs at least one IMU sample to remain constrained
+    // when LiDAR points are sparse or dropped: knot_hz <= round(imu_hz).
+    const double imu_hz = (init_imu_.size() - 1) * 1e9 / double(init_imu_.back().time_ns - init_imu_.front().time_ns);
+    const int max_knot_hz = static_cast<int>(std::lround(imu_hz));
+    if (cfg_.knot_hz > max_knot_hz) {
+      LOG(W, "spline.knot_hz " << cfg_.knot_hz << " is more than the IMU (" << max_knot_hz
+                               << " Hz) can carry: knot intervals go unconstrained when the LiDAR is starved."
+                               << " Use " << max_knot_hz << ".");
+    }
+
     Eigen::Vector3d gravity_sum = Eigen::Vector3d::Zero();
     for (const ImuData& imu : init_imu_) gravity_sum += imu.accel;
     gravity_sum /= double(init_imu_.size());

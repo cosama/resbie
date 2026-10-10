@@ -165,7 +165,7 @@ loader); only `calibration` must be set.
 | `calibration` | `translation`, `rotation` (T_I_L, LiDAR to IMU, row-major) |
 | `lidar` | `min_range_m`, `max_range_m`, `time_offset_s` |
 | `imu` | `normalized`; `acc_noise_std`, `gyro_noise_std` (per sample); `acc_bias_init_std`, `gyro_bias_init_std`; `acc_bias_walk`, `gyro_bias_walk` (per sqrt(s)) |
-| `spline` | `knot_hz`, `iterations`, `init_std`; `pos_noise`, `ort_noise` (motion-model noise of settled control points, m/s and rad/s); `new_pos_noise`, `new_ort_noise` (newest control point) |
+| `spline` | `knot_hz` (at most the IMU rate, rounded: each knot interval needs >= 1 IMU sample when the LiDAR is starved; init warns otherwise), `iterations`, `init_std`; `pos_noise`, `ort_noise` (motion-model noise of settled control points, m/s and rad/s); `new_pos_noise`, `new_ort_noise` (newest control point) |
 | `points` | `downsample_m`, `informed_voxels`, `per_update`, `noise_std_m`, `huber_delta_m`, `gate_sigma` |
 | `map` | `pixel_size_m`, `voxel_size_m`, `normal_tolerance_deg`, `smooth`, `weighted`, `max_size`, `init_min_voxels` |
 | `loop_closure` | `enable` (the whole graph, default on), `max_speed_mps`, and the closer's keyframe, Scan Context, ICP and pose-graph keys |

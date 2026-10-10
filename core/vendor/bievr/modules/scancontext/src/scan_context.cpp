@@ -158,7 +158,9 @@ ScanContext::Match ScanContext::search(KeyTree& tree, const std::vector<float>& 
   }
 
   const double sector_angle = 360.0 / config_.num_sectors;
-  match.yaw_diff_rad = static_cast<float>(best_shift * sector_angle * M_PI / 180.0);
+  double yaw_diff = best_shift * sector_angle * M_PI / 180.0;
+  if (yaw_diff > M_PI) yaw_diff -= 2.0 * M_PI;
+  match.yaw_diff_rad = static_cast<float>(yaw_diff);
   if (match.distance >= config_.dist_threshold) match.index = -1;
   return match;
 }

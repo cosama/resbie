@@ -117,12 +117,20 @@ void LoopCloser::addFrame(uint64_t stamp, const Transform& T_W_I, const Pointclo
   if (match.index >= 0) {
     const int current = static_cast<int>(scan_context_.size()) - 1;
     const LoopCandidate candidate{match.index, current, match.yaw_diff_rad};
+    std::cout << "[resbie::pgo] Loop candidate found: from kf=" << candidate.from
+              << " to kf=" << candidate.to
+              << ", sc_dist=" << match.distance
+              << ", yaw_diff=" << (match.yaw_diff_rad * 180.0 / M_PI) << " deg" << std::endl;
     if (const auto constraint = computeLoopConstraint(candidate)) {
       graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(X(candidate.from), X(candidate.to),
                                                     *constraint, loop_noise_));
       ++num_loops_;
+      std::cout << "[resbie::pgo] >>> Loop ACCEPTED between kf=" << candidate.from
+                << " and kf=" << candidate.to << " (total accepted: " << num_loops_ << ")" << std::endl;
     } else {
       ++num_rejected_;
+      std::cout << "[resbie::pgo] --- Loop REJECTED between kf=" << candidate.from
+                << " and kf=" << candidate.to << " (total rejected: " << num_rejected_ << ")" << std::endl;
     }
   }
   optimize();
@@ -286,25 +294,36 @@ std::optional<gtsam::Pose3> LoopCloser::computeLoopConstraint(const LoopCandidat
   // so both are tried. That best-of-two also weakens the fitness rejection below,
   // which is why it is off by default.
   std::vector<Eigen::Matrix4f> guesses;
+  guesses.push_back(Eigen::Matrix4f::Identity());
   const double yaw = candidate.yaw_diff_rad;
-  if (config_.use_sc_yaw_guess &&
-      std::abs(yaw) >= std::max(deg2rad(config_.sc_yaw_guess_min_deg), 1e-6)) {
-    for (const double sign : {-1.0, 1.0}) {
-      const gtsam::Pose3 rotation(gtsam::Rot3::Yaw(sign * yaw), gtsam::Point3(0, 0, 0));
-      guesses.push_back(toMatrix4f(pose_loop * rotation * pose_curr.inverse()));
+  if (config_.use_sc_yaw_guess) {
+    if (std::abs(yaw) >= std::max(deg2rad(config_.sc_yaw_guess_min_deg), 1e-6)) {
+      for (const double sign : {-1.0, 1.0}) {
+        const gtsam::Pose3 rotation(gtsam::Rot3::Yaw(sign * yaw), gtsam::Point3(0, 0, 0));
+        guesses.push_back(toMatrix4f(pose_loop * rotation * pose_curr.inverse()));
+      }
+    } else {
+      guesses.push_back(toMatrix4f(pose_loop * pose_curr.inverse()));
     }
-  } else {
-    guesses.push_back(Eigen::Matrix4f::Identity());
   }
 
   bool converged = false;
   double best_fitness = std::numeric_limits<double>::max();
   Eigen::Matrix4f best_transformation = Eigen::Matrix4f::Identity();
   Cloud aligned;
+  int guess_idx = 0;
   for (const auto& guess : guesses) {
+    ++guess_idx;
     icp.align(aligned, guess);
-    if (!icp.hasConverged()) continue;
+    if (!icp.hasConverged()) {
+      std::cout << "[resbie::pgo]   ICP guess " << guess_idx << "/" << guesses.size()
+                << " did not converge." << std::endl;
+      continue;
+    }
     const double fitness = icp.getFitnessScore();
+    std::cout << "[resbie::pgo]   ICP guess " << guess_idx << "/" << guesses.size()
+              << " converged: fitness=" << fitness
+              << " (threshold=" << config_.loop_fitness_score_threshold << ")" << std::endl;
     if (fitness < best_fitness) {
       converged = true;
       best_fitness = fitness;
@@ -312,7 +331,15 @@ std::optional<gtsam::Pose3> LoopCloser::computeLoopConstraint(const LoopCandidat
     }
   }
 
-  if (!converged || best_fitness > config_.loop_fitness_score_threshold) return std::nullopt;
+  if (!converged || best_fitness > config_.loop_fitness_score_threshold) {
+    if (converged) {
+      std::cout << "[resbie::pgo]   Loop rejected: best fitness " << best_fitness
+                << " > threshold " << config_.loop_fitness_score_threshold << std::endl;
+    } else {
+      std::cout << "[resbie::pgo]   Loop rejected: ICP did not converge for any guess." << std::endl;
+    }
+    return std::nullopt;
+  }
 
   // getFinalTransformation() includes the initial guess, and corrects the current
   // keyframe in the world frame: P_corrected = T_icp * P_curr. BetweenFactor

@@ -85,8 +85,9 @@ for continuing through areas with little or no LiDAR:
   LiDAR information (rotation, translation) and the weakest translation
   direction, position sigma, loop-closer use, point NIS, IMU samples and the
   acceleration axes RESPLE's 10 m/s^2 residual gate dropped, the sweep's mean
-  velocity and the accelerometer bias. `log_level: debug` prints the same as
-  one line per sweep; the default `info` prints none of it.
+  velocity and the accelerometer bias. `resbie.set_log_level("debug")` (a run
+  option, not config) prints the same as one line per sweep; the default
+  `info` prints none of it.
 - **Loop-closer guard:** empty or implausibly fast sweeps
   (`loop_closure.max_speed_mps`) never become keyframes, so a diverged run
   cannot stall the synchronous closer.
@@ -173,7 +174,7 @@ loader); only `calibration` must be set.
 | `points` | `downsample_m`, `informed_voxels`, `per_update`, `noise_std_m`, `huber_delta_m`, `gate_sigma` |
 | `map` | `pixel_size_m`, `voxel_size_m`, `normal_tolerance_deg`, `smooth`, `weighted`, `max_size`, `init_min_voxels` |
 | `loop_closure` | `enable` (the whole graph, default on), `max_speed_mps`, and the closer's keyframe, Scan Context, ICP and pose-graph keys |
-| (top level) | `max_num_threads`, `log_level` (debug, info, warn, error) |
+| (top level) | `max_num_threads` |
 
 Noises and biases take one number (all axes) or three. RESPLE's parameters
 map one to one: `cov_*` variances become `*_std`, and `std_sys` times

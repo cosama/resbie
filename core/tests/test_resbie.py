@@ -147,19 +147,21 @@ def test_default_config_loads_as_is(tmp_path):
     resbie.Resbie(str(path))
     assert set(resbie.DEFAULT_CONFIG) == {
         "calibration", "lidar", "imu", "spline", "points", "map", "loop_closure", "max_num_threads",
-        "log_level",
     }
 
 
-def test_log_level_rejects_unknown_names(tmp_path):
-    with pytest.raises(Exception):
-        resbie.Resbie(_config(tmp_path, extra="log_level: verbose\n"))
+def test_log_level_rejects_unknown_names():
+    with pytest.raises(ValueError):
+        resbie.set_log_level("verbose")
 
 
 @pytest.mark.parametrize("level, lines", [("debug", True), ("info", False)])
 def test_debug_logs_one_line_per_sweep(tmp_path, capfd, level, lines):
-    s = _run(_config(tmp_path, extra=f"loop_closure: {{enable: false}}\nlog_level: {level}\n"),
-             seconds=3.0)
+    resbie.set_log_level(level)
+    try:
+        s = _run(_config(tmp_path, extra="loop_closure: {enable: false}\n"), seconds=3.0)
+    finally:
+        resbie.set_log_level("info")
     out, err = capfd.readouterr()
     n = sum(line.startswith("DEBUG sweep ") for line in out.splitlines())
     assert n == (len(s.trajectory()) if lines else 0)

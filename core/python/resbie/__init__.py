@@ -29,9 +29,9 @@ from typing import Any, Sequence
 
 import numpy as np
 
-from ._core import Resbie as _NativeResbie, default_config
+from ._core import Resbie as _NativeResbie, default_config, set_log_level
 
-__all__ = ["Resbie", "DEFAULT_CONFIG", "DIAGNOSTIC_COLUMNS"]
+__all__ = ["Resbie", "DEFAULT_CONFIG", "DIAGNOSTIC_COLUMNS", "set_log_level"]
 
 # Columns of Resbie.sweep_diagnostics(), one row per reported sweep.
 DIAGNOSTIC_COLUMNS = (

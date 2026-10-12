@@ -52,7 +52,6 @@ class Resbie {
     if (!resbie::loadConfig(config_files, config_)) {
       throw std::invalid_argument("resbie rejected the configuration (see log above)");
     }
-    resbie::applyLogLevel(config_.log_level);
     if (config_.max_num_threads > 0) {
       tbb_control_ = std::make_unique<tbb::global_control>(
           tbb::global_control::max_allowed_parallelism, config_.max_num_threads);
@@ -392,13 +391,22 @@ py::dict defaultConfig() {
       py::arg("isam_relinearize_threshold") = lc.isam_relinearize_threshold,
       py::arg("isam_relinearize_skip") = lc.isam_relinearize_skip);
   d["max_num_threads"] = c.max_num_threads;
-  d["log_level"] = c.log_level;
   return d;
 }
 
 PYBIND11_MODULE(_core, m) {
   m.doc() = "resbie: RESPLE spline filter on the BIEVR map";
   m.def("default_config", &defaultConfig, "Every default, as a nested config dict.");
+  m.def(
+      "set_log_level",
+      [](const std::string& level) {
+        if (!resbie::setLogLevel(level)) {
+          throw std::invalid_argument("log level must be debug, info, warn or error, not '" + level + "'");
+        }
+      },
+      py::arg("level"),
+      "Process-wide log level: debug (adds a line per sweep with the filter diagnostics), info, warn, "
+      "error.");
   py::class_<Resbie>(m, "Resbie")
       .def(py::init<const std::vector<std::string>&, size_t>(), py::arg("config_files"),
            py::arg("map_point_stride") = 0)

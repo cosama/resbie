@@ -61,6 +61,8 @@ class Estimator
         int num_tot_eff = 0;
         int t = 0;
         point_nis.clear();
+        imu_samples = imu_meas.size();
+        acc_gated = 0;
         for (int i = 0; i < max_iter; i++) {
             record_nis_ = (i == 0);
             Eigen::Matrix<double, XSIZE, 1> rcpi = getState();
@@ -130,6 +132,10 @@ class Estimator
     // update pulls it in); ~1 on average if HPH' + R is honest.
     std::vector<double> point_nis;
     bool record_nis_ = false;
+    // resbie: IMU samples in the last update's first iteration, and how many
+    // of their acceleration axes the 10 m/s^2 residual gate dropped.
+    size_t imu_samples = 0;
+    size_t acc_gated = 0;
 
     // resbie: filter covariance (control points, then biases).
     const Eigen::Matrix<double, XSIZE, XSIZE>& covariance() const { return cov_rcp; }
@@ -292,6 +298,7 @@ class Estimator
                         if (gateAccepts(pt_data.zp, lid_cov)) {
                             innv(idx_offset) = - pt_data.zp;
                             H.block(idx_offset, 0, 1, 24) = pt_data.H;
+                            
                         } 
                         mat_cov_inv(idx_offset) = 1/var_pt;
                         idx_offset++;
@@ -311,6 +318,7 @@ class Estimator
                     imu.tail<3>() = imu_data.gyro;
                     for (int i = 0; i < 3; i++) {
                         if (abs(imu(i) - imu_itp(i)) > 10.0) {
+                            if (record_nis_) ++acc_gated;
                             imu(i) = 0;
                             imu_itp(i) = 0;
                             Hi.row(i).setZero();

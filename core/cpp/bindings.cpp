@@ -52,6 +52,7 @@ class Resbie {
     if (!resbie::loadConfig(config_files, config_)) {
       throw std::invalid_argument("resbie rejected the configuration (see log above)");
     }
+    resbie::applyLogLevel(config_.log_level);
     if (config_.max_num_threads > 0) {
       tbb_control_ = std::make_unique<tbb::global_control>(
           tbb::global_control::max_allowed_parallelism, config_.max_num_threads);
@@ -265,7 +266,12 @@ class Resbie {
                         {nsToS(stamp), double(sweep.points.size()), double(g.points_measured),
                          double(g.points_effective), double(g.updates), double(g.imu_only_updates),
                          g.info_rotation, g.info_translation, g.pos_sigma, double(to_closer),
-                         g.nis_count ? g.nis_sum / double(g.nis_count) : NAN});
+                         g.nis_count ? g.nis_sum / double(g.nis_count) : NAN,
+                         g.weak_translation.x(), g.weak_translation.y(), g.weak_translation.z(),
+                         double(g.imu_samples), double(g.acc_gated),
+                         g.velocity.x(), g.velocity.y(), g.velocity.z(),
+                         g.acc_bias.x(), g.acc_bias.y(), g.acc_bias.z(),
+                         double(g.matched_voxels)});
     if (to_closer) {
       // GTSAM's ISAM2 parallelizes through TBB and then depends on scheduling;
       // one thread keeps the loop closer deterministic (as the bievr bridge).
@@ -307,7 +313,7 @@ class Resbie {
   size_t loop_closer_skipped_ = 0;
 
  public:
-  static constexpr size_t kDiagColumns = 11;
+  static constexpr size_t kDiagColumns = 23;
   py::array_t<double> sweepDiagnostics() {
     std::lock_guard<std::mutex> lock(mutex_);
     const py::ssize_t rows = static_cast<py::ssize_t>(diagnostics_.size() / kDiagColumns);
@@ -386,6 +392,7 @@ py::dict defaultConfig() {
       py::arg("isam_relinearize_threshold") = lc.isam_relinearize_threshold,
       py::arg("isam_relinearize_skip") = lc.isam_relinearize_skip);
   d["max_num_threads"] = c.max_num_threads;
+  d["log_level"] = c.log_level;
   return d;
 }
 

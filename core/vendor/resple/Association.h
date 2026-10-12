@@ -28,10 +28,12 @@ public:
         return q * p_b + pos;
     }
 
-    // Residual of a world point against the map and its gradient d r / d p_w.
-    // False when no observed voxel with a valid pixel covers the point.
+    // Residual of a world point against the map, its gradient d r / d p_w, and
+    // the voxel it was measured in. False when no observed voxel with a valid
+    // pixel covers the point.
     static bool mapResidual(const bievr::BIEVRMap& map, const MapAssociationConfig& cfg,
-                            const Eigen::Vector3d& p_w, double& r, Eigen::Vector3d& grad)
+                            const Eigen::Vector3d& p_w, double& r, Eigen::Vector3d& grad,
+                            size_t& voxel_hash)
     {
         size_t hash = map.hashIndex(p_w);
         const bievr::Voxel* voxel = map.getVoxel(hash);
@@ -50,6 +52,7 @@ public:
         const Eigen::Vector3d dr_dpo(-dIdx * inv_size, -dIdy * inv_size, 1.0);
         r = p_o.z() - I;
         grad = T_C_W.linear().transpose() * dr_dpo;
+        voxel_hash = hash;
         return true;
     }
 
@@ -67,7 +70,7 @@ public:
             pt_data.pt_w = pointBodyToWorld(pt_data.time_ns, spline, pt_data.pt_b);
             double r;
             Eigen::Vector3d grad;
-            if (!mapResidual(map, cfg, pt_data.pt_w, r, grad)) continue;
+            if (!mapResidual(map, cfg, pt_data.pt_w, r, grad, pt_data.voxel)) continue;
             pt_data.if_valid = true;
             pt_data.normvec = grad;
             pt_data.dist = r - grad.dot(pt_data.pt_w);

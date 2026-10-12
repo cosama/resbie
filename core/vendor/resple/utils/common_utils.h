@@ -107,6 +107,7 @@ struct PointData {
     Eigen::Matrix<double, 1, 24> H = Eigen::Matrix<double, 1, 24>::Zero();
     double var_pt = 0.01;
     double var_scale = 1.0;
+    size_t voxel = 0;  // resbie: map voxel the point was matched to
 
     PointData() {}
     PointData(const Eigen::Vector3d& p_b, int64_t t_ns, double w_pt)

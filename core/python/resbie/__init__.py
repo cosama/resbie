@@ -46,6 +46,18 @@ DIAGNOSTIC_COLUMNS = (
     "pos_sigma",         # position sigma of the newest control point, m
     "to_loop_closer",    # 1 if handed to the loop closer
     "nis_mean",          # mean point zp^2 / (HPH' + R) (prior); ~1 if variances are honest
+    "weak_x",            # world direction of info_translation (unit; sign arbitrary)
+    "weak_y",
+    "weak_z",
+    "imu_samples",       # IMU samples measured
+    "acc_gated",         # of their acceleration axes, dropped by the 10 m/s^2 residual gate
+    "vel_x",             # final spline velocity, mean over the sweep, world, m/s
+    "vel_y",
+    "vel_z",
+    "acc_bias_x",        # accelerometer bias at the sweep's last update, m/s^2
+    "acc_bias_y",
+    "acc_bias_z",
+    "matched_voxels",    # distinct map voxels of the matched points, summed over updates
 )
 
 PathLike = str | os.PathLike

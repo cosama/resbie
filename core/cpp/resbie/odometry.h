@@ -27,9 +27,11 @@
 
 #include <Eigen/Eigenvalues>
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <iomanip>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -55,6 +57,12 @@ struct SweepDiagnostics {
   double info_translation = 0.0; // smallest eigenvalue, translation block (1/m^2)
   double nis_sum = 0.0;          // sum of point zp^2 / (HPH' + R) (prior, first iteration)
   size_t nis_count = 0;
+  Eigen::Vector3d weak_translation = Eigen::Vector3d::Zero();  // world direction of info_translation
+  size_t matched_voxels = 0;     // distinct map voxels of the matched points, summed over updates
+  size_t imu_samples = 0;        // IMU samples measured
+  size_t acc_gated = 0;          // of their acceleration axes, dropped by the 10 m/s^2 residual gate
+  Eigen::Vector3d acc_bias = Eigen::Vector3d::Zero();  // at the last update, m/s^2
+  Eigen::Vector3d velocity = Eigen::Vector3d::Zero();  // final spline, world, mean over the sweep, m/s
 };
 
 // One LiDAR sweep in the IMU frame, range-filtered, with absolute point times.
@@ -199,9 +207,11 @@ class Odometry {
   // Adds this update to the diagnostics of the sweep its batch ends in.
   void recordUpdate(int64_t t_ns) {
     size_t effective = 0;
+    size_t voxels = 0;
     Eigen::Matrix<double, 6, 6> info = Eigen::Matrix<double, 6, 6>::Zero();
     if (!pt_meas_.empty()) {
       const Eigen::Vector3d pos = spline_->itpPosition(std::min(t_ns, spline_->maxTimeNs()));
+      std::vector<size_t> matched;
       for (const PointData& p : pt_meas_) {
         if (!p.if_valid) continue;
         ++effective;
@@ -210,7 +220,10 @@ class Odometry {
         Eigen::Matrix<double, 6, 1> J;
         J << (p.pt_w - pos).cross(p.normvec), p.normvec;
         info.noalias() += (1.0 / (p.var_pt * p.var_scale)) * J * J.transpose();
+        matched.push_back(p.voxel);
       }
+      std::sort(matched.begin(), matched.end());
+      voxels = std::unique(matched.begin(), matched.end()) - matched.begin();
     }
     ++updates_;
     points_measured_ += pt_meas_.size();
@@ -229,11 +242,15 @@ class Odometry {
     d->imu_only_updates += effective == 0;
     d->points_measured += pt_meas_.size();
     d->points_effective += effective;
+    d->matched_voxels += voxels;
     d->info += info;
     for (double nis : estimator_.point_nis) {
       d->nis_sum += nis;
       ++d->nis_count;
     }
+    d->imu_samples += estimator_.imu_samples;
+    d->acc_gated += estimator_.acc_gated;
+    d->acc_bias = estimator_.getState().template segment<3>(Estimator<30>::BA_OFFSET);
     const Eigen::Matrix3d P_pos = estimator_.covariance().template block<3, 3>(18, 18);
     d->pos_sigma = std::sqrt(std::max(
         0.0, Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(P_pos).eigenvalues().maxCoeff()));
@@ -438,7 +455,22 @@ class Odometry {
     const Eigen::Matrix3d Ir = d.info.topLeftCorner<3, 3>();
     const Eigen::Matrix3d It = d.info.bottomRightCorner<3, 3>();
     d.info_rotation = Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(Ir).eigenvalues().minCoeff();
-    d.info_translation = Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(It).eigenvalues().minCoeff();
+    const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> et(It);  // eigenvalues ascending
+    d.info_translation = et.eigenvalues()(0);
+    d.weak_translation = et.eigenvectors().col(0);
+  }
+
+  static void logDiagnostics(int64_t end_ns, const SweepDiagnostics& d) {
+    LOG(D, std::fixed << std::setprecision(3) << "sweep " << end_ns * 1e-9
+        << " matched " << d.points_effective << "/" << d.points_measured << " points"
+        << " updates " << d.updates << " (imu-only " << d.imu_only_updates << ")"
+        << std::setprecision(4) << " info rot " << d.info_rotation << " trans " << d.info_translation
+        << " weak [" << d.weak_translation.transpose() << "]"
+        << " weak_sigma " << (d.info_translation > 0.0 ? 1.0 / std::sqrt(d.info_translation) : INFINITY)
+        << " pos_sigma " << d.pos_sigma
+        << " nis " << (d.nis_count ? d.nis_sum / double(d.nis_count) : NAN)
+        << " voxels " << d.matched_voxels << " imu " << d.imu_samples << " acc_gated " << d.acc_gated
+        << " vel [" << d.velocity.transpose() << "] acc_bias [" << d.acc_bias.transpose() << "]");
   }
 
   void finalize(Sweep& sweep) {
@@ -460,6 +492,10 @@ class Odometry {
     spline_->itpQuaternion(sweep.end_ns, &q_end);
     const bievr::Transform T_W_I(q_end, spline_->itpPosition(sweep.end_ns));
     const bievr::Transform T_I_W = T_W_I.inverse();
+    if (sweep.end_ns > t0) {
+      sweep.diag.velocity = (T_W_I.translation() - p[0]) / (double(sweep.end_ns - t0) * 1e-9);
+    }
+    if (debugEnabled()) logDiagnostics(sweep.end_ns, sweep.diag);
 
     const size_t n = sweep.points.size();
     bievr::Pointcloud world, deskewed;

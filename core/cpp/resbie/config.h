@@ -17,7 +17,7 @@
 //           weighted, max_size, init_min_voxels
 //   loop_closure: enable, max_speed_mps, BIEVR's keyframe / Scan Context /
 //           ICP / pose-graph keys (bievr_pgo/config_loader.h)
-//   max_num_threads
+//   max_num_threads, log_level
 
 #include <cmath>
 #include <string>
@@ -89,6 +89,8 @@ struct Config {
   double loop_closure_max_speed_mps = 30.0;
 
   int max_num_threads = 0;  // 0: all cores
+  // debug adds a line per sweep with the filter diagnostics (resbie/odometry.h).
+  std::string log_level = "info";  // debug, info, warn, error
   std::vector<std::string> yaml_paths;
 };
 
@@ -106,8 +108,22 @@ inline constexpr const char* kKeys[] = {
     "map.pixel_size_m", "map.voxel_size_m", "map.normal_tolerance_deg", "map.smooth",
     "map.weighted", "map.max_size", "map.init_min_voxels",
     "loop_closure.max_speed_mps",
-    "max_num_threads",
+    "max_num_threads", "log_level",
 };
+
+// log_level names, in the order of lpp::internal::BaseSeverity.
+inline constexpr const char* kLogLevels[] = {"debug", "info", "warn", "error"};
+
+// Sets the process-wide log++ level (it is one global sink).
+inline void applyLogLevel(const std::string& level) {
+  const auto it = std::find(std::begin(kLogLevels), std::end(kLogLevels), level);
+  LOG_SET_LEVEL(static_cast<lpp::internal::BaseSeverity>(std::distance(std::begin(kLogLevels), it)));
+}
+
+inline bool debugEnabled() {
+  return lpp::internal::lpp_min_severity.load(std::memory_order_relaxed) <=
+         static_cast<int>(lpp::internal::BaseSeverity::DEBUG);
+}
 
 namespace detail {
 
@@ -247,6 +263,12 @@ inline bool loadConfig(const std::vector<std::string>& yaml_paths, Config& c) {
   c.max_num_threads = yaml.getTopLevel<int>("max_num_threads", c.max_num_threads);
   if (c.max_num_threads < 0) {
     LOG(E, "Config error: 'max_num_threads' must be >= 0.");
+    return false;
+  }
+  c.log_level = yaml.getTopLevel<std::string>("log_level", c.log_level);
+  if (std::find(std::begin(kLogLevels), std::end(kLogLevels), c.log_level) == std::end(kLogLevels)) {
+    LOG(E, "Config error: 'log_level' must be debug, info, warn or error, not '" << c.log_level
+                                                                                    << "'.");
     return false;
   }
   return true;

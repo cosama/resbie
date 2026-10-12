@@ -146,8 +146,34 @@ def test_default_config_loads_as_is(tmp_path):
     path.write_text(json.dumps(resbie.DEFAULT_CONFIG))  # JSON is valid YAML
     resbie.Resbie(str(path))
     assert set(resbie.DEFAULT_CONFIG) == {
-        "calibration", "lidar", "imu", "spline", "points", "map", "loop_closure", "max_num_threads"
+        "calibration", "lidar", "imu", "spline", "points", "map", "loop_closure", "max_num_threads",
+        "log_level",
     }
+
+
+def test_log_level_rejects_unknown_names(tmp_path):
+    with pytest.raises(Exception):
+        resbie.Resbie(_config(tmp_path, extra="log_level: verbose\n"))
+
+
+@pytest.mark.parametrize("level, lines", [("debug", True), ("info", False)])
+def test_debug_logs_one_line_per_sweep(tmp_path, capfd, level, lines):
+    s = _run(_config(tmp_path, extra=f"loop_closure: {{enable: false}}\nlog_level: {level}\n"),
+             seconds=3.0)
+    out, err = capfd.readouterr()
+    n = sum(line.startswith("DEBUG sweep ") for line in out.splitlines())
+    assert n == (len(s.trajectory()) if lines else 0)
+
+
+def test_diagnostics_velocity_follows_the_motion(tmp_path):
+    s = _run(_config(tmp_path, extra="loop_closure: {enable: false}\n"), seconds=4.0,
+             velocity=(0.5, 0.0, 0.0))
+    diag = s.sweep_diagnostics()
+    col = {c: i for i, c in enumerate(resbie.DIAGNOSTIC_COLUMNS)}
+    late = diag[diag[:, 0] > diag[0, 0] + 1.0]
+    vel = late[:, [col["vel_x"], col["vel_y"], col["vel_z"]]]
+    assert np.abs(vel - [0.5, 0.0, 0.0]).max() < 0.05, vel
+    assert np.all(late[:, col["imu_samples"]] > 0)
 
 
 def _tilt_deg(q):

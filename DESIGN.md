@@ -108,7 +108,10 @@ outputs:
   densities at the measured IMU rate.
 - The first keyframe's prior fixes only yaw and position (the gauge); roll
   and pitch are left to gravity.
-- Loop closures (Scan Context + ICP) add relative poses as before.
+- Loop closures (Scan Context + ICP) add relative poses as before. Scan
+  Context sees each keyframe cloud levelled on gravity (by the graph's
+  corrected attitude, heading kept), not in the body frame, which may be
+  tilted or mounted upside down.
 - iSAM2 updates incrementally per keyframe (loop search uses the corrected
   map); `finish()` runs one batch optimization of the whole graph.
 

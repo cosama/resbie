@@ -44,6 +44,16 @@ Eigen::Matrix4f toMatrix4f(const gtsam::Pose3& p) { return p.matrix().cast<float
 
 double deg2rad(double deg) { return deg * M_PI / 180.0; }
 
+// resbie: the body frame's heading about world z (world z is up, gravity-aligned).
+double headingOf(const Eigen::Matrix3d& R) { return std::atan2(R(1, 0), R(0, 0)); }
+
+// resbie: a pose's gravity-aligned frame: same position and heading, level.
+// Scan Context assumes a level cloud with z up; the body frame can be tilted or
+// mounted upside down (H420's imu_link is rolled by pi).
+gtsam::Pose3 levelFrame(const gtsam::Pose3& pose) {
+  return gtsam::Pose3(gtsam::Rot3::Yaw(headingOf(pose.rotation().matrix())), pose.translation());
+}
+
 }  // namespace
 
 LoopCloser::LoopCloser(Config config)
@@ -158,12 +168,16 @@ void LoopCloser::integrateKeyframe(PendingFrame frame) {
   keyframe_poses_.push_back(initial);
   keyframe_stamps_.push_back(frame.stamp);
 
-  // Scan Context wants the body-frame cloud, at the same resolution the
-  // original pipeline fed it.
+  // Scan Context wants the cloud at the same resolution the original pipeline
+  // fed it, in the keyframe's level frame (resbie: not the body frame, which
+  // may be tilted or upside down). Level by the corrected estimate, whose roll
+  // and pitch the graph's gravity factors keep honest, as the loop check does.
+  const Eigen::Matrix3d R_level_body =
+      levelFrame(initial).rotation().matrix().transpose() * initial.rotation().matrix();
   Eigen::Matrix<double, 3, Eigen::Dynamic> sc_cloud(3, downsampled->size());
   for (size_t i = 0; i < downsampled->size(); ++i) {
     const auto& p = downsampled->points[i];
-    sc_cloud.col(i) << p.x, p.y, p.z;
+    sc_cloud.col(i) = R_level_body * Eigen::Vector3d(p.x, p.y, p.z);
   }
   scan_context_.add(sc_cloud);
 
@@ -289,21 +303,24 @@ std::optional<gtsam::Pose3> LoopCloser::computeLoopConstraint(const LoopCandidat
   icp.setInputTarget(target);
 
   // Both clouds are in the world frame, so identity is the right start unless the
-  // revisit runs in the opposite direction. Then Scan Context's yaw is lifted to
-  // the world frame as P_loop * Rz(+-yaw) * P_curr^-1; the sign is not measured,
-  // so both are tried. That best-of-two also weakens the fitness rejection below,
-  // which is why it is off by default.
+  // revisit runs in the opposite direction. Then Scan Context's yaw (measured
+  // between the level frames L) is lifted to the world frame as
+  // L_loop * Rz(+-yaw) * L_curr^-1, a rotation about world z; the sign is not
+  // measured, so both are tried. That best-of-two also weakens the fitness
+  // rejection below, which is why it is off by default.
   std::vector<Eigen::Matrix4f> guesses;
   guesses.push_back(Eigen::Matrix4f::Identity());
   const double yaw = candidate.yaw_diff_rad;
+  const gtsam::Pose3 level_curr = levelFrame(pose_curr);
+  const gtsam::Pose3 level_loop = levelFrame(pose_loop);
   if (config_.use_sc_yaw_guess) {
     if (std::abs(yaw) >= std::max(deg2rad(config_.sc_yaw_guess_min_deg), 1e-6)) {
       for (const double sign : {-1.0, 1.0}) {
         const gtsam::Pose3 rotation(gtsam::Rot3::Yaw(sign * yaw), gtsam::Point3(0, 0, 0));
-        guesses.push_back(toMatrix4f(pose_loop * rotation * pose_curr.inverse()));
+        guesses.push_back(toMatrix4f(level_loop * rotation * level_curr.inverse()));
       }
     } else {
-      guesses.push_back(toMatrix4f(pose_loop * pose_curr.inverse()));
+      guesses.push_back(toMatrix4f(level_loop * level_curr.inverse()));
     }
   }
 

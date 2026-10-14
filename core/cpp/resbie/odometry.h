@@ -63,6 +63,14 @@ struct SweepDiagnostics {
   size_t acc_gated = 0;          // of their acceleration axes, dropped by the 10 m/s^2 residual gate
   Eigen::Vector3d acc_bias = Eigen::Vector3d::Zero();  // at the last update, m/s^2
   Eigen::Vector3d velocity = Eigen::Vector3d::Zero();  // final spline, world, mean over the sweep, m/s
+  size_t points_gated = 0;       // matched points the Mahalanobis gate rejected (last iteration)
+  // A-posteriori IMU check: the final spline's velocity change over the sweep
+  // minus the IMU's (world, m/s, final orientation, current acc bias). Each
+  // IMU sample is checked against the spline only once, before later updates
+  // reshape it; this checks the result. Its std under the accelerometer noise
+  // is imu_post_sigma.
+  Eigen::Vector3d imu_post_dv = Eigen::Vector3d::Constant(NAN);
+  double imu_post_sigma = NAN;
 };
 
 // One LiDAR sweep in the IMU frame, range-filtered, with absolute point times.
@@ -115,6 +123,7 @@ class Odometry {
     init_imu_.emplace_back(t_ns, gyro, acc);
     if (init_imu_.size() > kInitImuSamples) init_imu_.pop_front();
     imu_buff_.emplace_back(t_ns, gyro, acc * (acc_scale_ > 0 ? acc_scale_ : 1.0));
+    imu_hist_.emplace_back(t_ns, acc);
     process();
     return true;
   }
@@ -194,14 +203,39 @@ class Odometry {
         estimator_.propRCP(max_time_ns);
       }
       knots_at_last_update_ = spline_->numKnots();
+      const Eigen::Matrix<double, 30, 1> state_before = estimator_.getState();
       for (PointData& p : pt_meas_) p.var_pt = pointVariance();
       estimator_.updateIEKFLiDARInertial(pt_meas_, map_, cfg_.association, imu_meas_, gravity_,
                                          cfg_.acc_noise_std.cwiseAbs2(),
                                          cfg_.gyro_noise_std.cwiseAbs2());
       recordUpdate(max_time_ns);
+      if (debugEnabled()) logUpdate(max_time_ns, state_before);
       pt_meas_.clear();
       finalizeSweeps(false);
     }
+  }
+
+  // Debug trace, one line per filter update: what it measured and how far it
+  // moved the newest knot (position, and velocity (cp_3 - cp_2) / dt).
+  void logUpdate(int64_t t_ns, const Eigen::Matrix<double, 30, 1>& before) {
+    const Eigen::Matrix<double, 30, 1> after = estimator_.getState();
+    const double inv_dt = 1e9 / double(dt_ns_);
+    const auto vel = [&](const Eigen::Matrix<double, 30, 1>& s) {
+      return Eigen::Vector3d((s.segment<3>(18) - s.segment<3>(12)) * inv_dt);
+    };
+    size_t matched = 0;
+    for (const PointData& p : pt_meas_) matched += p.if_valid;
+    double nis_mean = 0.0, nis_max = 0.0;
+    for (double n : estimator_.point_nis) {
+      nis_mean += n;
+      nis_max = std::max(nis_max, n);
+    }
+    if (!estimator_.point_nis.empty()) nis_mean /= double(estimator_.point_nis.size());
+    LOG(D, std::fixed << std::setprecision(4) << "update " << t_ns * 1e-9 << " points " << matched << "/"
+        << pt_meas_.size() << " gated " << estimator_.points_gated << " imu " << imu_meas_.size()
+        << " nis " << nis_mean << " max " << nis_max
+        << " d_pos " << (after.segment<3>(18) - before.segment<3>(18)).norm()
+        << " vel [" << vel(after).transpose() << "] d_vel [" << (vel(after) - vel(before)).transpose() << "]");
   }
 
   // Adds this update to the diagnostics of the sweep its batch ends in.
@@ -250,6 +284,7 @@ class Odometry {
     }
     d->imu_samples += estimator_.imu_samples;
     d->acc_gated += estimator_.acc_gated;
+    if (effective > 0) d->points_gated += estimator_.points_gated;
     d->acc_bias = estimator_.getState().template segment<3>(Estimator<30>::BA_OFFSET);
     const Eigen::Matrix3d P_pos = estimator_.covariance().template block<3, 3>(18, 18);
     d->pos_sigma = std::sqrt(std::max(
@@ -451,6 +486,31 @@ class Odometry {
     }
   }
 
+  // SweepDiagnostics::imu_post_dv. The spline's acceleration is R (a - b_a) - g
+  // (Estimator::prepIMU), integrated here over the sweep's IMU samples.
+  void checkImuPosterior(Sweep& sweep) {
+    while (!imu_hist_.empty() && imu_hist_.front().first < sweep.start_ns - 1000000000LL) imu_hist_.pop_front();
+    if (sweep.end_ns <= sweep.start_ns || sweep.start_ns < spline_->minTimeNs() || acc_scale_ <= 0) return;
+    const Eigen::Vector3d ba = estimator_.biasAcc();
+    Eigen::Vector3d dv_imu = Eigen::Vector3d::Zero();
+    double sum_dt2 = 0.0;
+    int64_t prev = sweep.start_ns;
+    for (const auto& [t, a] : imu_hist_) {
+      if (t <= sweep.start_ns || t > sweep.end_ns) continue;
+      Eigen::Quaterniond q;
+      spline_->itpQuaternion(t, &q);
+      const double dt = double(t - prev) * 1e-9;
+      dv_imu += (q * (a * acc_scale_ - ba) - gravity_) * dt;
+      sum_dt2 += dt * dt;
+      prev = t;
+    }
+    if (prev == sweep.start_ns) return;
+    const Eigen::Vector3d dv_spline =
+        spline_->itpPosition<1>(prev) - spline_->itpPosition<1>(sweep.start_ns);
+    sweep.diag.imu_post_dv = dv_spline - dv_imu;
+    sweep.diag.imu_post_sigma = cfg_.acc_noise_std.mean() * std::sqrt(sum_dt2);
+  }
+
   static void summarizeInfo(SweepDiagnostics& d) {
     const Eigen::Matrix3d Ir = d.info.topLeftCorner<3, 3>();
     const Eigen::Matrix3d It = d.info.bottomRightCorner<3, 3>();
@@ -470,7 +530,9 @@ class Odometry {
         << " pos_sigma " << d.pos_sigma
         << " nis " << (d.nis_count ? d.nis_sum / double(d.nis_count) : NAN)
         << " voxels " << d.matched_voxels << " imu " << d.imu_samples << " acc_gated " << d.acc_gated
-        << " vel [" << d.velocity.transpose() << "] acc_bias [" << d.acc_bias.transpose() << "]");
+        << " vel [" << d.velocity.transpose() << "] acc_bias [" << d.acc_bias.transpose() << "]"
+        << " gated " << d.points_gated << " imu_post_dv [" << d.imu_post_dv.transpose() << "] (sigma "
+        << d.imu_post_sigma << ")");
   }
 
   void finalize(Sweep& sweep) {
@@ -495,6 +557,7 @@ class Odometry {
     if (sweep.end_ns > t0) {
       sweep.diag.velocity = (T_W_I.translation() - p[0]) / (double(sweep.end_ns - t0) * 1e-9);
     }
+    checkImuPosterior(sweep);
     if (debugEnabled()) logDiagnostics(sweep.end_ns, sweep.diag);
 
     const size_t n = sweep.points.size();
@@ -530,6 +593,7 @@ class Odometry {
   int64_t knots_at_last_update_ = -1;
 
   std::deque<ImuData> init_imu_;
+  std::deque<std::pair<int64_t, Eigen::Vector3d>> imu_hist_;  // raw acc, for checkImuPosterior
   Eigen::aligned_deque<ImuData> imu_buff_;
   Eigen::aligned_deque<ImuData> imu_meas_;
   std::deque<Sweep> sweeps_;         // waiting to be measured

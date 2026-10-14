@@ -85,9 +85,13 @@ for continuing through areas with little or no LiDAR:
   LiDAR information (rotation, translation) and the weakest translation
   direction, position sigma, loop-closer use, point NIS, IMU samples and the
   acceleration axes RESPLE's 10 m/s^2 residual gate dropped, the sweep's mean
-  velocity and the accelerometer bias. `resbie.set_log_level("debug")` (a run
-  option, not config) prints the same as one line per sweep; the default
-  `info` prints none of it.
+  velocity and the accelerometer bias, the points the gate rejected, and an
+  a-posteriori IMU check (the final trajectory's velocity change per sweep
+  minus the IMU's: each IMU sample is otherwise only checked once, before
+  later updates reshape the trajectory). `resbie.set_log_level("debug")` (a run
+  option, not config) prints the same as one line per sweep, plus one line per
+  filter update (what it measured, how far it moved the newest knot); the
+  default `info` prints none of it.
 - **Loop-closer guard:** empty or implausibly fast sweeps
   (`loop_closure.max_speed_mps`) never become keyframes, so a diverged run
   cannot stall the synchronous closer.

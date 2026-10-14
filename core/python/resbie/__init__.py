@@ -58,6 +58,11 @@ DIAGNOSTIC_COLUMNS = (
     "acc_bias_y",
     "acc_bias_z",
     "matched_voxels",    # distinct map voxels of the matched points, summed over updates
+    "points_gated",      # matched points the Mahalanobis gate rejected (last iteration of each update)
+    "imu_post_dv_x",     # final spline's velocity change over the sweep minus the IMU's, world, m/s
+    "imu_post_dv_y",
+    "imu_post_dv_z",
+    "imu_post_sigma",    # its std under the configured accelerometer noise, m/s
 )
 
 PathLike = str | os.PathLike

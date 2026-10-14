@@ -270,7 +270,8 @@ class Resbie {
                          double(g.imu_samples), double(g.acc_gated),
                          g.velocity.x(), g.velocity.y(), g.velocity.z(),
                          g.acc_bias.x(), g.acc_bias.y(), g.acc_bias.z(),
-                         double(g.matched_voxels)});
+                         double(g.matched_voxels), double(g.points_gated), g.imu_post_dv.x(),
+                         g.imu_post_dv.y(), g.imu_post_dv.z(), g.imu_post_sigma});
     if (to_closer) {
       // GTSAM's ISAM2 parallelizes through TBB and then depends on scheduling;
       // one thread keeps the loop closer deterministic (as the bievr bridge).
@@ -312,7 +313,7 @@ class Resbie {
   size_t loop_closer_skipped_ = 0;
 
  public:
-  static constexpr size_t kDiagColumns = 23;
+  static constexpr size_t kDiagColumns = 28;
   py::array_t<double> sweepDiagnostics() {
     std::lock_guard<std::mutex> lock(mutex_);
     const py::ssize_t rows = static_cast<py::ssize_t>(diagnostics_.size() / kDiagColumns);

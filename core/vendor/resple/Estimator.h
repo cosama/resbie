@@ -63,6 +63,7 @@ class Estimator
         point_nis.clear();
         imu_samples = imu_meas.size();
         acc_gated = 0;
+        bool updated = false;
         for (int i = 0; i < max_iter; i++) {
             record_nis_ = (i == 0);
             Eigen::Matrix<double, XSIZE, 1> rcpi = getState();
@@ -79,8 +80,13 @@ class Estimator
                 // out here, so a LiDAR gap also dropped every IMU sample in it.
                 updateLiDARInertial(pt_meas, imu_meas, 0, rcp_prop, cov_prop, g, cov_acc, cov_gyro);
             } else {
+                // resbie: re-association found nothing to measure. Keep the
+                // last iteration's estimate with its posterior covariance
+                // (upstream kept the prior covariance for an updated state).
+                if (updated) cov_rcp = 0.5*(P_post_ + P_post_.transpose());
                 break;
             }
+            updated = true;
             converged = true;
             Eigen::Matrix<double, XSIZE, 1> state_af = getState();
             if ((state_af - rcpi).norm() > eps) {
@@ -136,6 +142,8 @@ class Estimator
     // of their acceleration axes the 10 m/s^2 residual gate dropped.
     size_t imu_samples = 0;
     size_t acc_gated = 0;
+    // resbie: matched points the Mahalanobis gate rejected in the last iteration.
+    size_t points_gated = 0;
 
     // resbie: filter covariance (control points, then biases).
     const Eigen::Matrix<double, XSIZE, XSIZE>& covariance() const { return cov_rcp; }
@@ -240,6 +248,7 @@ class Estimator
             prepLiDAR(pt_data);
         }        
         int idx_offset = 0;
+        points_gated = 0;
         for(size_t i = 0; i < num_pt; i++) {
             const PointData& pt_data = pt_meas[i];
             if (pt_data.if_valid) {
@@ -252,8 +261,9 @@ class Estimator
                 if (gateAccepts(pt_data.zp, lid_cov)) {
                     innv(idx_offset) = - pt_data.zp;
                     H.row(idx_offset) = Hi;
-                    
-                } 
+                } else {
+                    ++points_gated;
+                }
                 mat_cov_inv(idx_offset) = 1/var_pt;
                 idx_offset++;
             }
@@ -275,6 +285,7 @@ class Estimator
         for (size_t i = 0; i < imu_meas.size(); i++) {
             prepIMU(imu_meas[i], g);
         }                
+        points_gated = 0;
         int dim_meas = 6*imu_meas.size() + num_valid;
         Eigen::Matrix<double, Eigen::Dynamic, XSIZE> H(dim_meas, XSIZE);
         Eigen::Matrix<double, Eigen::Dynamic, 1> innv(dim_meas, 1);
@@ -298,8 +309,9 @@ class Estimator
                         if (gateAccepts(pt_data.zp, lid_cov)) {
                             innv(idx_offset) = - pt_data.zp;
                             H.block(idx_offset, 0, 1, 24) = pt_data.H;
-                            
-                        } 
+                        } else {
+                            ++points_gated;
+                        }
                         mat_cov_inv(idx_offset) = 1/var_pt;
                         idx_offset++;
                     }

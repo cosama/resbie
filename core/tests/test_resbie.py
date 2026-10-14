@@ -175,6 +175,12 @@ def test_diagnostics_velocity_follows_the_motion(tmp_path):
     late = diag[diag[:, 0] > diag[0, 0] + 1.0]
     vel = late[:, [col["vel_x"], col["vel_y"], col["vel_z"]]]
     assert np.abs(vel - [0.5, 0.0, 0.0]).max() < 0.05, vel
+    # Consistent data: the final trajectory agrees with the IMU sweep by sweep
+    # to within a few accelerometer-noise sigmas (a wrong gravity or sign
+    # would be ~40 sigma).
+    dv = late[:, [col["imu_post_dv_x"], col["imu_post_dv_y"], col["imu_post_dv_z"]]]
+    z = dv / late[:, [col["imu_post_sigma"]]]
+    assert np.nanmean(z**2) < 10.0, z
     assert np.all(late[:, col["imu_samples"]] > 0)
 
 

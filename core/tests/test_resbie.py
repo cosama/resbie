@@ -246,3 +246,38 @@ def test_map_max_size_lru_eviction(tmp_path):
     np.testing.assert_array_equal(s1.trajectory(), s2.trajectory())
     np.testing.assert_array_equal(s1.sweep_diagnostics(), s2.sweep_diagnostics())
 
+
+def test_step1_low_risk_fixes(tmp_path):
+    # 1. Single-voxel scan: the old group loop initialized prev_hash = hashed_points_.back().first,
+    # which skipped the entire scan whenever all points landed in a single voxel (front == back).
+    extra = "map: {voxel_size_m: 100.0, init_min_voxels: 1}\nloop_closure: {enable: false}\n"
+    s = resbie.Resbie(_config(tmp_path, 0, extra=extra))
+    rng = np.random.default_rng(42)
+    pts = rng.uniform(1.5, 4.5, (200, 3))
+    rel = np.sort(rng.uniform(0.0, 0.09, len(pts)))
+    for k in range(40):
+        assert s.push_imu(1.0 + k * IMU_DT, [0.0, 0.0, 9.81], [0.0, 0.0, 0.0])
+    assert s.push_lidar(1.0, pts, rel)
+    assert s.push_lidar(1.1, pts, rel)
+    st = s.status()
+    assert st["initialized"]
+    assert st["map_voxels"] == 1
+
+    # 2. 24-col normal equations with gated IMU spike (verifies gated axis sets w_imu(k) = 0.0
+    # in R_inv so rejected spikes do not count as full-confidence bias measurements):
+    s_spike = resbie.Resbie(_config(tmp_path, 0, extra="loop_closure: {enable: false}\n"))
+    t0 = 1.0
+    for k in range(int(3.0 / IMU_DT)):
+        acc = [50.0, 0.0, 9.81] if k == 250 else [0.0, 0.0, 9.81]
+        gyr = [0.0, 20.0, 0.0] if k == 250 else [0.0, 0.0, 0.0]
+        assert s_spike.push_imu(t0 + k * IMU_DT, acc, gyr)
+        if k % SWEEP_IMU == SWEEP_IMU - 1:
+            start = t0 + (k - SWEEP_IMU + 1) * IMU_DT
+            world = _room(rng, 800)
+            rel_t = np.sort(rng.uniform(0.0, 0.0999, len(world)))
+            assert s_spike.push_lidar(start, world, rel_t)
+    s_spike.finish()
+    traj = s_spike.trajectory()
+    assert len(traj) > 10 and np.all(np.isfinite(traj))
+    assert np.abs(traj[:, 1:4]).max() < 0.05
+

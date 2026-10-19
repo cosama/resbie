@@ -334,9 +334,7 @@ class Odometry {
     }
     // RESPLE initialization(): level the first pose on gravity, zero yaw.
     const Eigen::Vector3d gravity_ave = gravity_sum.normalized() * kGravity;
-    Eigen::Matrix3d R0 = CommonUtils::g2R(gravity_ave);
-    const double yaw = CommonUtils::R2ypr(R0).x();
-    R0 = CommonUtils::ypr2R(Eigen::Vector3d{-yaw, 0, 0}) * R0;
+    const Eigen::Matrix3d R0 = CommonUtils::g2R(gravity_ave);
     const Eigen::Quaterniond q_WI = Quater::positify(Eigen::Quaterniond(R0));
     gravity_ = q_WI * gravity_ave;
 

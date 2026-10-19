@@ -157,6 +157,8 @@ class Estimator
     Eigen::Vector3d biasGyro() const { return bg; }
 
   private:
+    using MatX = Eigen::Matrix<double, XSIZE, XSIZE>;
+
     SplineState spl;
     Eigen::Matrix<double, XSIZE, XSIZE> cov_rcp;  
     Eigen::Matrix<double, XSIZE, XSIZE> cov_sys; 
@@ -165,13 +167,42 @@ class Estimator
     Eigen::Vector3d ba = Eigen::Vector3d::Zero();     
     Eigen::Matrix<double, XSIZE, XSIZE> KH;
     Eigen::Matrix<double, XSIZE, XSIZE> P_post_;
-    Eigen::Matrix<double, Eigen::Dynamic, XSIZE> H_buf_;
+    Eigen::Matrix<double, Eigen::Dynamic, 24> H_24_buf_;
+    Eigen::Matrix<double, 24, Eigen::Dynamic> HT_R_inv_24_buf_;
+    Eigen::Matrix<double, XSIZE, Eigen::Dynamic> K_buf_;
     Eigen::Matrix<double, Eigen::Dynamic, 1> innv_buf_;
     Eigen::Matrix<double, Eigen::Dynamic, 1> R_inv_buf_;
-    Eigen::Matrix<double, XSIZE, Eigen::Dynamic> HT_R_inv_buf_;
-    Eigen::Matrix<double, XSIZE, Eigen::Dynamic> K_buf_;
+    std::vector<int> imu_row_offsets_;
     int max_iter = 5;
     double eps = 0.1;
+
+    void ensureMeasBuffers(int n)
+    {
+        if (H_24_buf_.rows() < n) {
+            H_24_buf_.resize(n, 24);
+            HT_R_inv_24_buf_.resize(24, n);
+            K_buf_.resize(XSIZE, n);
+            innv_buf_.resize(n, 1);
+            R_inv_buf_.resize(n, 1);
+        }
+    }
+
+    // resbie: square-root information form, S_inv = L (I + L' H'R^-1H L)^-1 L'
+    // with P_prop = L L' (pivoted LDLT). Never inverts P_prop: its control
+    // points are strongly correlated and a long gap makes it huge, so an
+    // explicit inverse loses digits even when LLT reports success.
+    void solvePosteriorCovariance(const MatX& P_prop, const MatX& HT_R_inv_H, MatX& S_inv) const
+    {
+        const MatX I_X = MatX::Identity();
+        const Eigen::LDLT<MatX> ldlt_P(P_prop);
+        const MatX L_p =
+            ldlt_P.transpositionsP().transpose() *
+            MatX(ldlt_P.matrixL()) *
+            ldlt_P.vectorD().cwiseMax(0.0).cwiseSqrt().asDiagonal();
+        const MatX M = I_X + L_p.transpose() * HT_R_inv_H * L_p;
+        S_inv.noalias() = L_p * M.llt().solve(L_p.transpose());
+        S_inv = 0.5 * (S_inv + S_inv.transpose()).eval();
+    }
 
     void prepIMU(ImuData& imu_data, const Eigen::Vector3d& g)
     {
@@ -186,7 +217,7 @@ class Estimator
         Eigen::Matrix3d RT = q_itp.inverse().toRotationMatrix();   
         Eigen::Matrix<double, 3, 4> drot;
         Quater::drot(a_w, q_itp, drot);
-        Eigen::Matrix<double, 6, XSIZE> Hi = Eigen::Matrix<double, 6, XSIZE>::Zero();
+        Eigen::Matrix<double, 6, 24> Hi = Eigen::Matrix<double, 6, 24>::Zero();
         int recur_st_id = spl.numKnots() - 4;
         for (int i = 0; i < (int) J_line_acc.d_val_d_knot.size(); i++) {
             int j = J_line_acc.start_idx + i - recur_st_id;
@@ -196,17 +227,15 @@ class Estimator
                 Hi.block(3, j*6 + 3, 3, 3) = J_gyro.d_val_d_knot[i];                
             }
         }       
-        Hi.block(0, BA_OFFSET, 3, 3) = Eigen::Matrix3d::Identity();
-        Hi.block(3, BG_OFFSET, 3, 3) = Eigen::Matrix3d::Identity();            
         imu_data.imu_itp.head<3>() = RT * a_w + ba;
         imu_data.imu_itp.tail<3>() = rot_vel + bg;
-        imu_data.H = Hi.template leftCols<24>();
+        imu_data.H = Hi;
     }    
 
     void prepLiDAR(PointData& pt_data) const    
     {
         if (pt_data.if_valid) { 
-            Eigen::Matrix<double, 1, XSIZE> Hi = Eigen::Matrix<double, 1, XSIZE>::Zero();
+            Eigen::Matrix<double, 1, 24> Hi = Eigen::Matrix<double, 1, 24>::Zero();
             Eigen::Quaterniond q_itp;
             Jacobian43 J_ortdel;
             Jacobian J_pos;
@@ -227,7 +256,7 @@ class Estimator
                     Hi.block(0, j*6 + 3, 1, 3) = tmp * J_ortdel.d_val_d_knot[i];
                 }
             }  
-            pt_data.H = Hi.template leftCols<24>();
+            pt_data.H = Hi;
         }
     } 
 
@@ -244,17 +273,6 @@ class Estimator
     bool updateLiDAR(Eigen::aligned_deque<PointData>& pt_meas, int num_valid, const Eigen::Matrix<double, XSIZE, 1>& x_prop, 
         const Eigen::Matrix<double, XSIZE, XSIZE>& P_prop, bool reassociated = false)
     {
-        if (H_buf_.rows() < num_valid) {
-            H_buf_.resize(num_valid, Eigen::NoChange);
-            innv_buf_.resize(num_valid, Eigen::NoChange);
-            R_inv_buf_.resize(num_valid, Eigen::NoChange);
-        }
-        auto H = H_buf_.topRows(num_valid);
-        auto innv = innv_buf_.topRows(num_valid);
-        auto mat_cov_inv = R_inv_buf_.topRows(num_valid);
-        H.setZero();
-        innv.setZero();
-        mat_cov_inv.setConstant(1/0.01);
         size_t num_pt = pt_meas.size();
         if (!reassociated) {
             #pragma omp parallel for num_threads(NUM_OF_THREAD) schedule(dynamic)
@@ -263,28 +281,54 @@ class Estimator
                 prepLiDAR(pt_data);
             }
         }
+        if (num_valid <= 0) {
+            P_post_ = P_prop;
+            KH.setZero();
+            return false;
+        }
+        const Eigen::Matrix<double, 24, 24> cov = cov_rcp.template topLeftCorner<24, 24>();
+        ensureMeasBuffers(num_valid);
+        auto H_24 = H_24_buf_.topRows(num_valid);
+        auto innv = innv_buf_.head(num_valid);
+        auto R_inv = R_inv_buf_.head(num_valid);
+        auto HT_R_inv_24 = HT_R_inv_24_buf_.leftCols(num_valid);
+        auto K = K_buf_.leftCols(num_valid);
         int idx_offset = 0;
         points_gated = 0;
         for(size_t i = 0; i < num_pt; i++) {
             const PointData& pt_data = pt_meas[i];
             if (pt_data.if_valid) {
-                Eigen::Matrix<double, 1, XSIZE> Hi = Eigen::Matrix<double, 1, XSIZE>::Zero();
-                Hi.template leftCols<24>() = pt_data.H;
                 // resbie: var_scale is the Huber weight of this linearization.
                 const double var_pt = pt_data.var_pt * pt_data.var_scale;
-                double lid_cov = Hi*cov_rcp*Hi.transpose() + var_pt;
+                double lid_cov = (pt_data.H * cov * pt_data.H.transpose())(0, 0) + var_pt;
                 if (record_nis_) point_nis.push_back(pt_data.zp * pt_data.zp / lid_cov);
                 if (gateAccepts(pt_data.zp, lid_cov)) {
                     innv(idx_offset) = - pt_data.zp;
-                    H.row(idx_offset) = Hi;
+                    H_24.row(idx_offset) = pt_data.H;
                 } else {
+                    innv(idx_offset) = 0.0;
+                    H_24.row(idx_offset).setZero();
                     ++points_gated;
                 }
-                mat_cov_inv(idx_offset) = 1/var_pt;
+                R_inv(idx_offset) = 1.0 / var_pt;
                 idx_offset++;
             }
         }        
-        update(innv, mat_cov_inv, H, x_prop, P_prop);
+        HT_R_inv_24.noalias() = (H_24.transpose().array().rowwise() * R_inv.transpose().array()).matrix();
+        Eigen::Matrix<double, XSIZE, XSIZE> HT_R_inv_H = Eigen::Matrix<double, XSIZE, XSIZE>::Zero();
+        HT_R_inv_H.template topLeftCorner<24, 24>().noalias() = HT_R_inv_24 * H_24;
+
+        Eigen::Matrix<double, XSIZE, XSIZE> S_inv;
+        solvePosteriorCovariance(P_prop, HT_R_inv_H, S_inv);
+
+        K.noalias() = S_inv.template leftCols<24>() * HT_R_inv_24;
+        KH.noalias() = S_inv * HT_R_inv_H;
+        P_post_ = S_inv;
+        Eigen::Matrix<double, XSIZE, 1> delta_cur = (getState() - x_prop);
+        Eigen::Matrix<double, XSIZE, 1> deltax = KH * delta_cur + K * innv - delta_cur;
+        Eigen::Matrix<double, XSIZE, 1> RCPs_post;
+        RCPs_post.noalias() = getState() + deltax;
+        updateState(RCPs_post);
         return true;
     }           
 
@@ -306,18 +350,19 @@ class Estimator
         }                
         points_gated = 0;
         int dim_meas = 6*imu_meas.size() + num_valid;
-        if (H_buf_.rows() < dim_meas) {
-            H_buf_.resize(dim_meas, Eigen::NoChange);
-            innv_buf_.resize(dim_meas, Eigen::NoChange);
-            R_inv_buf_.resize(dim_meas, Eigen::NoChange);
+        if (dim_meas <= 0) {
+            P_post_ = P_prop;
+            KH.setZero();
+            return;
         }
-        auto H = H_buf_.topRows(dim_meas);
-        auto innv = innv_buf_.topRows(dim_meas);
-        auto mat_cov_inv = R_inv_buf_.topRows(dim_meas);
-        H.setZero();    
-        innv.setZero();
-        mat_cov_inv.setZero();
         const Eigen::Matrix<double, 24, 24> cov = cov_rcp.template topLeftCorner<24, 24>();
+        ensureMeasBuffers(dim_meas);
+        auto H_24 = H_24_buf_.topRows(dim_meas);
+        auto innv = innv_buf_.head(dim_meas);
+        auto R_inv = R_inv_buf_.head(dim_meas);
+        auto HT_R_inv_24 = HT_R_inv_24_buf_.leftCols(dim_meas);
+        auto K = K_buf_.leftCols(dim_meas);
+        imu_row_offsets_.resize(imu_meas.size());
         int idx_offset = 0;
         size_t id_imu = 0;
         size_t id_pt = 0;
@@ -328,15 +373,17 @@ class Estimator
                     if (pt_data.if_valid) {
                         // resbie: var_scale is the Huber weight of this linearization.
                         const double var_pt = pt_data.var_pt * pt_data.var_scale;
-                        double lid_cov = pt_data.H*cov*pt_data.H.transpose() + var_pt;
+                        double lid_cov = (pt_data.H * cov * pt_data.H.transpose())(0, 0) + var_pt;
                         if (record_nis_) point_nis.push_back(pt_data.zp * pt_data.zp / lid_cov);
                         if (gateAccepts(pt_data.zp, lid_cov)) {
                             innv(idx_offset) = - pt_data.zp;
-                            H.block(idx_offset, 0, 1, 24) = pt_data.H;
+                            H_24.row(idx_offset) = pt_data.H;
                         } else {
+                            innv(idx_offset) = 0.0;
+                            H_24.row(idx_offset).setZero();
                             ++points_gated;
                         }
-                        mat_cov_inv(idx_offset) = 1/var_pt;
+                        R_inv(idx_offset) = 1.0 / var_pt;
                         idx_offset++;
                     }
                     id_pt++;
@@ -344,10 +391,8 @@ class Estimator
                         (id_pt >= pt_meas.size() && id_imu < imu_meas.size())) {
                     const ImuData& imu_data = imu_meas[id_imu];
                     Eigen::Matrix<double, 6, 1> imu_itp = imu_data.imu_itp;
-                    Eigen::Matrix<double, 6, XSIZE> Hi = Eigen::Matrix<double, 6, XSIZE>::Zero();
-                    Hi.template leftCols<24>() = imu_data.H;
-                    Hi.block(0, BA_OFFSET, 3, 3) = Eigen::Matrix3d::Identity();
-                    Hi.block(3, BG_OFFSET, 3, 3) = Eigen::Matrix3d::Identity();   
+                    Eigen::Matrix<double, 6, 24> Hi = imu_data.H;
+                    Eigen::Matrix<double, 6, 1> w_imu = cov_imu_inv;
 
                     Eigen::Matrix<double, 6, 1> imu;
                     imu.head<3>() = imu_data.accel;
@@ -358,76 +403,55 @@ class Estimator
                             imu(i) = 0;
                             imu_itp(i) = 0;
                             Hi.row(i).setZero();
+                            w_imu(i) = 0.0;
                         } 
                         if (abs(imu(i+3) - imu_itp(i+3)) > 5.0) {
                             imu(i+3) = 0;
                             imu_itp(i+3) = 0;
                             Hi.row(i+3).setZero();
+                            w_imu(i+3) = 0.0;
                         }                     
                     }
+                    imu_row_offsets_[id_imu] = idx_offset;
                     innv.segment<6>(idx_offset) = imu - imu_itp;
-                    H.block(idx_offset, 0, 6, XSIZE) = Hi;
-                    mat_cov_inv.segment<6>(idx_offset) = cov_imu_inv;  
+                    H_24.block<6, 24>(idx_offset, 0) = Hi;
+                    R_inv.segment<6>(idx_offset) = w_imu;  
                     idx_offset += 6;
                     id_imu++;
             }
         }        
-        update(innv, mat_cov_inv, H, x_prop, P_prop);        
-    }
-
-    template <typename InnovDerived, typename RInvDerived, typename HDerived>
-    void update(const Eigen::MatrixBase<InnovDerived>& innov,
-                const Eigen::MatrixBase<RInvDerived>& R_inv,
-                const Eigen::MatrixBase<HDerived>& H, 
-                const Eigen::Matrix<double, XSIZE, 1>& x_prop,
-                const Eigen::Matrix<double, XSIZE, XSIZE>& cov_prop)
-    {
-        int num_pts = innov.rows();
-        Eigen::Matrix<double, XSIZE, 1> RCPs_post;
-        const Eigen::Matrix<double, XSIZE, XSIZE> I_X = Eigen::Matrix<double, XSIZE, XSIZE>::Identity();
-        if (num_pts > XSIZE) {
-            Eigen::Matrix<double, XSIZE, XSIZE> cov_rcp_inv = cov_prop.llt().solve(I_X);
-            if (HT_R_inv_buf_.cols() < num_pts) {
-                HT_R_inv_buf_.resize(Eigen::NoChange, num_pts);
+        HT_R_inv_24.noalias() = (H_24.transpose().array().rowwise() * R_inv.transpose().array()).matrix();
+        Eigen::Matrix<double, XSIZE, XSIZE> HT_R_inv_H = Eigen::Matrix<double, XSIZE, XSIZE>::Zero();
+        HT_R_inv_H.template topLeftCorner<24, 24>().noalias() = HT_R_inv_24 * H_24;
+        if constexpr (XSIZE == 30) {
+            for (size_t m = 0; m < imu_meas.size(); m++) {
+                const int row = imu_row_offsets_[m];
+                for (int k = 0; k < 6; k++) {
+                    HT_R_inv_H.template block<24, 1>(0, 24 + k) += HT_R_inv_24.col(row + k);
+                    HT_R_inv_H(24 + k, 24 + k) += R_inv(row + k);
+                }
             }
-            if (K_buf_.cols() < num_pts) {
-                K_buf_.resize(Eigen::NoChange, num_pts);
-            }
-            auto HT_R_inv = HT_R_inv_buf_.leftCols(num_pts);
-            auto K = K_buf_.leftCols(num_pts);
-            HT_R_inv.noalias() = (H.transpose().array().rowwise() * R_inv.transpose().array()).matrix();
-            Eigen::Matrix<double, XSIZE, XSIZE> HT_R_inv_H;
-            HT_R_inv_H.noalias() = HT_R_inv * H;
-
-            Eigen::Matrix<double, XSIZE, XSIZE> S = HT_R_inv_H;
-            S.noalias() += cov_rcp_inv;
-            Eigen::Matrix<double, XSIZE, XSIZE> S_inv = S.llt().solve(I_X);
-            K.noalias() = S_inv * HT_R_inv;
-
-            KH.noalias() = S_inv * HT_R_inv_H;     
-            // resbie: the posterior covariance of the information form is
-            // S^-1 itself (symmetric positive definite by construction).
-            P_post_ = S_inv;
-            Eigen::Matrix<double, XSIZE, 1> delta_cur = (getState() - x_prop);
-            Eigen::Matrix<double, XSIZE, 1> deltax = KH * delta_cur + K * innov - delta_cur;      
-            RCPs_post.noalias() = getState() + deltax;      
-        } else {
-            if (K_buf_.cols() < num_pts) {
-                K_buf_.resize(Eigen::NoChange, num_pts);
-            }
-            auto K = K_buf_.leftCols(num_pts);
-            Eigen::MatrixXd R = R_inv.cwiseInverse().asDiagonal();
-            Eigen::MatrixXd S(num_pts, num_pts);
-            S.noalias() = H * cov_prop * H.transpose() + R;
-            K.noalias() = cov_prop * H.transpose() * S.inverse();
-            KH.noalias() = K * H;
-            // resbie: Joseph form, stable where (I - KH) P is not.
-            const Eigen::Matrix<double, XSIZE, XSIZE> IKH = I_X - KH;
-            P_post_ = IKH * cov_prop * IKH.transpose() + K * R * K.transpose();
-            Eigen::Matrix<double, XSIZE, 1> delta_cur = (getState() - x_prop);
-            Eigen::Matrix<double, XSIZE, 1> deltax = KH * delta_cur + K * innov - delta_cur;
-            RCPs_post.noalias() = getState() + deltax;
+            HT_R_inv_H.template block<6, 24>(24, 0) = HT_R_inv_H.template block<24, 6>(0, 24).transpose();
         }
-        updateState(RCPs_post);     
-    }    
+
+        Eigen::Matrix<double, XSIZE, XSIZE> S_inv;
+        solvePosteriorCovariance(P_prop, HT_R_inv_H, S_inv);
+
+        K.noalias() = S_inv.template leftCols<24>() * HT_R_inv_24;
+        if constexpr (XSIZE == 30) {
+            for (size_t m = 0; m < imu_meas.size(); m++) {
+                const int row = imu_row_offsets_[m];
+                for (int k = 0; k < 6; k++) {
+                    K.col(row + k).noalias() += S_inv.col(24 + k) * R_inv(row + k);
+                }
+            }
+        }
+        KH.noalias() = S_inv * HT_R_inv_H;
+        P_post_ = S_inv;
+        Eigen::Matrix<double, XSIZE, 1> delta_cur = (getState() - x_prop);
+        Eigen::Matrix<double, XSIZE, 1> deltax = KH * delta_cur + K * innv - delta_cur;
+        Eigen::Matrix<double, XSIZE, 1> RCPs_post;
+        RCPs_post.noalias() = getState() + deltax;
+        updateState(RCPs_post);
+    }
 };

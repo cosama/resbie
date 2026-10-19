@@ -195,13 +195,15 @@ bool BIEVRMap::integratePoints(const Pointcloud& cloud, const std::vector<double
   // indexes directly into voxels_ without probing the hash table.
   hash_change_indices_.clear();
   voxel_slots_.clear();
-  size_t prev_hash = hashed_points_.back().first;
-  for (size_t i = 0; i < hashed_points_.size(); ++i) {
-    size_t current_hash = hashed_points_[i].first;
-    if (current_hash != prev_hash) {
-      hash_change_indices_.push_back(i);
-      voxel_slots_.push_back(findOrInsert(current_hash));
-      prev_hash = current_hash;
+  if (!hashed_points_.empty()) {
+    size_t prev_hash = 0;
+    for (size_t i = 0; i < hashed_points_.size(); ++i) {
+      size_t current_hash = hashed_points_[i].first;
+      if (i == 0 || current_hash != prev_hash) {
+        hash_change_indices_.push_back(i);
+        voxel_slots_.push_back(findOrInsert(current_hash));
+        prev_hash = current_hash;
+      }
     }
   }
 

@@ -254,13 +254,17 @@ class SplineState
             for (int i = 2; i >= 0; i-- ) {
                 q_r_all[i] = q_delta_scale[i+1] * q_r_all[i+1];
             }
-            if (J_q) {
+            if (q_out || J_q) {
                 q_itps[0] = cp0 * q_delta_scale[0];
                 q_itps[1] = q_itps[0] * q_delta_scale[1];
                 q_itps[2] = q_itps[1] * q_delta_scale[2];
                 q_itps[3] = q_itps[2] * q_delta_scale[3];
                 q_itps[3].normalize();
-                *q_out = q_itps[3];
+                if (q_out) {
+                    *q_out = q_itps[3];
+                }
+            }
+            if (J_q) {
                 Eigen::Matrix4d Q_l_all[4];
                 Quater::Qleft(cp0, Q_l_all[0]);
                 Quater::Qleft(q_itps[0], Q_l_all[1]);
@@ -269,37 +273,39 @@ class SplineState
                 J_q->d_val_d_knot.resize(size_J);
                 J_q->start_idx = idx0;
                 for (int i = size_J - 1; i >= 0; i--) {
+                    const int idx = 4 - size_J + i;
                     Eigen::Matrix4d Q_r_all;
-                    Quater::Qright(q_r_all[i], Q_r_all);
-                    J_q->d_val_d_knot[i].noalias() = coeff[i] * Q_r_all * Q_l_all[i] * dexp_dt[i];
+                    Quater::Qright(q_r_all[idx], Q_r_all);
+                    J_q->d_val_d_knot[i].noalias() = coeff[idx] * Q_r_all * Q_l_all[idx] * dexp_dt[idx];
                 }
             }
-            if (J_w) {
+            if (w_out || J_w) {
                 baseCoeffsWithTime<1>(p, u);
                 dcoeff = inv_dt * cumulative_blending_matrix * p;
                 w_itps[0].setZero();
                 w_itps[1] = 2 * dcoeff[1] * t_delta[1];
                 w_itps[2] = q_delta_scale[2].inverse() * w_itps[1] + 2 * dcoeff[2] * t_delta[2];
                 w_itps[3] = q_delta_scale[3].inverse() * w_itps[2] + 2 * dcoeff[3] * t_delta[3];
-                *w_out = w_itps[3];
+                if (w_out) {
+                    *w_out = w_itps[3];
+                }
+            }
+            if (J_w) {
                 Eigen::Matrix<double, 3, 4> drot_dq[2];
                 Quater::drot(w_itps[1], q_delta_scale[2], drot_dq[0]);
                 Quater::drot(w_itps[2], q_delta_scale[3], drot_dq[1]);
+                const Eigen::Matrix3d R3_inv = q_delta_scale[3].inverse().toRotationMatrix();
+                Eigen::Matrix3d d_w[4];
+                d_w[0].setZero();
+                d_w[1] = 2 * dcoeff[1] * R3_inv * q_delta_scale[2].inverse().toRotationMatrix();
+                Eigen::Matrix3d tmp = coeff[2] * drot_dq[0] * dexp_dt[2];
+                d_w[2] = R3_inv * (tmp + 2 * dcoeff[2] * Eigen::Matrix3d::Identity());
+                d_w[3] = coeff[3] * drot_dq[1] * dexp_dt[3] + 2 * dcoeff[3] * Eigen::Matrix3d::Identity();
                 J_w->d_val_d_knot.resize(size_J);
                 J_w->start_idx = idx0;
-                J_w->d_val_d_knot[0].setZero();           
-                if (size_J > 1) {
-                    J_w->d_val_d_knot[1] = 2 * dcoeff[1] * q_delta_scale[3].inverse().toRotationMatrix() * q_delta_scale[2].inverse().toRotationMatrix();
-                    if (size_J > 2) {
-                        Eigen::Matrix3d tmp = coeff[2] * drot_dq[0] * dexp_dt[2];
-                        J_w->d_val_d_knot[2] = q_delta_scale[3].inverse().toRotationMatrix() * (tmp + 2 * dcoeff[2] * Eigen::Matrix3d::Identity());
-                        if (size_J > 3) {
-                            J_w->d_val_d_knot[3] = coeff[3] * drot_dq[1] * dexp_dt[3] + 2 * dcoeff[3] * Eigen::Matrix3d::Identity();
-                        }
-                    }
-
+                for (int i = 0; i < size_J; i++) {
+                    J_w->d_val_d_knot[i] = d_w[4 - size_J + i];
                 }
-
             }
         } else {
             t_delta_scale[0] = t_delta[0] * coeff[0];

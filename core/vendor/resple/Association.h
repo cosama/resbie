@@ -38,8 +38,7 @@ public:
         size_t hash = map.hashIndex(p_w);
         const bievr::Voxel* voxel = map.getVoxel(hash);
         if (!voxel) {
-            if (!map.nearestVoxel(p_w, hash)) return false;
-            voxel = map.getVoxel(hash);
+            voxel = map.nearestNeighborVoxel(p_w, hash);
             if (!voxel) return false;
         }
         const double inv_size = map.inv_px_size;
@@ -60,6 +59,7 @@ public:
                             const MapAssociationConfig& cfg, Eigen::aligned_deque<PointData>& pt_meas)
     {
         int num_pt = pt_meas.size();
+        const int RCP_st_id = spline->numKnots() - 4;
         #pragma omp parallel for num_threads(NUM_OF_THREAD) schedule(dynamic)
         for (int i = 0; i < num_pt; i++) {
             PointData& pt_data = pt_meas[i];
@@ -76,6 +76,26 @@ public:
             pt_data.dist = r - grad.dot(pt_data.pt_w);
             const double abs_r = std::abs(r);
             pt_data.var_scale = abs_r <= cfg.huber_delta ? 1.0 : abs_r / cfg.huber_delta;
+
+            Eigen::Quaterniond q_itp;
+            Jacobian43 J_ortdel;
+            Jacobian J_pos;
+            spline->itpQuaternion(pt_data.time_ns, &q_itp, nullptr, &J_ortdel);
+            Eigen::Vector3d p_itp = spline->itpPosition(pt_data.time_ns, &J_pos);
+            Eigen::Vector3d pt_w = q_itp * pt_data.pt_b + p_itp;
+            pt_data.zp = pt_data.normvec.dot(pt_w) + pt_data.dist;
+
+            Eigen::Matrix<double, 3, 4> drot;
+            Quater::drotInv(pt_data.pt_b, q_itp, drot);
+            const Eigen::Matrix<double, 1, 4> tmp = pt_data.normvec.transpose() * drot;
+            pt_data.H.setZero();
+            for (int k = 0; k < (int) J_pos.d_val_d_knot.size(); k++) {
+                int j = (int) J_pos.start_idx + k - RCP_st_id;
+                if (j >= 0) {
+                    pt_data.H.block<1, 3>(0, j*6) = pt_data.normvec.transpose() * J_pos.d_val_d_knot[k];
+                    pt_data.H.block<1, 3>(0, j*6 + 3) = tmp * J_ortdel.d_val_d_knot[k];
+                }
+            }
         }
         for (int i = 0; i < num_pt; i++) {
             if (pt_meas[i].if_valid) effect_num_k++;

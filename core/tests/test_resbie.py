@@ -234,3 +234,15 @@ def test_graph_levels_the_odometry(tmp_path):
     tilt_kf, tilt_odom = _tilt_deg(kf[1:, 4:6]), _tilt_deg(odom_at_kf[1:, 4:6])
     assert tilt_kf.max() < 0.5, tilt_kf
     assert tilt_kf.mean() < tilt_odom.mean(), (tilt_kf, tilt_odom)
+
+
+def test_map_max_size_lru_eviction(tmp_path):
+    extra = "map: {max_size: 40, init_min_voxels: 20}\n"
+    s1 = _run(_config(tmp_path, 0, extra=extra), seconds=4.0, velocity=(0.5, 0.2, 0.0))
+    st = s1.status()
+    assert st["initialized"]
+    assert st["map_voxels"] == 40
+    s2 = _run(_config(tmp_path, 3, extra=extra), seconds=4.0, velocity=(0.5, 0.2, 0.0))
+    np.testing.assert_array_equal(s1.trajectory(), s2.trajectory())
+    np.testing.assert_array_equal(s1.sweep_diagnostics(), s2.sweep_diagnostics())
+

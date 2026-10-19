@@ -64,21 +64,25 @@ class Estimator
         imu_samples = imu_meas.size();
         acc_gated = 0;
         bool updated = false;
+        bool reassociated = false;
         for (int i = 0; i < max_iter; i++) {
             record_nis_ = (i == 0);
             Eigen::Matrix<double, XSIZE, 1> rcpi = getState();
             if (converged) {
                 num_tot_eff = 0;
                 Association::findCorresp(num_tot_eff, &spl, map, assoc, pt_meas);
+                reassociated = true;
+            } else {
+                reassociated = false;
             }
             if (num_tot_eff > 0 && imu_meas.empty()) {
-                updateLiDAR(pt_meas, num_tot_eff, rcp_prop, cov_prop);
+                updateLiDAR(pt_meas, num_tot_eff, rcp_prop, cov_prop, reassociated);
             } else if (num_tot_eff > 0) {
-                updateLiDARInertial(pt_meas, imu_meas, num_tot_eff, rcp_prop, cov_prop, g, cov_acc, cov_gyro);
+                updateLiDARInertial(pt_meas, imu_meas, num_tot_eff, rcp_prop, cov_prop, g, cov_acc, cov_gyro, reassociated);
             } else if (!imu_meas.empty()) {
                 // resbie: no matched point -> IMU-only update. Upstream broke
                 // out here, so a LiDAR gap also dropped every IMU sample in it.
-                updateLiDARInertial(pt_meas, imu_meas, 0, rcp_prop, cov_prop, g, cov_acc, cov_gyro);
+                updateLiDARInertial(pt_meas, imu_meas, 0, rcp_prop, cov_prop, g, cov_acc, cov_gyro, reassociated);
             } else {
                 // resbie: re-association found nothing to measure. Keep the
                 // last iteration's estimate with its posterior covariance
@@ -161,6 +165,11 @@ class Estimator
     Eigen::Vector3d ba = Eigen::Vector3d::Zero();     
     Eigen::Matrix<double, XSIZE, XSIZE> KH;
     Eigen::Matrix<double, XSIZE, XSIZE> P_post_;
+    Eigen::Matrix<double, Eigen::Dynamic, XSIZE> H_buf_;
+    Eigen::Matrix<double, Eigen::Dynamic, 1> innv_buf_;
+    Eigen::Matrix<double, Eigen::Dynamic, 1> R_inv_buf_;
+    Eigen::Matrix<double, XSIZE, Eigen::Dynamic> HT_R_inv_buf_;
+    Eigen::Matrix<double, XSIZE, Eigen::Dynamic> K_buf_;
     int max_iter = 5;
     double eps = 0.1;
 
@@ -233,20 +242,27 @@ class Estimator
     }        
 
     bool updateLiDAR(Eigen::aligned_deque<PointData>& pt_meas, int num_valid, const Eigen::Matrix<double, XSIZE, 1>& x_prop, 
-        const Eigen::Matrix<double, XSIZE, XSIZE>& P_prop)
+        const Eigen::Matrix<double, XSIZE, XSIZE>& P_prop, bool reassociated = false)
     {
-        Eigen::Matrix<double, Eigen::Dynamic, XSIZE> H(num_valid, XSIZE);
-        Eigen::Matrix<double, Eigen::Dynamic, 1> innv(num_valid, 1);
-        Eigen::Matrix<double, Eigen::Dynamic, 1> mat_cov_inv(num_valid, 1);
-        H.setZero();    
+        if (H_buf_.rows() < num_valid) {
+            H_buf_.resize(num_valid, Eigen::NoChange);
+            innv_buf_.resize(num_valid, Eigen::NoChange);
+            R_inv_buf_.resize(num_valid, Eigen::NoChange);
+        }
+        auto H = H_buf_.topRows(num_valid);
+        auto innv = innv_buf_.topRows(num_valid);
+        auto mat_cov_inv = R_inv_buf_.topRows(num_valid);
+        H.setZero();
         innv.setZero();
         mat_cov_inv.setConstant(1/0.01);
-        size_t num_pt = pt_meas.size();    
-        #pragma omp parallel for num_threads(NUM_OF_THREAD) schedule(dynamic)
-        for (size_t i = 0; i < num_pt; i++) {
-            PointData& pt_data = pt_meas[i];
-            prepLiDAR(pt_data);
-        }        
+        size_t num_pt = pt_meas.size();
+        if (!reassociated) {
+            #pragma omp parallel for num_threads(NUM_OF_THREAD) schedule(dynamic)
+            for (size_t i = 0; i < num_pt; i++) {
+                PointData& pt_data = pt_meas[i];
+                prepLiDAR(pt_data);
+            }
+        }
         int idx_offset = 0;
         points_gated = 0;
         for(size_t i = 0; i < num_pt; i++) {
@@ -273,13 +289,16 @@ class Estimator
     }           
 
     void updateLiDARInertial(Eigen::aligned_deque<PointData>& pt_meas, Eigen::aligned_deque<ImuData>& imu_meas, int num_valid, const Eigen::Matrix<double, XSIZE, 1>& x_prop, 
-        const Eigen::Matrix<double, XSIZE, XSIZE>& P_prop, const Eigen::Vector3d& g, const Eigen::Vector3d& cov_acc, const Eigen::Vector3d& cov_gyro)
+        const Eigen::Matrix<double, XSIZE, XSIZE>& P_prop, const Eigen::Vector3d& g, const Eigen::Vector3d& cov_acc, const Eigen::Vector3d& cov_gyro,
+        bool reassociated = false)
     {
         Eigen::Matrix<double, 6, 1> cov_imu_inv =  Eigen::Matrix<double, 6, 1>(1/cov_acc[0], 1/cov_acc[1], 1/cov_acc[2], 1/cov_gyro[0], 1/cov_gyro[1], 1/cov_gyro[2]);
-        #pragma omp parallel for num_threads(NUM_OF_THREAD) schedule(dynamic)
-        for (size_t i = 0; i < pt_meas.size(); i++) {
-            PointData& pt_data = pt_meas[i];
-            prepLiDAR(pt_data); 
+        if (!reassociated) {
+            #pragma omp parallel for num_threads(NUM_OF_THREAD) schedule(dynamic)
+            for (size_t i = 0; i < pt_meas.size(); i++) {
+                PointData& pt_data = pt_meas[i];
+                prepLiDAR(pt_data); 
+            }
         }
         #pragma omp parallel for num_threads(NUM_OF_THREAD) 
         for (size_t i = 0; i < imu_meas.size(); i++) {
@@ -287,12 +306,18 @@ class Estimator
         }                
         points_gated = 0;
         int dim_meas = 6*imu_meas.size() + num_valid;
-        Eigen::Matrix<double, Eigen::Dynamic, XSIZE> H(dim_meas, XSIZE);
-        Eigen::Matrix<double, Eigen::Dynamic, 1> innv(dim_meas, 1);
-        Eigen::Matrix<double, Eigen::Dynamic, 1> mat_cov_inv(dim_meas, 1);
+        if (H_buf_.rows() < dim_meas) {
+            H_buf_.resize(dim_meas, Eigen::NoChange);
+            innv_buf_.resize(dim_meas, Eigen::NoChange);
+            R_inv_buf_.resize(dim_meas, Eigen::NoChange);
+        }
+        auto H = H_buf_.topRows(dim_meas);
+        auto innv = innv_buf_.topRows(dim_meas);
+        auto mat_cov_inv = R_inv_buf_.topRows(dim_meas);
         H.setZero();    
         innv.setZero();
         mat_cov_inv.setZero();
+        const Eigen::Matrix<double, 24, 24> cov = cov_rcp.template topLeftCorner<24, 24>();
         int idx_offset = 0;
         size_t id_imu = 0;
         size_t id_pt = 0;
@@ -301,7 +326,6 @@ class Estimator
                 (id_pt < pt_meas.size() && id_imu >= imu_meas.size())) {
                     PointData& pt_data = pt_meas[id_pt];
                     if (pt_data.if_valid) {
-                        Eigen::Matrix<double, 24, 24> cov = cov_rcp.template topLeftCorner<24, 24>();
                         // resbie: var_scale is the Huber weight of this linearization.
                         const double var_pt = pt_data.var_pt * pt_data.var_scale;
                         double lid_cov = pt_data.H*cov*pt_data.H.transpose() + var_pt;
@@ -351,16 +375,26 @@ class Estimator
         update(innv, mat_cov_inv, H, x_prop, P_prop);        
     }
 
-    template <int RSIZE>
-    void update(const Eigen::Matrix<double, RSIZE, 1>& innov, const Eigen::Matrix<double, RSIZE, 1>& R_inv, const Eigen::Matrix<double, RSIZE, XSIZE>& H, 
-        const Eigen::Matrix<double, XSIZE, 1>& x_prop, const Eigen::Matrix<double, XSIZE, XSIZE>& cov_prop)
+    template <typename InnovDerived, typename RInvDerived, typename HDerived>
+    void update(const Eigen::MatrixBase<InnovDerived>& innov,
+                const Eigen::MatrixBase<RInvDerived>& R_inv,
+                const Eigen::MatrixBase<HDerived>& H, 
+                const Eigen::Matrix<double, XSIZE, 1>& x_prop,
+                const Eigen::Matrix<double, XSIZE, XSIZE>& cov_prop)
     {
         int num_pts = innov.rows();
         Eigen::Matrix<double, XSIZE, 1> RCPs_post;
-        Eigen::MatrixXd I_X = Eigen::MatrixXd::Identity(XSIZE, XSIZE); 
+        const Eigen::Matrix<double, XSIZE, XSIZE> I_X = Eigen::Matrix<double, XSIZE, XSIZE>::Identity();
         if (num_pts > XSIZE) {
             Eigen::Matrix<double, XSIZE, XSIZE> cov_rcp_inv = cov_prop.llt().solve(I_X);
-            Eigen::Matrix<double, XSIZE, RSIZE> HT_R_inv;
+            if (HT_R_inv_buf_.cols() < num_pts) {
+                HT_R_inv_buf_.resize(Eigen::NoChange, num_pts);
+            }
+            if (K_buf_.cols() < num_pts) {
+                K_buf_.resize(Eigen::NoChange, num_pts);
+            }
+            auto HT_R_inv = HT_R_inv_buf_.leftCols(num_pts);
+            auto K = K_buf_.leftCols(num_pts);
             HT_R_inv.noalias() = (H.transpose().array().rowwise() * R_inv.transpose().array()).matrix();
             Eigen::Matrix<double, XSIZE, XSIZE> HT_R_inv_H;
             HT_R_inv_H.noalias() = HT_R_inv * H;
@@ -368,7 +402,6 @@ class Estimator
             Eigen::Matrix<double, XSIZE, XSIZE> S = HT_R_inv_H;
             S.noalias() += cov_rcp_inv;
             Eigen::Matrix<double, XSIZE, XSIZE> S_inv = S.llt().solve(I_X);
-            Eigen::Matrix<double, XSIZE, RSIZE> K;
             K.noalias() = S_inv * HT_R_inv;
 
             KH.noalias() = S_inv * HT_R_inv_H;     
@@ -379,14 +412,17 @@ class Estimator
             Eigen::Matrix<double, XSIZE, 1> deltax = KH * delta_cur + K * innov - delta_cur;      
             RCPs_post.noalias() = getState() + deltax;      
         } else {
-            Eigen::Matrix<double, RSIZE, RSIZE> R = R_inv.cwiseInverse().asDiagonal();
-            Eigen::Matrix<double, RSIZE, RSIZE> S;
+            if (K_buf_.cols() < num_pts) {
+                K_buf_.resize(Eigen::NoChange, num_pts);
+            }
+            auto K = K_buf_.leftCols(num_pts);
+            Eigen::MatrixXd R = R_inv.cwiseInverse().asDiagonal();
+            Eigen::MatrixXd S(num_pts, num_pts);
             S.noalias() = H * cov_prop * H.transpose() + R;
-            Eigen::Matrix<double, XSIZE, RSIZE> K;
             K.noalias() = cov_prop * H.transpose() * S.inverse();
             KH.noalias() = K * H;
             // resbie: Joseph form, stable where (I - KH) P is not.
-            const Eigen::Matrix<double, XSIZE, XSIZE> IKH = Eigen::Matrix<double, XSIZE, XSIZE>::Identity() - KH;
+            const Eigen::Matrix<double, XSIZE, XSIZE> IKH = I_X - KH;
             P_post_ = IKH * cov_prop * IKH.transpose() + K * R * K.transpose();
             Eigen::Matrix<double, XSIZE, 1> delta_cur = (getState() - x_prop);
             Eigen::Matrix<double, XSIZE, 1> deltax = KH * delta_cur + K * innov - delta_cur;

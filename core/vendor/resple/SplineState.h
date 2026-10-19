@@ -3,10 +3,22 @@
 #include "utils/common_utils.h"
 #include "utils/math_tools.h"
 
+#include <array>
+
 template <class MatT>
 struct JacobianStruct {
-    size_t start_idx;
-    std::vector<MatT> d_val_d_knot;
+    struct KnotBuffer {
+        std::array<MatT, 4> data{};
+        size_t n = 0;
+        void clear() { n = 0; }
+        void resize(size_t sz) { n = sz; }
+        size_t size() const { return n; }
+        MatT& operator[](size_t i) { return data[i]; }
+        const MatT& operator[](size_t i) const { return data[i]; }
+        EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    };
+    size_t start_idx = 0;
+    KnotBuffer d_val_d_knot;
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 };
 

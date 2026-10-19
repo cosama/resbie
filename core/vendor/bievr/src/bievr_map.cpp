@@ -39,6 +39,124 @@ BIEVRMap::BIEVRMap(Config config) : config_(config) {
   norm_tol_rad_ = M_PI * config_.norm_tol_deg / 180.0;
   inv_voxel_size_ = 1.0 / config_.voxel_size;
   inv_px_size_ = 1.0 / config_.px_size;
+
+  bits_ = 16;
+  shift_ = 64 - bits_;
+  mask_ = (1ULL << bits_) - 1;
+  table_.assign(1ULL << bits_, Slot{});
+  voxels_.reserve(32768);
+}
+
+void BIEVRMap::lruPushFront(uint32_t idx) {
+  Voxel& v = voxels_[idx];
+  v.lru_prev_ = UINT32_MAX;
+  v.lru_next_ = lru_head_;
+  if (lru_head_ != UINT32_MAX) {
+    voxels_[lru_head_].lru_prev_ = idx;
+  } else {
+    lru_tail_ = idx;
+  }
+  lru_head_ = idx;
+}
+
+void BIEVRMap::lruRemove(uint32_t idx) {
+  Voxel& v = voxels_[idx];
+  if (v.lru_prev_ != UINT32_MAX) {
+    voxels_[v.lru_prev_].lru_next_ = v.lru_next_;
+  } else {
+    lru_head_ = v.lru_next_;
+  }
+  if (v.lru_next_ != UINT32_MAX) {
+    voxels_[v.lru_next_].lru_prev_ = v.lru_prev_;
+  } else {
+    lru_tail_ = v.lru_prev_;
+  }
+  v.lru_prev_ = UINT32_MAX;
+  v.lru_next_ = UINT32_MAX;
+}
+
+void BIEVRMap::lruMoveToFront(uint32_t idx) {
+  if (lru_head_ == idx) return;
+  lruRemove(idx);
+  lruPushFront(idx);
+}
+
+void BIEVRMap::evictLRU() {
+  if (lru_tail_ == UINT32_MAX) return;
+  const uint32_t victim_idx = lru_tail_;
+  lruRemove(victim_idx);
+
+  size_t hole = voxels_[victim_idx].slot_pos_;
+  // Backward-shift deletion (Knuth Algorithm R) to preserve linear probing invariants.
+  size_t scan = (hole + 1) & mask_;
+  while (table_[scan].idx != UINT32_MAX) {
+    const size_t home =
+        ((table_[scan].key ^ (table_[scan].key >> 32)) * 0x9E3779B97F4A7C15ULL) >> shift_;
+    if (((hole - home) & mask_) < ((scan - home) & mask_)) {
+      table_[hole] = table_[scan];
+      voxels_[table_[hole].idx].slot_pos_ = static_cast<uint32_t>(hole);
+      hole = scan;
+    }
+    scan = (scan + 1) & mask_;
+  }
+  table_[hole] = Slot{};
+
+  voxels_[victim_idx] = Voxel{};
+  free_voxel_indices_.push_back(victim_idx);
+  --active_voxels_;
+}
+
+void BIEVRMap::rehash(uint32_t new_bits) {
+  bits_ = new_bits;
+  shift_ = 64 - bits_;
+  mask_ = (1ULL << bits_) - 1;
+  table_.assign(1ULL << bits_, Slot{});
+  for (uint32_t idx = 0; idx < voxels_.size(); ++idx) {
+    if (voxels_[idx].slot_pos_ == UINT32_MAX) continue;
+    const size_t key = voxels_[idx].hash_;
+    size_t pos = ((key ^ (key >> 32)) * 0x9E3779B97F4A7C15ULL) >> shift_;
+    while (table_[pos].idx != UINT32_MAX) {
+      pos = (pos + 1) & mask_;
+    }
+    table_[pos].key = key;
+    table_[pos].idx = idx;
+    table_[pos].observed = voxels_[idx].observed_ ? 1u : 0u;
+    voxels_[idx].slot_pos_ = static_cast<uint32_t>(pos);
+  }
+}
+
+uint32_t BIEVRMap::findOrInsert(size_t key) {
+  if ((active_voxels_ + 1) * 2 >= table_.size()) {
+    rehash(bits_ + 1);
+  }
+  size_t pos = ((key ^ (key >> 32)) * 0x9E3779B97F4A7C15ULL) >> shift_;
+  for (;;) {
+    Slot& s = table_[pos];
+    if (s.idx == UINT32_MAX) {
+      uint32_t idx;
+      if (!free_voxel_indices_.empty()) {
+        idx = free_voxel_indices_.back();
+        free_voxel_indices_.pop_back();
+      } else {
+        idx = static_cast<uint32_t>(voxels_.size());
+        voxels_.emplace_back();
+      }
+      s.key = key;
+      s.idx = idx;
+      s.observed = 0;
+      Voxel& v = voxels_[idx];
+      v.hash_ = key;
+      v.slot_pos_ = static_cast<uint32_t>(pos);
+      v.pending_points_.reserve(8);
+      ++active_voxels_;
+      lruPushFront(idx);
+      return idx;
+    }
+    if (s.key == key) {
+      return s.idx;
+    }
+    pos = (pos + 1) & mask_;
+  }
 }
 
 bool BIEVRMap::integratePoints(const Pointcloud& cloud, const std::vector<double>* ranges) {
@@ -50,102 +168,92 @@ bool BIEVRMap::integratePoints(const Pointcloud& cloud, const std::vector<double
   LOG(D, "Integrating " << cloud.size() << " points to the map.");
 
   // Each entry is {voxel hash, point (xyz, plus range/weight in w)}.
-  std::vector<std::pair<size_t, Eigen::Vector4d>> hashed_points(cloud.size());
+  hashed_points_.resize(cloud.size());
 
   // Calculate Hash indices for each point
   tbb::parallel_for(tbb::blocked_range<size_t>(0, cloud.size()),
                     [&](const tbb::blocked_range<size_t>& r) {
                       for (size_t i = r.begin(); i != r.end(); ++i) {
-                        hashed_points[i].second.head(3) = cloud[i];
+                        hashed_points_[i].second.head(3) = cloud[i];
                         if (ranges) {
-                          hashed_points[i].second(3) = (*ranges)[i];  // weight by range
+                          hashed_points_[i].second(3) = (*ranges)[i];  // weight by range
                         } else {
-                          hashed_points[i].second(3) = 1;
+                          hashed_points_[i].second(3) = 1;
                         }
-                        hashed_points[i].first = hashIndex(hashed_points[i].second.head(3));
+                        hashed_points_[i].first = hashIndex(hashed_points_[i].second.head(3));
                       }
                     });
 
   // Group points by voxel; tie-break on x for a deterministic order within each voxel.
-  tbb::parallel_sort(hashed_points.begin(), hashed_points.end(), [](const auto& a, const auto& b) {
-    if (a.first != b.first) return a.first < b.first;
-    return a.second(0) < b.second(0);
-  });
+  tbb::parallel_sort(hashed_points_.begin(), hashed_points_.end(),
+                     [](const auto& a, const auto& b) {
+                       if (a.first != b.first) return a.first < b.first;
+                       return a.second(0) < b.second(0);
+                     });
 
-  // Extract unique hash indices
-  std::vector<size_t> hash_change_indices;
-  hash_change_indices.reserve(hashed_points.size());
-  if (!hashed_points.empty()) {
-    size_t prev_hash = hashed_points[hashed_points.size() - 1].first;
-
-    for (size_t i = 0; i < hashed_points.size(); ++i) {
-      size_t current_hash = hashed_points[i].first;
-      if (current_hash != prev_hash) {
-        hash_change_indices.push_back(i);
-        if (map_.find(current_hash) == map_.end()) {
-          voxels_cache_.push_front(current_hash);
-          auto res = map_.emplace(current_hash, VoxelEntry{Voxel(), voxels_cache_.begin()});
-          res.first->second.voxel.pending_points_.reserve(8);
-        }
-        prev_hash = current_hash;
-      }
+  // Extract unique hash indices and resolve/insert their voxel slots up front so the parallel loop
+  // indexes directly into voxels_ without probing the hash table.
+  hash_change_indices_.clear();
+  voxel_slots_.clear();
+  size_t prev_hash = hashed_points_.back().first;
+  for (size_t i = 0; i < hashed_points_.size(); ++i) {
+    size_t current_hash = hashed_points_[i].first;
+    if (current_hash != prev_hash) {
+      hash_change_indices_.push_back(i);
+      voxel_slots_.push_back(findOrInsert(current_hash));
+      prev_hash = current_hash;
     }
   }
 
-  // Update voxels. Resolve each group's voxel iterator once here (in parallel) and reuse it for
-  // the serial LRU update below, instead of looking the voxel up in the map again.
-  std::vector<decltype(map_)::iterator> voxel_iters(hash_change_indices.size());
   tbb::parallel_for(
-      tbb::blocked_range<size_t>(0, hash_change_indices.size()),
+      tbb::blocked_range<size_t>(0, hash_change_indices_.size()),
       [&](const tbb::blocked_range<size_t>& r) {
         std::vector<Eigen::Vector4d> voxel_points;
         for (size_t i = r.begin(); i != r.end(); ++i) {
-          int start_idx = hash_change_indices[i];
-          int end_idx = (i + 1 < hash_change_indices.size()) ? hash_change_indices[i + 1]
-                                                             : hashed_points.size();
+          int start_idx = hash_change_indices_[i];
+          int end_idx = (i + 1 < hash_change_indices_.size()) ? hash_change_indices_[i + 1]
+                                                              : hashed_points_.size();
 
-          const size_t hash = hashed_points[start_idx].first;
-          auto iter = map_.find(hash);
-          voxel_iters[i] = iter;
+          Voxel& voxel = voxels_[voxel_slots_[i]];
           voxel_points.clear();
           voxel_points.reserve(end_idx - start_idx);
           for (size_t j = start_idx; j < end_idx; ++j) {
-            iter->second.voxel.sum_ += hashed_points[j].second.head(3);
-            iter->second.voxel.num_points_++;
-            iter->second.voxel.outer_sum_ +=
-                hashed_points[j].second.head(3) * hashed_points[j].second.head(3).transpose();
-            voxel_points.emplace_back(hashed_points[j].second);
+            voxel.sum_ += hashed_points_[j].second.head(3);
+            voxel.num_points_++;
+            voxel.outer_sum_ +=
+                hashed_points_[j].second.head(3) * hashed_points_[j].second.head(3).transpose();
+            voxel_points.emplace_back(hashed_points_[j].second);
           }
 
-          bool valid_before = iter->second.voxel.observed_;
-          bool normal_change = updateNormal(iter->second.voxel);
+          bool valid_before = voxel.observed_;
+          bool normal_change = updateNormal(voxel);
 
-          auto& pending = iter->second.voxel.pending_points_;
-          if (!valid_before && iter->second.voxel.observed_) {
+          auto& pending = voxel.pending_points_;
+          if (!valid_before && voxel.observed_) {
             // Just became observed: fold the points accumulated while unobserved into this scan's
             // batch so they get projected once, then release the buffer.
+            table_[voxel.slot_pos_].observed = 1u;
             voxel_points.insert(voxel_points.end(), pending.begin(), pending.end());
             pending.clear();
             pending.shrink_to_fit();
-          } else if (!iter->second.voxel.observed_) {
+          } else if (!voxel.observed_) {
             // Still unobserved: keep accumulating raw points until a normal exists.
             pending.insert(pending.end(), voxel_points.begin(), voxel_points.end());
           }
 
-          updateBumpImage(voxel_points, iter->second.voxel, normal_change);
+          updateBumpImage(voxel_points, voxel, normal_change);
         }
       });
 
-  // Update LRU Cache
-  for (const auto& iter : voxel_iters) {
-    voxels_cache_.splice(voxels_cache_.begin(), voxels_cache_, iter->second.lru_it);
+  // Update LRU cache in exact same order as d94007a
+  for (uint32_t idx : voxel_slots_) {
+    lruMoveToFront(idx);
   }
 
   // If max_size exceeded, remove least recently used voxels
   int removal_counter = 0;
-  while (map_.size() > config_.max_size && !voxels_cache_.empty()) {
-    map_.erase(voxels_cache_.back());
-    voxels_cache_.pop_back();
+  while (active_voxels_ > config_.max_size && lru_tail_ != UINT32_MAX) {
+    evictLRU();
     removal_counter++;
   }
 
@@ -159,6 +267,7 @@ bool BIEVRMap::updateNormal(Voxel& voxel) {
   if (voxel.num_points_ < kNMinValid) return false;
 
   Point mean = voxel.sum_ / static_cast<double>(voxel.num_points_);
+  voxel.mean_ = mean;
   M3 covariance = (voxel.outer_sum_ - voxel.sum_ * mean.transpose()) /
                   (static_cast<double>(voxel.num_points_) - 1.0);
 
@@ -206,30 +315,48 @@ bool BIEVRMap::updateBumpImage(const std::vector<Eigen::Vector4d>& points, Voxel
     return false;
   }
 
+  const int rows_init = voxel.bump_img_.rows();
+  const int cols_init = voxel.bump_img_.cols();
+  int r0 = rows_init, r1 = -1, c0 = cols_init, c1 = -1;
   Eigen::MatrixXi changed;
   if (normal_change) {
     // If the normal has changed, we reproject the surface from the old image into the new image
     ImageBounds bounds = computeImageSize(voxel, points[0].head<3>());
-    reprojectImage(voxel, bounds, changed);
+    r0 = bounds.height;
+    c0 = bounds.width;
+    reprojectImage(voxel, bounds, changed, r0, r1, c0, c1);
   } else {
-    changed = Eigen::MatrixXi::Zero(voxel.bump_img_.rows(), voxel.bump_img_.cols());
+    changed = Eigen::MatrixXi::Zero(rows_init, cols_init);
   }
 
   // Update the pixel values and weights based on the new points
-  integratePoints(points, voxel, changed);
+  integratePoints(points, voxel, changed, r0, r1, c0, c1);
 
-  Eigen::MatrixXi changed_dilated =
-      Eigen::MatrixXi::Zero(voxel.bump_img_.rows(), voxel.bump_img_.cols());
-  if (normal_change) {
-    changed_dilated = changed;
-  } else {
-    // For the smoothing, we also need to consider pixels that are adjacent to the changed pixels
-    dilateMask(changed, voxel.bump_weights_, changed_dilated);
+  if (r1 < r0) {
+    // No pixel was touched (all points fell out of bounds).
+    if (!config_.smooth) {
+      voxel.bump_smoothed_ = voxel.bump_img_;
+    }
+    computeScore(voxel);
+    return true;
   }
 
+  Eigen::MatrixXi changed_dilated;
+  int dr0 = r0, dr1 = r1, dc0 = c0, dc1 = c1;
+  if (!normal_change) {
+    // For the smoothing, we also need to consider pixels that are adjacent to the changed pixels
+    changed_dilated = Eigen::MatrixXi::Zero(voxel.bump_img_.rows(), voxel.bump_img_.cols());
+    dilateMask(changed, voxel.bump_weights_, changed_dilated, r0, r1, c0, c1);
+    dr0 = std::max(0, r0 - 1);
+    dr1 = std::min<int>(voxel.bump_img_.rows() - 1, r1 + 1);
+    dc0 = std::max(0, c0 - 1);
+    dc1 = std::min<int>(voxel.bump_img_.cols() - 1, c1 + 1);
+  }
+  const Eigen::MatrixXi& mask = normal_change ? changed : changed_dilated;
+
   if (config_.smooth) {
-    maskedGaussianSmooth(voxel.bump_img_, voxel.bump_weights_, changed_dilated,
-                         voxel.bump_smoothed_);
+    maskedGaussianSmooth(voxel.bump_img_, voxel.bump_weights_, mask, voxel.bump_smoothed_, dr0, dr1,
+                         dc0, dc1);
   } else {
     voxel.bump_smoothed_ = voxel.bump_img_;
   }
@@ -257,7 +384,8 @@ BIEVRMap::ImageBounds BIEVRMap::computeImageSize(const Voxel& voxel,
   return bounds;
 }
 
-void BIEVRMap::reprojectImage(Voxel& voxel, const ImageBounds& bounds, Eigen::MatrixXi& changed) {
+void BIEVRMap::reprojectImage(Voxel& voxel, const ImageBounds& bounds, Eigen::MatrixXi& changed,
+                              int& r0, int& r1, int& c0, int& c1) {
   Eigen::MatrixXf bump_original = voxel.bump_img_;
   Eigen::MatrixXf weights_original = voxel.bump_weights_;
   Transform T_W_C_o = voxel.T_C_W_.inverse();
@@ -293,12 +421,16 @@ void BIEVRMap::reprojectImage(Voxel& voxel, const ImageBounds& bounds, Eigen::Ma
       voxel.bump_img_(y, x) = p_O(2);
       voxel.bump_weights_(y, x) = weights_original(i, j);
       changed(y, x) = 1;
+      r0 = std::min(r0, y);
+      r1 = std::max(r1, y);
+      c0 = std::min(c0, x);
+      c1 = std::max(c1, x);
     }
   }
 }
 
 void BIEVRMap::integratePoints(const std::vector<Eigen::Vector4d>& points, Voxel& voxel,
-                               Eigen::MatrixXi& changed) {
+                               Eigen::MatrixXi& changed, int& r0, int& r1, int& c0, int& c1) {
   for (const auto& p : points) {
     Point p_O = voxel.T_C_W_.linear() * p.head(3) + voxel.T_C_W_.translation();
 
@@ -320,20 +452,26 @@ void BIEVRMap::integratePoints(const std::vector<Eigen::Vector4d>& points, Voxel
     voxel.bump_weights_(y, x) += weight_new;
     voxel.bump_img_(y, x) = (mean_old * weight + weight_new * p_O(2)) / voxel.bump_weights_(y, x);
     changed(y, x) = 1;
+    r0 = std::min(r0, y);
+    r1 = std::max(r1, y);
+    c0 = std::min(c0, x);
+    c1 = std::max(c1, x);
   }
 }
 
 void BIEVRMap::dilateMask(const Eigen::MatrixXi& changed, const Eigen::MatrixXf& weights,
-                          Eigen::MatrixXi& changed_dilated) {
-  for (size_t i = 0; i < changed.rows(); ++i) {
-    for (size_t j = 0; j < changed.cols(); ++j) {
+                          Eigen::MatrixXi& changed_dilated, int r0, int r1, int c0, int c1) {
+  const int rows = changed.rows();
+  const int cols = changed.cols();
+  for (int i = r0; i <= r1; ++i) {
+    for (int j = c0; j <= c1; ++j) {
       if (changed(i, j) != 1) continue;
       for (int k = -1; k < 2; k++) {
         int i_n = i + k;
-        if (i_n < 0 || i_n >= changed.rows()) continue;
+        if (i_n < 0 || i_n >= rows) continue;
         for (int l = -1; l < 2; l++) {
           int j_n = j + l;
-          if (j_n < 0 || j_n >= changed.cols()) continue;
+          if (j_n < 0 || j_n >= cols) continue;
           if (weights(i_n, j_n) <= 0.) continue;
           changed_dilated(i_n, j_n) = 1;
         }
@@ -344,12 +482,13 @@ void BIEVRMap::dilateMask(const Eigen::MatrixXi& changed, const Eigen::MatrixXf&
 
 // Apply Gaussian smoothing only over valid pixels
 void BIEVRMap::maskedGaussianSmooth(const Eigen::MatrixXf& image, const Eigen::MatrixXf& weights,
-                                    const Eigen::MatrixXi& changed, Eigen::MatrixXf& image_smooth) {
+                                    const Eigen::MatrixXi& changed, Eigen::MatrixXf& image_smooth,
+                                    int r0, int r1, int c0, int c1) {
   int rows = image.rows();
   int cols = image.cols();
   int radius = gauss_kernel_.rows() / 2;
-  for (int y = 0; y < rows; ++y) {
-    for (int x = 0; x < cols; ++x) {
+  for (int y = r0; y <= r1; ++y) {
+    for (int x = c0; x <= c1; ++x) {
       // Skip pixels not marked
       if (!changed(y, x)) {
         continue;
@@ -404,14 +543,6 @@ void BIEVRMap::computeScore(Voxel& voxel) {
   }
 }
 
-const Voxel* BIEVRMap::getVoxel(size_t hash_idx) const {
-  auto it = map_.find(hash_idx);
-  if (it != map_.end() && it->second.voxel.observed_) {
-    return &it->second.voxel;
-  }
-  return nullptr;
-}
-
 Eigen::Vector3i BIEVRMap::getVoxelIdx(const Eigen::Vector3d& point) const {
   Eigen::Vector3i idx;
   idx(0) = floor(point.x() * inv_voxel_size_);
@@ -428,22 +559,8 @@ Eigen::Vector3d BIEVRMap::getVoxelOrigin(const Eigen::Vector3d& point) const {
 }
 
 bool BIEVRMap::nearestVoxel(const Eigen::Vector3d& point, size_t& result) const {
-  double min_dist = std::numeric_limits<double>::max();
-  bool found = false;
-  // Select nearest voxel based on distance to voxel centroid
-  for (const auto& offset : neighbor_offsets_) {
-    Eigen::Vector3d nearby_point = point + offset;
-    size_t hash_idx = hashIndex(nearby_point);
-    auto voxel = getVoxel(hash_idx);
-    if (!voxel) continue;
-    Eigen::Vector3d centroid = voxel->sum_ / static_cast<double>(voxel->num_points_);
-    double sqdistance = (point - centroid).squaredNorm();
-    if (sqdistance > min_dist) continue;
-    min_dist = sqdistance;
-    result = hash_idx;
-    found = true;
-  }
-  return found;
+  const Voxel* voxel = nearestNeighborVoxel(point, result);
+  return voxel != nullptr;
 }
 
 }  // namespace bievr

@@ -6,6 +6,8 @@
 // API mirrors bievr's (push_imu / push_lidar / trajectory /
 // keyframe_trajectory / drain_map_scans / status) plus finish().
 
+#include <dlfcn.h>
+#include <link.h>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -45,10 +47,42 @@ Eigen::Vector3d toV3(const Array& a, const char* name) {
   return Eigen::Vector3d(p[0], p[1], p[2]);
 }
 
+// Eigen sizes its matrix-product blocks from the cache sizes CPUID reports on
+// the core that runs the first product. On hybrid CPUs (P cores 48 KB L1d, E
+// cores 32 KB) that changes the summation order, so a run's last bits depend
+// on where it started, and the filter grows them into metres. resbie's own
+// Eigen is built with EIGEN_NO_CPUID (CMakeLists.txt). The prebuilt GTSAM and
+// PCL keep their own copy of that state (Eigen 3.4: an exported function-local
+// static and its guard); pin every loaded copy to the same fixed sizes.
+void pinEigenCacheSizes() {
+  struct CacheSizes {
+    std::ptrdiff_t l1, l2, l3;  // Eigen::internal::CacheSizes
+  };
+  static const CacheSizes fixed{Eigen::l1CacheSize(), Eigen::l2CacheSize(), Eigen::l3CacheSize()};
+  dl_iterate_phdr(
+      [](dl_phdr_info* info, size_t, void*) -> int {
+        if (!info->dlpi_name || !info->dlpi_name[0]) return 0;
+        void* lib = dlopen(info->dlpi_name, RTLD_NOLOAD | RTLD_LAZY);
+        if (!lib) return 0;
+        auto* sizes = static_cast<CacheSizes*>(
+            dlsym(lib, "_ZZN5Eigen8internal20manage_caching_sizesENS_6ActionEPlS2_S2_E12m_cacheSizes"));
+        auto* guard = static_cast<unsigned char*>(
+            dlsym(lib, "_ZGVZN5Eigen8internal20manage_caching_sizesENS_6ActionEPlS2_S2_E12m_cacheSizes"));
+        if (sizes && guard) {
+          *sizes = fixed;
+          __atomic_store_n(guard, 1, __ATOMIC_RELEASE);  // constructed: never queries CPUID
+        }
+        dlclose(lib);
+        return 0;
+      },
+      nullptr);
+}
+
 class Resbie {
  public:
   Resbie(const std::vector<std::string>& config_files, size_t map_point_stride)
       : map_point_stride_(map_point_stride) {
+    pinEigenCacheSizes();
     if (!resbie::loadConfig(config_files, config_)) {
       throw std::invalid_argument("resbie rejected the configuration (see log above)");
     }

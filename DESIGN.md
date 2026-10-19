@@ -78,6 +78,12 @@ for continuing through areas with little or no LiDAR:
 - **Mahalanobis point gate,** `zp^2 <= gate_sigma^2 (HPH' + R)` (`points.gate_sigma`, 3),
   using RESPLE's own covariance. RESPLE's gate widened only when the filter
   was certain.
+- **Same bits on every core.** Eigen sizes its matrix-product blocks from
+  the cache sizes CPUID reports on the core that runs the first product; on
+  hybrid CPUs (P/E cores) a run's last bits depended on where it started, and
+  the filter grows those into metres. resbie's Eigen is built with
+  `EIGEN_NO_CPUID`, and at construction the binding pins the cache sizes of
+  the Eigen copies inside the prebuilt GTSAM and PCL to the same values.
 - **Bias drift** (`imu.*_bias_walk`): RESPLE gives the biases no process
   noise, so they freeze.
 - **Diagnostics** (`sweep_diagnostics()`, columns in `DIAGNOSTIC_COLUMNS`):

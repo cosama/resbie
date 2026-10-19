@@ -41,7 +41,12 @@ target_include_directories(_core PRIVATE
   ${PCL_INCLUDE_DIRS}
 )
 # BIEVR's compile mode (log++ in LPP mode).
-target_compile_definitions(_core PRIVATE MODE_LPP)
+target_compile_definitions(_core PRIVATE MODE_LPP
+  # Eigen sizes its GEMM blocks from the cache sizes CPUID reports on the core
+  # that runs the first product. Hybrid CPUs (P/E cores: 48 vs 32 KB L1d)
+  # then sum in a different order and runs differ in the last bit, which the
+  # filter grows into metres. Fixed sizes keep results core-independent.
+  EIGEN_NO_CPUID)
 target_compile_options(_core PRIVATE -O3 -fconcepts)
 target_link_libraries(_core PRIVATE
   Eigen3::Eigen

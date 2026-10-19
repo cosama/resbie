@@ -81,6 +81,35 @@ def test_deterministic_across_runs_and_threads(tmp_path, threads):
     np.testing.assert_array_equal(reference, again)
 
 
+def test_deterministic_across_p_and_e_cores(tmp_path):
+    """Fresh processes pinned to a P-core (CPU 0) vs an E-core produce bit-identical trajectories."""
+    import os
+    import subprocess
+    import sys
+
+    if not hasattr(os, "sched_setaffinity") or (os.cpu_count() or 1) < 2:
+        pytest.skip("CPU affinity pinning requires >= 2 cores and sched_setaffinity")
+
+    cfg = _config(tmp_path, 0)
+    e_cpu = min(12, (os.cpu_count() or 2) - 1)
+    test_dir = str(os.path.dirname(os.path.abspath(__file__)))
+
+    def _run_on_cpu(cpu: int) -> np.ndarray:
+        out_npy = tmp_path / f"traj_cpu{cpu}.npy"
+        code = (
+            "import os, sys, numpy as np\n"
+            f"os.sched_setaffinity(0, {{{cpu}}})\n"
+            f"sys.path.insert(0, {test_dir!r})\n"
+            "import test_resbie\n"
+            f"t = test_resbie._run({cfg!r}, seconds=2.0, velocity=(0.3, 0.0, 0.0)).trajectory()\n"
+            f"np.save({str(out_npy)!r}, t)\n"
+        )
+        subprocess.run([sys.executable, "-c", code], check=True)
+        return np.load(out_npy)
+
+    np.testing.assert_array_equal(_run_on_cpu(0), _run_on_cpu(e_cpu))
+
+
 def test_rejects_out_of_order_input(tmp_path):
     s = resbie.Resbie(_config(tmp_path))
     assert s.push_imu(2.0, [0, 0, 9.81], [0, 0, 0])

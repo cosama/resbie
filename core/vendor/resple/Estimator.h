@@ -113,18 +113,17 @@ class Estimator
 
     void propRCP(int64_t t)
     {
-        if (spl.maxTimeNs() >= t) {
-            cov_rcp += cov_sys;
-        } else {
-            while (spl.maxTimeNs() < t) {
-                Eigen::Matrix<double, 24, 1> cps_win = spl.getRCPs();
-                Eigen::Matrix<double, 6, 1> cp_prop_pos = 2*cps_win.block<6, 1>(12, 0) - cps_win.block<6, 1>(0, 0);
-                Eigen::Vector3d delta = cps_win.segment<3>(9);
-                spl.addOneStateKnot(cp_prop_pos.head<3>(), delta);
-                cov_rcp = a_mat * cov_rcp * a_mat.transpose() + cov_sys;
-            }
+        // resbie: cov_sys is the per-knot process noise; only add it when a
+        // new knot is actually appended, never on a no-op call with maxTimeNs() >= t.
+        if (spl.maxTimeNs() >= t) return;
+        while (spl.maxTimeNs() < t) {
+            Eigen::Matrix<double, 24, 1> cps_win = spl.getRCPs();
+            Eigen::Matrix<double, 6, 1> cp_prop_pos = 2*cps_win.block<6, 1>(12, 0) - cps_win.block<6, 1>(0, 0);
+            Eigen::Vector3d delta = cps_win.segment<3>(9);
+            spl.addOneStateKnot(cp_prop_pos.head<3>(), delta);
+            cov_rcp = a_mat * cov_rcp * a_mat.transpose() + cov_sys;
         }
-    }    
+    }
 
     SplineState* getSpline() {
         return &spl;

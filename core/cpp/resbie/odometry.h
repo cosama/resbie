@@ -190,19 +190,9 @@ class Odometry {
       int64_t max_time_ns = pt_meas_.empty() ? spline_->maxTimeNs() : pt_meas_.back().time_ns;
       if (!imu_meas_.empty()) max_time_ns = std::max(imu_meas_.back().time_ns, max_time_ns);
       while (!imu_meas_.empty() &&
-             imu_meas_.front().time_ns < spline_->maxTimeNs() - spline_->getKnotTimeIntervalNs()) {
+             imu_meas_.front().time_ns <= spline_->maxTimeNs() - spline_->getKnotTimeIntervalNs()) {
         imu_meas_.pop_front();
       }
-      // RESPLE's propRCP also adds the motion-model noise when the spline
-      // already reaches max_time_ns, i.e. once per batch. RESPLE sees about
-      // one batch per knot; dense clouds give several, which then counted as
-      // extra elapsed time (chandv2: ~5 per knot, the filter loosened and
-      // wobbled). Process noise is per knot: skip it for later batches of
-      // the same knot.
-      if (max_time_ns > spline_->maxTimeNs() || spline_->numKnots() != knots_at_last_update_) {
-        estimator_.propRCP(max_time_ns);
-      }
-      knots_at_last_update_ = spline_->numKnots();
       const Eigen::Matrix<double, 30, 1> state_before = estimator_.getState();
       for (PointData& p : pt_meas_) p.var_pt = pointVariance();
       estimator_.updateIEKFLiDARInertial(pt_meas_, map_, cfg_.association, imu_meas_, gravity_,
@@ -211,6 +201,7 @@ class Odometry {
       recordUpdate(max_time_ns);
       if (debugEnabled()) logUpdate(max_time_ns, state_before);
       pt_meas_.clear();
+      imu_meas_.clear();
       finalizeSweeps(false);
     }
   }
@@ -341,7 +332,6 @@ class Odometry {
     const int64_t start_t_ns = std::max(sweep.start_ns, int64_t(0));
     initFilter(start_t_ns, q_WI);
     while (!imu_buff_.empty() && imu_buff_.front().time_ns < start_t_ns) imu_buff_.pop_front();
-    estimator_.propRCP(start_t_ns);
 
     // Seed the map with the whole sweep at the initial pose (static start).
     const bievr::Transform T_W_I(q_WI, Eigen::Vector3d::Zero());
@@ -425,6 +415,8 @@ class Odometry {
   }
 
   // RESPLE collectMeasurements(), one LiDAR, IMU required, plus gap steps.
+  // Advances at most one knot per call and collects all points in the active
+  // knot into a single update.
   bool collectMeasurements() {
     const int64_t next = spline_->maxTimeNs() + dt_ns_;
     // Gap: no point up to the next knot, but the arrived sweeps (or a later
@@ -433,7 +425,7 @@ class Odometry {
     const int64_t lidar_known =
         std::max(covered_until_, pt_buff_.empty() ? covered_until_ : pt_buff_.front().time_ns);
     if (!point_before_next && lidar_known > next) {
-      if (imu_buff_.empty() || imu_buff_.back().time_ns <= next) return false;
+      if (imu_buff_.empty() || imu_buff_.back().time_ns < next) return false;
       estimator_.propRCP(next);
       ++gap_knots_;
       takeImu(spline_->maxTimeNs());
@@ -443,21 +435,19 @@ class Odometry {
     if (pt_buff_.empty()) return false;
     const int64_t pt_min_time = pt_buff_.front().time_ns;
     const int64_t pt_max_time = pt_buff_.back().time_ns;
-    if (pt_max_time <= spline_->maxTimeNs() + dt_ns_) return false;
-    if (imu_buff_.empty() || imu_buff_.back().time_ns <= spline_->maxTimeNs()) return false;
-    int64_t max_time_ns = std::min(spline_->maxTimeNs(), pt_min_time + dt_ns_);
-    if (pt_min_time > max_time_ns) {
-      estimator_.propRCP(pt_min_time);
-      max_time_ns = spline_->maxTimeNs();
+    if (pt_max_time <= next) return false;
+    if (pt_min_time > spline_->maxTimeNs()) {
+      if (imu_buff_.empty() || imu_buff_.back().time_ns < next) return false;
+      estimator_.propRCP(next);
+    } else {
+      if (imu_buff_.empty() || imu_buff_.back().time_ns < spline_->maxTimeNs()) return false;
     }
-    if (spline_->numKnots() > 4) max_time_ns = spline_->maxTimeNs();
-    int cnt = 0;
-    while (!pt_buff_.empty() && pt_buff_.front().time_ns <= max_time_ns && cnt < cfg_.per_update) {
-      if (spline_->numKnots() < 10 || pt_buff_.front().time_ns >= spline_->maxTimeNs() - dt_ns_) {
+    const int64_t max_time_ns = spline_->maxTimeNs();
+    while (!pt_buff_.empty() && pt_buff_.front().time_ns <= max_time_ns) {
+      if (spline_->numKnots() < 10 || pt_buff_.front().time_ns >= max_time_ns - dt_ns_) {
         pt_meas_.push_back(pt_buff_.front());
       }
       pt_buff_.pop_front();
-      cnt++;
     }
     takeImu(max_time_ns);
     return true;
@@ -588,7 +578,6 @@ class Odometry {
   double acc_scale_ = -1.0;  // < 0 until decided
   Eigen::Vector3d gravity_ = Eigen::Vector3d::Zero();
   int64_t covered_until_ = std::numeric_limits<int64_t>::min();  // LiDAR seen up to here
-  int64_t knots_at_last_update_ = -1;
 
   std::deque<ImuData> init_imu_;
   std::deque<std::pair<int64_t, Eigen::Vector3d>> imu_hist_;  // raw acc, for checkImuPosterior

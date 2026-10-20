@@ -11,7 +11,7 @@
 //           acc_bias_init_std, gyro_bias_init_std, acc_bias_walk, gyro_bias_walk
 //   spline: knot_hz, iterations, init_std, pos_noise, ort_noise,
 //           new_pos_noise, new_ort_noise
-//   points: downsample_m, informed_voxels, per_update, noise_std_m,
+//   points: downsample_m, informed_voxels, noise_std_m,
 //           huber_delta_m, gate_sigma
 //   map:    pixel_size_m, voxel_size_m, normal_tolerance_deg, smooth,
 //           weighted, max_size, init_min_voxels
@@ -66,7 +66,6 @@ struct Config {
   // points: which LiDAR points the filter measures, and how it weighs them.
   double downsample = 0.25;         // m, voxel grid before informed sampling
   size_t informed_voxels = 300;     // most informative map voxels kept (all their points)
-  int per_update = 100;             // points per filter update (never past the next knot)
   double point_noise_std = 0.1;     // m, against the map surface
   MapAssociationConfig association; // huber_delta_m
   double gate_sigma = 3.0;          // Mahalanobis gate on the predicted residual
@@ -101,7 +100,7 @@ inline constexpr const char* kKeys[] = {
     "imu.gyro_bias_init_std", "imu.acc_bias_walk", "imu.gyro_bias_walk",
     "spline.knot_hz", "spline.iterations", "spline.init_std", "spline.pos_noise",
     "spline.ort_noise", "spline.new_pos_noise", "spline.new_ort_noise",
-    "points.downsample_m", "points.informed_voxels", "points.per_update", "points.noise_std_m",
+    "points.downsample_m", "points.informed_voxels", "points.noise_std_m",
     "points.huber_delta_m", "points.gate_sigma",
     "map.pixel_size_m", "map.voxel_size_m", "map.normal_tolerance_deg", "map.smooth",
     "map.weighted", "map.max_size", "map.init_min_voxels",
@@ -232,7 +231,6 @@ inline bool loadConfig(const std::vector<std::string>& yaml_paths, Config& c) {
   int informed = static_cast<int>(c.informed_voxels);
   if (!ci::getPositive(yaml, "points", "downsample_m", c.downsample, c.downsample) ||
       !ci::getPositive(yaml, "points", "informed_voxels", informed, informed) ||
-      !ci::getPositive(yaml, "points", "per_update", c.per_update, c.per_update) ||
       !ci::getPositive(yaml, "points", "noise_std_m", c.point_noise_std, c.point_noise_std) ||
       !ci::getPositive(yaml, "points", "huber_delta_m", c.association.huber_delta,
                        c.association.huber_delta) ||

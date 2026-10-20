@@ -161,7 +161,10 @@ def test_blackout_is_bridged_by_imu(tmp_path):
     assert np.all(diag[blackout, 3] == 0) and np.all(diag[blackout, 5] > 0)  # no matched point, IMU-only updates
 
 
-@pytest.mark.parametrize("extra", ["resple: {knot_hz: 50}\n", "points: {downsample: 0.3}\n"])
+@pytest.mark.parametrize(
+    "extra",
+    ["resple: {knot_hz: 50}\n", "points: {downsample: 0.3}\n", "points: {per_update: 100}\n"],
+)
 def test_unknown_keys_raise(tmp_path, extra):
     # Old (pre-schema) or misspelled keys must not silently fall back to defaults.
     with pytest.raises(Exception):
@@ -280,4 +283,15 @@ def test_step1_low_risk_fixes(tmp_path):
     traj = s_spike.trajectory()
     assert len(traj) > 10 and np.all(np.isfinite(traj))
     assert np.abs(traj[:, 1:4]).max() < 0.05
+
+
+def test_step2_one_update_per_knot_and_imu_counted_once(tmp_path):
+    assert "per_update" not in resbie.DEFAULT_CONFIG["points"]
+    s = _run(_config(tmp_path, 0, extra="loop_closure: {enable: false}\n"), seconds=2.0)
+    diag = s.sweep_diagnostics()
+    col = {c: i for i, c in enumerate(resbie.DIAGNOSTIC_COLUMNS)}
+    # Steady-state sweeps (0.1 s at 100 Hz knots, 200 Hz IMU): 10 updates and 20 IMU samples each.
+    np.testing.assert_array_equal(diag[2:, col["updates"]], 10)
+    np.testing.assert_array_equal(diag[2:, col["imu_samples"]], SWEEP_IMU)
+
 

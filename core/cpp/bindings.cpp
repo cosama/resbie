@@ -384,7 +384,6 @@ py::dict defaultConfig() {
                          py::arg("new_ort_noise") = c.new_ort_noise);
   d["points"] = py::dict(py::arg("downsample_m") = c.downsample,
                          py::arg("informed_voxels") = c.informed_voxels,
-                         py::arg("per_update") = c.per_update,
                          py::arg("noise_std_m") = c.point_noise_std,
                          py::arg("huber_delta_m") = c.association.huber_delta,
                          py::arg("gate_sigma") = c.gate_sigma);

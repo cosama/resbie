@@ -46,7 +46,11 @@ target_compile_definitions(_core PRIVATE MODE_LPP
   # that runs the first product. Hybrid CPUs (P/E cores: 48 vs 32 KB L1d)
   # then sum in a different order and runs differ in the last bit, which the
   # filter grows into metres. Fixed sizes keep results core-independent.
-  EIGEN_NO_CPUID)
+  EIGEN_NO_CPUID
+  # With OpenMP on, Eigen splits large products over omp_get_max_threads()
+  # threads and then blocks the summed dimension differently than on one
+  # thread: OMP_NUM_THREADS=1 and >1 differ once an update exceeds 320 rows.
+  EIGEN_DONT_PARALLELIZE)
 target_compile_options(_core PRIVATE -O3 -fconcepts)
 target_link_libraries(_core PRIVATE
   Eigen3::Eigen

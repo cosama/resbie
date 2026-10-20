@@ -26,6 +26,13 @@
 #include "resbie/config.h"
 #include "resbie/odometry.h"
 
+// Without these, results depend on the core a run starts on and on
+// OMP_NUM_THREADS (see core/CMakeLists.txt). A build that lost them must not
+// produce numbers.
+#if !defined(EIGEN_NO_CPUID) || !defined(EIGEN_DONT_PARALLELIZE)
+#error "resbie needs EIGEN_NO_CPUID and EIGEN_DONT_PARALLELIZE (core/CMakeLists.txt)"
+#endif
+
 namespace py = pybind11;
 
 namespace {

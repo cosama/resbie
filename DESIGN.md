@@ -84,6 +84,10 @@ for continuing through areas with little or no LiDAR:
   the filter grows those into metres. resbie's Eigen is built with
   `EIGEN_NO_CPUID`, and at construction the binding pins the cache sizes of
   the Eigen copies inside the prebuilt GTSAM and PCL to the same values.
+  `EIGEN_DONT_PARALLELIZE` keeps Eigen's products on one thread: with OpenMP,
+  Eigen blocks a large product differently on one thread than on several, so
+  `OMP_NUM_THREADS=1` changed the bits. resbie's own loops stay parallel and
+  write per element. The binding refuses to compile without both defines.
 - **Bias drift** (`imu.*_bias_walk`): RESPLE gives the biases no process
   noise, so they freeze.
 - **Diagnostics** (`sweep_diagnostics()`, columns in `DIAGNOSTIC_COLUMNS`):

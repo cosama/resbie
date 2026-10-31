@@ -12,13 +12,16 @@ processing they triggered is done, so results depend only on the pushed data.
 
 * IMU: seconds, m/s^2 (or g, see ``imu.normalized``), rad/s, in the IMU frame.
 * LiDAR: points in the LiDAR frame; ``calibration`` maps LiDAR -> IMU.
-* Poses are the IMU frame in a gravity-aligned world frame, one per sweep,
-  stamped at the sweep's last point. A pose is reported once the spline over
-  its sweep is final (about 50 ms of data later); ``finish()`` reports the
-  rest with the current estimate.
+* Poses are the IMU frame in the map frame, one per sweep, stamped at the
+  sweep's last point. A pose is reported once the spline over its sweep is
+  final (about 50 ms of data later); ``finish()`` reports the rest with the
+  current estimate.
 * The filter starts once the IMU has started and a sweep covers
-  ``map.init_min_voxels`` map voxels; the 15 IMU samples before it set the
-  gravity direction.
+  ``map.init_min_voxels`` map voxels. The map frame is the first pose,
+  levelled on the 15 IMU samples before it (yaw zero); gravity's direction in
+  it is estimated from then on (``up_*`` in the sweep diagnostics,
+  ``gravity_up`` in ``stats()``), so the map frame is only as level as that
+  start.
 """
 
 from __future__ import annotations
@@ -63,6 +66,13 @@ DIAGNOSTIC_COLUMNS = (
     "imu_post_dv_y",
     "imu_post_dv_z",
     "imu_post_sigma",    # its std under the configured accelerometer noise, m/s
+    "gyro_bias_x",       # gyro bias at the sweep's last update, rad/s
+    "gyro_bias_y",
+    "gyro_bias_z",
+    "up_x",              # estimated gravity up direction, world (unit), at the sweep's last update
+    "up_y",
+    "up_z",
+    "up_sigma",          # its largest std, rad
 )
 
 PathLike = str | os.PathLike

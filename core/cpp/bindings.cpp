@@ -268,6 +268,8 @@ class Resbie {
     const Eigen::Vector3d ba = odometry_->accBias(), bg = odometry_->gyroBias();
     d["acc_bias"] = std::vector<double>(ba.data(), ba.data() + 3);
     d["gyro_bias"] = std::vector<double>(bg.data(), bg.data() + 3);
+    const Eigen::Vector3d up = odometry_->gravityUp();
+    d["gravity_up"] = std::vector<double>(up.data(), up.data() + 3);
     py::dict pgo;
     pgo["enabled"] = loop_closer_ != nullptr;
     if (loop_closer_) {
@@ -312,7 +314,9 @@ class Resbie {
                          g.velocity.x(), g.velocity.y(), g.velocity.z(),
                          g.acc_bias.x(), g.acc_bias.y(), g.acc_bias.z(),
                          double(g.matched_voxels), double(g.points_gated), g.imu_post_dv.x(),
-                         g.imu_post_dv.y(), g.imu_post_dv.z(), g.imu_post_sigma});
+                         g.imu_post_dv.y(), g.imu_post_dv.z(), g.imu_post_sigma,
+                         g.gyro_bias.x(), g.gyro_bias.y(), g.gyro_bias.z(),
+                         g.gravity_up.x(), g.gravity_up.y(), g.gravity_up.z(), g.gravity_sigma});
     if (to_closer) {
       // GTSAM's ISAM2 parallelizes through TBB and then depends on scheduling;
       // one thread keeps the loop closer deterministic (as the bievr bridge).
@@ -354,7 +358,7 @@ class Resbie {
   size_t loop_closer_skipped_ = 0;
 
  public:
-  static constexpr size_t kDiagColumns = 28;
+  static constexpr size_t kDiagColumns = 35;
   py::array_t<double> sweepDiagnostics() {
     std::lock_guard<std::mutex> lock(mutex_);
     const py::ssize_t rows = static_cast<py::ssize_t>(diagnostics_.size() / kDiagColumns);
@@ -383,7 +387,8 @@ py::dict defaultConfig() {
                       py::arg("acc_bias_init_std") = vec(c.acc_bias_init_std),
                       py::arg("gyro_bias_init_std") = vec(c.gyro_bias_init_std),
                       py::arg("acc_bias_walk") = c.acc_bias_walk,
-                      py::arg("gyro_bias_walk") = c.gyro_bias_walk);
+                      py::arg("gyro_bias_walk") = c.gyro_bias_walk,
+                      py::arg("gravity_init_std_deg") = c.gravity_init_std_deg);
   d["spline"] = py::dict(py::arg("knot_hz") = c.knot_hz, py::arg("iterations") = c.iterations,
                          py::arg("init_std") = c.init_std, py::arg("pos_noise") = c.pos_noise,
                          py::arg("ort_noise") = c.ort_noise,

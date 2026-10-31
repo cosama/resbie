@@ -8,7 +8,8 @@
 //   calibration: translation, rotation          T_I_L, LiDAR -> IMU
 //   lidar:  min_range_m, max_range_m, time_offset_s
 //   imu:    normalized, acc_noise_std, gyro_noise_std,
-//           acc_bias_init_std, gyro_bias_init_std, acc_bias_walk, gyro_bias_walk
+//           acc_bias_init_std, gyro_bias_init_std, acc_bias_walk, gyro_bias_walk,
+//           gravity_init_std_deg
 //   spline: knot_hz, iterations, init_std, pos_noise, ort_noise,
 //           new_pos_noise, new_ort_noise
 //   points: downsample_m, informed_voxels, noise_std_m,
@@ -51,6 +52,9 @@ struct Config {
   Eigen::Vector3d gyro_bias_init_std = Eigen::Vector3d::Constant(std::sqrt(0.2));  // rad/s
   double acc_bias_walk = 0.001;    // m/s^2/sqrt(s)
   double gyro_bias_walk = 0.0001;  // rad/s/sqrt(s)
+  // Gravity direction in the map frame: a constant state, learnt from the
+  // start (prior std about the start's mean specific force). 0 fixes it there.
+  double gravity_init_std_deg = 180.0 / M_PI;  // 1 rad: uninformative
 
   // spline: RESPLE's cubic B-spline and its iterated EKF. The motion model
   // adds, per knot, a random step of std noise * dt to every active control
@@ -97,7 +101,7 @@ inline constexpr const char* kKeys[] = {
     "calibration.translation", "calibration.rotation",
     "lidar.min_range_m", "lidar.max_range_m", "lidar.time_offset_s",
     "imu.normalized", "imu.acc_noise_std", "imu.gyro_noise_std", "imu.acc_bias_init_std",
-    "imu.gyro_bias_init_std", "imu.acc_bias_walk", "imu.gyro_bias_walk",
+    "imu.gyro_bias_init_std", "imu.acc_bias_walk", "imu.gyro_bias_walk", "imu.gravity_init_std_deg",
     "spline.knot_hz", "spline.iterations", "spline.init_std", "spline.pos_noise",
     "spline.ort_noise", "spline.new_pos_noise", "spline.new_ort_noise",
     "points.downsample_m", "points.informed_voxels", "points.noise_std_m",
@@ -212,7 +216,8 @@ inline bool loadConfig(const std::vector<std::string>& yaml_paths, Config& c) {
       !detail::getVector3(yaml, "imu", "acc_bias_init_std", c.acc_bias_init_std) ||
       !detail::getVector3(yaml, "imu", "gyro_bias_init_std", c.gyro_bias_init_std) ||
       !detail::getNonNegative(yaml, "imu", "acc_bias_walk", c.acc_bias_walk) ||
-      !detail::getNonNegative(yaml, "imu", "gyro_bias_walk", c.gyro_bias_walk)) {
+      !detail::getNonNegative(yaml, "imu", "gyro_bias_walk", c.gyro_bias_walk) ||
+      !detail::getNonNegative(yaml, "imu", "gravity_init_std_deg", c.gravity_init_std_deg)) {
     return false;
   }
 

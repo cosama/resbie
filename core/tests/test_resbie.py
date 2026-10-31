@@ -216,6 +216,115 @@ def test_diagnostics_velocity_follows_the_motion(tmp_path):
     assert np.all(late[:, col["imu_samples"]] > 0)
 
 
+def _run_accelerating_start(config: str, accel: float = 0.5, accel_s: float = 1.0,
+                            seconds: float = 6.0) -> resbie.Resbie:
+    """Level sensor accelerating along x from rest for accel_s, then coasting."""
+    rng = np.random.default_rng(0)
+    s = resbie.Resbie(config, map_point_stride=7)
+    t0 = 1.0
+
+    def x(t):
+        t = np.asarray(t) - t0
+        tc = np.minimum(t, accel_s)
+        return 0.5 * accel * tc**2 + accel * accel_s * (t - tc)
+
+    for k in range(int(seconds / IMU_DT)):
+        t = t0 + k * IMU_DT
+        a = accel if t - t0 < accel_s else 0.0
+        assert s.push_imu(t, [a, 0.0, 9.81], [0.0, 0.0, 0.0])
+        if k % SWEEP_IMU == SWEEP_IMU - 1:
+            start = t0 + (k - SWEEP_IMU + 1) * IMU_DT
+            world = _room(rng, 3000)
+            rel = np.sort(rng.uniform(0.0, 0.0999, len(world)))
+            body = world.copy()
+            body[:, 0] -= x(start + rel)
+            assert s.push_lidar(start, body, rel)
+    s.finish()
+    return s
+
+
+def test_moving_start_learns_gravity(tmp_path):
+    # The start is levelled on the mean specific force, here 2.9 deg off true
+    # up because the sensor accelerates. The map frame inherits that tilt
+    # (a gauge); gravity's direction in it must be learnt, so that once the
+    # sensor coasts the IMU agrees with the trajectory. With gravity fixed at
+    # the start, an accelerometer bias of ~0.5 m/s^2 would have to absorb it.
+    accel = 0.5
+    f0 = np.array([accel, 0.0, 9.81])
+    f0 /= np.linalg.norm(f0)
+    true_tilt = np.degrees(np.arccos(f0[2]))
+    extra = "loop_closure: {enable: false}\n"
+    col = {c: i for i, c in enumerate(resbie.DIAGNOSTIC_COLUMNS)}
+
+    diag = _run_accelerating_start(_config(tmp_path, extra=extra), accel).sweep_diagnostics()
+    up = diag[-1, [col["up_x"], col["up_y"], col["up_z"]]]
+    assert abs(np.linalg.norm(up) - 1.0) < 1e-9
+    tilt = np.degrees(np.arccos(np.clip(up[2], -1.0, 1.0)))
+    assert abs(tilt - true_tilt) < 0.5, (tilt, true_tilt)
+    assert up[0] < 0.0, up  # levelling on f0 tilted the frame toward +x
+    # Without a heading change tilt and horizontal accelerometer bias are one
+    # combination: the tilt's std stays at the bias prior over g (2.6 deg).
+    sigma = np.degrees(diag[-1, col["up_sigma"]])
+    assert 2.0 < sigma < 3.0, sigma
+    ba = diag[-1, [col["acc_bias_x"], col["acc_bias_y"], col["acc_bias_z"]]]
+    assert np.abs(ba).max() < 0.1, ba
+
+    pinned = _run_accelerating_start(
+        _config(tmp_path, extra=extra + "imu: {gravity_init_std_deg: 0}\n"), accel).sweep_diagnostics()
+    assert np.allclose(pinned[:, [col["up_x"], col["up_y"], col["up_z"]]], [0.0, 0.0, 1.0], atol=1e-9)
+
+
+def test_turning_start_separates_gravity_from_bias(tmp_path):
+    # Moving start (accelerating) with a real horizontal accelerometer bias,
+    # turning at 1 rad/s: the bias rotates with the sensor, gravity does not,
+    # so the turn tells them apart (gradually: the tilt's std falls from the
+    # 2.6 deg bias floor as the heading sweeps). Both must be recovered, from
+    # the start, with no static period.
+    accel, accel_s, omega, seconds = 0.5, 0.6, 1.0, 8.0
+    bias = np.array([0.2, -0.1, 0.0])
+    rng = np.random.default_rng(0)
+    s = resbie.Resbie(_config(tmp_path, extra="loop_closure: {enable: false}\n"), map_point_stride=7)
+    t0 = 1.0
+
+    def pose(t):
+        t = np.asarray(t, dtype=float) - t0
+        tc = np.minimum(t, accel_s)
+        x = 0.5 * accel * tc**2 + accel * accel_s * (t - tc)
+        return x, omega * t
+
+    for k in range(int(seconds / IMU_DT)):
+        t = t0 + k * IMU_DT
+        _, yaw = pose(t)
+        a_w = np.array([accel if t - t0 < accel_s else 0.0, 0.0, 9.81])
+        c, sn = np.cos(yaw), np.sin(yaw)
+        f = np.array([c * a_w[0] + sn * a_w[1], -sn * a_w[0] + c * a_w[1], a_w[2]]) + bias
+        assert s.push_imu(t, f, [0.0, 0.0, omega])
+        if k % SWEEP_IMU == SWEEP_IMU - 1:
+            start = t0 + (k - SWEEP_IMU + 1) * IMU_DT
+            world = _room(rng, 3000)
+            rel = np.sort(rng.uniform(0.0, 0.0999, len(world)))
+            x, yaw = pose(start + rel)
+            d = world - np.stack([x, np.zeros_like(x), np.zeros_like(x)], axis=1)
+            c, sn = np.cos(yaw), np.sin(yaw)
+            body = np.stack([c * d[:, 0] + sn * d[:, 1], -sn * d[:, 0] + c * d[:, 1], d[:, 2]], axis=1)
+            assert s.push_lidar(start, body, rel)
+    s.finish()
+
+    # The sensor is level throughout, so in the map frame its true up is its
+    # final attitude applied to body up, whatever tilt the map frame has
+    # (start levelling, a smeared seed sweep). Gravity must agree with that.
+    qx, qy, qz, qw = s.trajectory()[-1, 4:8]
+    up_true = np.array([2 * (qx * qz + qw * qy), 2 * (qy * qz - qw * qx), 1 - 2 * (qx**2 + qy**2)])
+    col = {c: i for i, c in enumerate(resbie.DIAGNOSTIC_COLUMNS)}
+    diag = s.sweep_diagnostics()
+    up = diag[-1, [col["up_x"], col["up_y"], col["up_z"]]]
+    err = np.degrees(np.arccos(np.clip(up @ up_true, -1.0, 1.0)))
+    assert err < 0.3, (err, up, up_true)
+    assert np.degrees(diag[-1, col["up_sigma"]]) < 1.0
+    ba = diag[-1, [col["acc_bias_x"], col["acc_bias_y"], col["acc_bias_z"]]]
+    assert np.abs(ba - bias).max() < 0.05, ba
+
+
 def _tilt_deg(q):
     qx, qy = q[..., 0], q[..., 1]
     return np.degrees(2 * np.arcsin(np.clip(np.hypot(qx, qy), 0, 1)))

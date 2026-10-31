@@ -114,3 +114,33 @@ public:
                 vec(2), vec(1), -vec(0), tmp;
     }
 };
+// resbie: SO(3) Jacobian of the rotation-vector exponential (full angle phi,
+// Exp(phi + e) ~ Exp(phi) Exp(Jr(phi) e) ~ Exp(Jl(phi) e) Exp(phi)).
+struct SO3
+{
+    static Eigen::Matrix3d skew(const Eigen::Vector3d& v)
+    {
+        Eigen::Matrix3d m;
+        m << 0, -v.z(), v.y(),
+             v.z(), 0, -v.x(),
+             -v.y(), v.x(), 0;
+        return m;
+    }
+
+    // Jr(phi) = I - a [phi]x + b [phi]x^2, a = (1 - cos t)/t^2, b = (t - sin t)/t^3.
+    static Eigen::Matrix3d rightJacobian(const Eigen::Vector3d& phi)
+    {
+        const double t2 = phi.squaredNorm();
+        double a, b;
+        if (t2 < 1e-8) {
+            a = 0.5 - t2 / 24.0;
+            b = 1.0 / 6.0 - t2 / 120.0;
+        } else {
+            const double t = std::sqrt(t2);
+            a = (1.0 - std::cos(t)) / t2;
+            b = (t - std::sin(t)) / (t2 * t);
+        }
+        const Eigen::Matrix3d K = skew(phi);
+        return Eigen::Matrix3d::Identity() - a * K + b * K * K;
+    }
+};

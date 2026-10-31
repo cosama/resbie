@@ -14,9 +14,12 @@
 // * The map gets a sweep once the spline over the sweep can no longer change
 //   (it left the 4-knot active window). Each point is placed with the spline
 //   pose at its own timestamp, then the whole sweep goes into BIEVR's map.
-// * Initialization: gravity from the first 15 IMU samples, as RESPLE; the
-//   first sweep with enough points seeds the map at the initial pose (RESPLE
-//   seeds with the first 100 ms of points, BIEVR with its first sweep).
+// * Initialization: the first pose is levelled on the first 15 IMU samples, as
+//   RESPLE, but gravity's direction in the map frame is a state from then on
+//   (RESPLE: fixed), so neither a moving start nor a map that tilts against
+//   gravity leaves the IMU with a fake acceleration. The first sweep with
+//   enough points seeds the map at the initial pose (RESPLE seeds with the
+//   first 100 ms of points, BIEVR with its first sweep).
 // * LiDAR gaps: RESPLE advances the spline only when points arrive and then
 //   jumps the gap on its constant-velocity model, discarding the gap's IMU.
 //   Here the spline steps knot by knot through any stretch the arrived sweeps
@@ -63,6 +66,9 @@ struct SweepDiagnostics {
   size_t acc_gated = 0;          // of their acceleration axes, dropped by the 10 m/s^2 residual gate
   Eigen::Vector3d acc_bias = Eigen::Vector3d::Zero();  // at the last update, m/s^2
   Eigen::Vector3d velocity = Eigen::Vector3d::Zero();  // final spline, world, mean over the sweep, m/s
+  Eigen::Vector3d gyro_bias = Eigen::Vector3d::Zero();  // at the last update, rad/s
+  Eigen::Vector3d gravity_up = Eigen::Vector3d::UnitZ();  // world up direction at the last update
+  double gravity_sigma = NAN;    // its largest tangent std, rad
   size_t points_gated = 0;       // matched points the Mahalanobis gate rejected (last iteration)
   // A-posteriori IMU check: the final spline's velocity change over the sweep
   // minus the IMU's (world, m/s, final orientation, current acc bias). Each
@@ -155,6 +161,7 @@ class Odometry {
   const bievr::BIEVRMap& map() const { return map_; }
   Eigen::Vector3d accBias() const { return initialized_ ? estimator_.biasAcc() : Eigen::Vector3d::Zero(); }
   Eigen::Vector3d gyroBias() const { return initialized_ ? estimator_.biasGyro() : Eigen::Vector3d::Zero(); }
+  Eigen::Vector3d gravityUp() const { return initialized_ ? estimator_.gravityUp() : Eigen::Vector3d::UnitZ(); }
 
   struct Stats {
     size_t imu_accepted, imu_rejected, lidar_accepted, lidar_rejected;
@@ -193,9 +200,9 @@ class Odometry {
              imu_meas_.front().time_ns <= spline_->maxTimeNs() - spline_->getKnotTimeIntervalNs()) {
         imu_meas_.pop_front();
       }
-      const Eigen::Matrix<double, 30, 1> state_before = estimator_.getState();
+      const Eigen::Matrix<double, 32, 1> state_before = estimator_.getState();
       for (PointData& p : pt_meas_) p.var_pt = pointVariance();
-      estimator_.updateIEKFLiDARInertial(pt_meas_, map_, cfg_.association, imu_meas_, gravity_,
+      estimator_.updateIEKFLiDARInertial(pt_meas_, map_, cfg_.association, imu_meas_,
                                          cfg_.acc_noise_std.cwiseAbs2(),
                                          cfg_.gyro_noise_std.cwiseAbs2());
       recordUpdate(max_time_ns);
@@ -208,10 +215,10 @@ class Odometry {
 
   // Debug trace, one line per filter update: what it measured and how far it
   // moved the newest knot (position, and velocity (cp_3 - cp_2) / dt).
-  void logUpdate(int64_t t_ns, const Eigen::Matrix<double, 30, 1>& before) {
-    const Eigen::Matrix<double, 30, 1> after = estimator_.getState();
+  void logUpdate(int64_t t_ns, const Eigen::Matrix<double, 32, 1>& before) {
+    const Eigen::Matrix<double, 32, 1> after = estimator_.getState();
     const double inv_dt = 1e9 / double(dt_ns_);
-    const auto vel = [&](const Eigen::Matrix<double, 30, 1>& s) {
+    const auto vel = [&](const Eigen::Matrix<double, 32, 1>& s) {
       return Eigen::Vector3d((s.segment<3>(18) - s.segment<3>(12)) * inv_dt);
     };
     size_t matched = 0;
@@ -276,7 +283,11 @@ class Odometry {
     d->imu_samples += estimator_.imu_samples;
     d->acc_gated += estimator_.acc_gated;
     if (effective > 0) d->points_gated += estimator_.points_gated;
-    d->acc_bias = estimator_.getState().template segment<3>(Estimator<30>::BA_OFFSET);
+    d->acc_bias = estimator_.biasAcc();
+    d->gyro_bias = estimator_.biasGyro();
+    d->gravity_up = estimator_.gravityUp();
+    d->gravity_sigma = std::sqrt(std::max(
+        0.0, Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d>(estimator_.gravityCovariance()).eigenvalues().maxCoeff()));
     const Eigen::Matrix3d P_pos = estimator_.covariance().template block<3, 3>(18, 18);
     d->pos_sigma = std::sqrt(std::max(
         0.0, Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(P_pos).eigenvalues().maxCoeff()));
@@ -323,14 +334,16 @@ class Odometry {
       acc_scale_ = gravity_sum.norm() < 0.5 * kGravity ? kGravity : 1.0;
       for (ImuData& imu : imu_buff_) imu.accel *= acc_scale_;
     }
-    // RESPLE initialization(): level the first pose on gravity, zero yaw.
-    const Eigen::Vector3d gravity_ave = gravity_sum.normalized() * kGravity;
-    const Eigen::Matrix3d R0 = CommonUtils::g2R(gravity_ave);
+    // RESPLE initialization(): level the first pose on the mean specific
+    // force, zero yaw. That pose is the gauge of the map frame; the mean force
+    // (motion included on a moving start) only sets gravity's linearisation
+    // point, the direction itself is estimated from here on.
+    const Eigen::Matrix3d R0 = CommonUtils::g2R(gravity_sum);
     const Eigen::Quaterniond q_WI = Quater::positify(Eigen::Quaterniond(R0));
-    gravity_ = q_WI * gravity_ave;
 
     const int64_t start_t_ns = std::max(sweep.start_ns, int64_t(0));
     initFilter(start_t_ns, q_WI);
+    estimator_.setGravity((q_WI * gravity_sum).normalized(), kGravity);
     while (!imu_buff_.empty() && imu_buff_.front().time_ns < start_t_ns) imu_buff_.pop_front();
 
     // Seed the map with the whole sweep at the initial pose (static start).
@@ -352,7 +365,7 @@ class Odometry {
     const double dt2 = dt_s * dt_s;
     const double cov_P0 = cfg_.init_std * cfg_.init_std * dt2;
     Eigen::Matrix<double, 24, 24> cov_RCPs = cov_P0 * Eigen::Matrix<double, 24, 24>::Identity();
-    Eigen::Matrix<double, 30, 30> Q = Eigen::Matrix<double, 30, 30>::Zero();
+    Eigen::Matrix<double, 32, 32> Q = Eigen::Matrix<double, 32, 32>::Zero();  // gravity: constant
     Eigen::Matrix<double, 6, 6> Q_block_old = Eigen::Matrix<double, 6, 6>::Zero();
     Q_block_old.topLeftCorner<3, 3>() = cfg_.pos_noise * cfg_.pos_noise * dt2 * Eigen::Matrix3d::Identity();
     Q_block_old.bottomRightCorner<3, 3>() = cfg_.ort_noise * cfg_.ort_noise * dt2 * Eigen::Matrix3d::Identity();
@@ -365,10 +378,12 @@ class Odometry {
     Q.block<6, 6>(18, 18) = Q_block_new;
     Q.block<3, 3>(24, 24) = cfg_.acc_bias_walk * cfg_.acc_bias_walk * dt_s * Eigen::Matrix3d::Identity();
     Q.block<3, 3>(27, 27) = cfg_.gyro_bias_walk * cfg_.gyro_bias_walk * dt_s * Eigen::Matrix3d::Identity();
-    Eigen::Matrix<double, 30, 30> cov_x = Eigen::Matrix<double, 30, 30>::Zero();
+    Eigen::Matrix<double, 32, 32> cov_x = Eigen::Matrix<double, 32, 32>::Zero();
     cov_x.topLeftCorner<24, 24>() = cov_RCPs;
     cov_x.block<3, 3>(24, 24) = cfg_.acc_bias_init_std.cwiseAbs2().asDiagonal();
     cov_x.block<3, 3>(27, 27) = cfg_.gyro_bias_init_std.cwiseAbs2().asDiagonal();
+    const double grav_std = cfg_.gravity_init_std_deg * M_PI / 180.0;
+    cov_x.block<2, 2>(30, 30) = grav_std * grav_std * Eigen::Matrix2d::Identity();
     estimator_.setState(dt_ns_, start_t_ns, Eigen::Vector3d::Zero(), q_init, Q, cov_x);
     spline_ = estimator_.getSpline();
   }
@@ -480,6 +495,7 @@ class Odometry {
     while (!imu_hist_.empty() && imu_hist_.front().first < sweep.start_ns - 1000000000LL) imu_hist_.pop_front();
     if (sweep.end_ns <= sweep.start_ns || sweep.start_ns < spline_->minTimeNs() || acc_scale_ <= 0) return;
     const Eigen::Vector3d ba = estimator_.biasAcc();
+    const Eigen::Vector3d g = estimator_.gravityVector();
     Eigen::Vector3d dv_imu = Eigen::Vector3d::Zero();
     double sum_dt2 = 0.0;
     int64_t prev = sweep.start_ns;
@@ -488,7 +504,7 @@ class Odometry {
       Eigen::Quaterniond q;
       spline_->itpQuaternion(t, &q);
       const double dt = double(t - prev) * 1e-9;
-      dv_imu += (q * (a * acc_scale_ - ba) - gravity_) * dt;
+      dv_imu += (q * (a * acc_scale_ - ba) - g) * dt;
       sum_dt2 += dt * dt;
       prev = t;
     }
@@ -519,6 +535,8 @@ class Odometry {
         << " nis " << (d.nis_count ? d.nis_sum / double(d.nis_count) : NAN)
         << " voxels " << d.matched_voxels << " imu " << d.imu_samples << " acc_gated " << d.acc_gated
         << " vel [" << d.velocity.transpose() << "] acc_bias [" << d.acc_bias.transpose() << "]"
+        << " gyro_bias [" << d.gyro_bias.transpose() << "] up [" << d.gravity_up.transpose() << "] (sigma "
+        << d.gravity_sigma * 180.0 / M_PI << " deg)"
         << " gated " << d.points_gated << " imu_post_dv [" << d.imu_post_dv.transpose() << "] (sigma "
         << d.imu_post_sigma << ")");
   }
@@ -572,11 +590,10 @@ class Odometry {
   Config cfg_;
   bievr::BIEVRMap map_;
   int64_t dt_ns_;
-  Estimator<30> estimator_;
+  Estimator<32> estimator_;
   SplineState* spline_ = nullptr;
   bool initialized_ = false;
   double acc_scale_ = -1.0;  // < 0 until decided
-  Eigen::Vector3d gravity_ = Eigen::Vector3d::Zero();
   int64_t covered_until_ = std::numeric_limits<int64_t>::min();  // LiDAR seen up to here
 
   std::deque<ImuData> init_imu_;

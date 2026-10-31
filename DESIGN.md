@@ -39,8 +39,10 @@ This is RESPLE's `processData` loop made synchronous, with no worker thread.
 Every push runs all processing the new data allows before returning.
 
 1. **Init.** The first sweep covering at least `map.init_min_voxels`
-   distinct map voxels seeds BIEVR's map at the initial pose (level, zero
-   yaw). Gravity comes from the 15 IMU samples before it, as in RESPLE.
+   distinct map voxels seeds BIEVR's map at the initial pose, levelled on the
+   mean specific force of the 15 IMU samples before it (zero yaw), as in
+   RESPLE. That pose is the map frame's gauge; gravity's direction in it is
+   then estimated (see below), so a moving start is fine.
    Sparse sweeps before that (a drone on the ground) are dropped, since a
    pose dead-reckoned on them would smear the map. So are sweeps that start
    before the first IMU sample: the filter would
@@ -90,13 +92,24 @@ for continuing through areas with little or no LiDAR:
   write per element. The binding refuses to compile without both defines.
 - **Bias drift** (`imu.*_bias_walk`): RESPLE gives the biases no process
   noise, so they freeze.
+- **Gravity direction as a state.** RESPLE fixes gravity at init along the
+  map's z. A start that is not static, or a map region built tilted, then
+  leaves the IMU with a fake horizontal acceleration g sin(tilt) that the
+  body-fixed accelerometer bias cannot absorb. Here the up direction in the
+  map frame is a 2-DoF state (S^2 tangent error, constant: no process noise,
+  prior `imu.gravity_init_std_deg`, 1 rad; 0 fixes it as RESPLE), with the
+  exact specific-force Jacobian, re-anchored once at the exit of every
+  update. Tilt separates from the horizontal accelerometer bias only with
+  heading changes; until then its std stays near `acc_bias_init_std / g`.
+  Poses stay in the map frame (only as level as the start); the estimate is
+  reported as `up_*` in the diagnostics and `gravity_up` in `stats()`.
 - **Diagnostics** (`sweep_diagnostics()`, columns in `DIAGNOSTIC_COLUMNS`):
   per sweep, matched points, IMU-only updates, the smallest eigenvalues of the
   LiDAR information (rotation, translation) and the weakest translation
   direction, position sigma, loop-closer use, point NIS, IMU samples and the
   acceleration axes RESPLE's 10 m/s^2 residual gate dropped, the sweep's mean
-  velocity and the accelerometer bias, the points the gate rejected, and an
-  a-posteriori IMU check (the final trajectory's velocity change per sweep
+  velocity, the accelerometer and gyro biases, the estimated up direction
+  and its std, the points the gate rejected, and an a-posteriori IMU check (the final trajectory's velocity change per sweep
   minus the IMU's: each IMU sample is otherwise only checked once, before
   later updates reshape the trajectory). `resbie.set_log_level("debug")` (a run
   option, not config) prints the same as one line per sweep, plus one line per
@@ -186,7 +199,7 @@ loader); only `calibration` must be set.
 |---|---|
 | `calibration` | `translation`, `rotation` (T_I_L, LiDAR to IMU, row-major) |
 | `lidar` | `min_range_m`, `max_range_m`, `time_offset_s` |
-| `imu` | `normalized`; `acc_noise_std`, `gyro_noise_std` (per sample); `acc_bias_init_std`, `gyro_bias_init_std`; `acc_bias_walk`, `gyro_bias_walk` (per sqrt(s)) |
+| `imu` | `normalized`; `acc_noise_std`, `gyro_noise_std` (per sample); `acc_bias_init_std`, `gyro_bias_init_std`; `acc_bias_walk`, `gyro_bias_walk` (per sqrt(s)); `gravity_init_std_deg` (prior on gravity's direction about the start's mean force; 0 fixes it) |
 | `spline` | `knot_hz` (at most the IMU rate, rounded: each knot interval needs >= 1 IMU sample when the LiDAR is starved; init warns otherwise), `iterations`, `init_std`; `pos_noise`, `ort_noise` (motion-model noise of settled control points, m/s and rad/s); `new_pos_noise`, `new_ort_noise` (newest control point) |
 | `points` | `downsample_m`, `informed_voxels`, `noise_std_m`, `huber_delta_m`, `gate_sigma` |
 | `map` | `pixel_size_m`, `voxel_size_m`, `normal_tolerance_deg`, `smooth`, `weighted`, `max_size`, `init_min_voxels` |

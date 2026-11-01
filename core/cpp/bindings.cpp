@@ -100,19 +100,20 @@ class Resbie {
     odometry_ = std::make_unique<resbie::Odometry>(config_);
 
     bievr::LoopClosureConfig loop_closure_config;
+    // The graph's IMU model has its own loop_closure keys (acc_noise_std, ...);
+    // a key left out falls back to resbie's imu section, set here first.
+    auto& lc = loop_closure_config.closer;
+    lc.gravity = resbie::Odometry::kGravity;
+    lc.acc_noise_std = config_.acc_noise_std;
+    lc.gyro_noise_std = config_.gyro_noise_std;
+    lc.acc_bias_walk = config_.acc_bias_walk;
+    lc.gyro_bias_walk = config_.gyro_bias_walk;
+    lc.acc_bias_init_std = config_.acc_bias_init_std;
+    lc.gyro_bias_init_std = config_.gyro_bias_init_std;
     if (!bievr::loadLoopClosureConfig(config_files, loop_closure_config)) {
       throw std::invalid_argument("resbie rejected the loop_closure configuration");
     }
     if (loop_closure_config.enable) {
-      // The graph's IMU factors use resbie's IMU model.
-      auto& lc = loop_closure_config.closer;
-      lc.gravity = resbie::Odometry::kGravity;
-      lc.acc_noise_std = config_.acc_noise_std;
-      lc.gyro_noise_std = config_.gyro_noise_std;
-      lc.acc_bias_walk = config_.acc_bias_walk;
-      lc.gyro_bias_walk = config_.gyro_bias_walk;
-      lc.acc_bias_init_std = config_.acc_bias_init_std;
-      lc.gyro_bias_init_std = config_.gyro_bias_init_std;
       loop_closer_ = std::make_unique<bievr::LoopCloser>(lc);
     }
 

@@ -7,6 +7,8 @@
 
 #include <bievr_lio/config_loader.h>
 
+#include <cmath>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -54,6 +56,12 @@ inline constexpr const char* kLoopClosureKeys[] = {
     "loop_noise_cauchy_c",
     "isam_relinearize_threshold",
     "isam_relinearize_skip",
+    "acc_noise_std",
+    "gyro_noise_std",
+    "acc_bias_walk",
+    "gyro_bias_walk",
+    "acc_bias_init_std",
+    "gyro_bias_init_std",
 };
 
 inline bool loadLoopClosureConfig(const std::vector<std::string>& yaml_paths,
@@ -116,6 +124,19 @@ inline bool loadLoopClosureConfig(const std::vector<std::string>& yaml_paths,
   c.isam_relinearize_threshold =
       yaml.get<double>(s, "isam_relinearize_threshold", c.isam_relinearize_threshold);
   c.isam_relinearize_skip = yaml.get<int>(s, "isam_relinearize_skip", c.isam_relinearize_skip);
+
+  // resbie: the graph's own IMU model (isotropic, per-sample std as in the imu
+  // section). A key left out keeps the value the caller set beforehand.
+  const auto iso = [&](const char* key, Eigen::Vector3d& v) {
+    const double x = yaml.get<double>(s, key, std::numeric_limits<double>::quiet_NaN());
+    if (std::isfinite(x)) v = Eigen::Vector3d::Constant(x);
+  };
+  iso("acc_noise_std", c.acc_noise_std);
+  iso("gyro_noise_std", c.gyro_noise_std);
+  iso("acc_bias_init_std", c.acc_bias_init_std);
+  iso("gyro_bias_init_std", c.gyro_bias_init_std);
+  c.acc_bias_walk = yaml.get<double>(s, "acc_bias_walk", c.acc_bias_walk);
+  c.gyro_bias_walk = yaml.get<double>(s, "gyro_bias_walk", c.gyro_bias_walk);
   return true;
 }
 

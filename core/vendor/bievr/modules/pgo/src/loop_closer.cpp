@@ -227,6 +227,10 @@ boost::shared_ptr<gtsam::PreintegrationCombinedParams> LoopCloser::makeImuParams
   p->integrationCovariance = kIntegrationVariance * gtsam::I_3x3;
   p->biasAccCovariance = config_.acc_bias_walk * config_.acc_bias_walk * gtsam::I_3x3;
   p->biasOmegaCovariance = config_.gyro_bias_walk * config_.gyro_bias_walk * gtsam::I_3x3;
+  // resbie: GTSAM (<= 4.2) adds biasAccOmegaInt to the measurement noise at every step, and
+  // its default I_6x6 made the factor ~100x weaker than the IMU (1 rad, 5.7 m/s after 1 s).
+  // The bias uncertainty is the B states' prior and random walk, so nothing goes here.
+  p->biasAccOmegaInt = gtsam::Z_6x6;
   return p;
 }
 

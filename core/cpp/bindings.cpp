@@ -131,10 +131,8 @@ class Resbie {
     py::gil_scoped_release release;
     std::lock_guard<std::mutex> lock(mutex_);
     const bool accepted = odometry_->addImu(t, a, w);
-    // The graph integrates the same samples, in m/s^2 (known once initialized).
-    if (accepted && loop_closer_ && odometry_->accScale() > 0) {
-      loop_closer_->addImu(static_cast<uint64_t>(t), a * odometry_->accScale(), w);
-    }
+    // The graph integrates the same samples.
+    if (accepted && loop_closer_) loop_closer_->addImu(static_cast<uint64_t>(t), a, w);
     return accepted;
   }
 
@@ -264,7 +262,6 @@ class Resbie {
     d["points_measured"] = s.points_measured;
     d["points_effective"] = s.points_effective;
     d["map_voxels"] = s.map_voxels;
-    d["acc_scale"] = s.acc_scale;
     d["poses"] = trajectory_.size() / 8;
     const Eigen::Vector3d ba = odometry_->accBias(), bg = odometry_->gyroBias();
     d["acc_bias"] = std::vector<double>(ba.data(), ba.data() + 3);
@@ -382,8 +379,7 @@ py::dict defaultConfig() {
                               py::arg("rotation") = std::vector<double>{1, 0, 0, 0, 1, 0, 0, 0, 1});
   d["lidar"] = py::dict(py::arg("min_range_m") = c.min_range, py::arg("max_range_m") = c.max_range,
                         py::arg("time_offset_s") = c.time_offset);
-  d["imu"] = py::dict(py::arg("normalized") = c.imu_normalized,
-                      py::arg("acc_noise_std") = vec(c.acc_noise_std),
+  d["imu"] = py::dict(py::arg("acc_noise_std") = vec(c.acc_noise_std),
                       py::arg("gyro_noise_std") = vec(c.gyro_noise_std),
                       py::arg("acc_bias_init_std") = vec(c.acc_bias_init_std),
                       py::arg("gyro_bias_init_std") = vec(c.gyro_bias_init_std),

@@ -7,7 +7,7 @@
 //
 //   calibration: translation, rotation          T_I_L, LiDAR -> IMU
 //   lidar:  min_range_m, max_range_m, time_offset_s
-//   imu:    normalized, acc_noise_std, gyro_noise_std,
+//   imu:    acc_noise_std, gyro_noise_std,
 //           acc_bias_init_std, gyro_bias_init_std, acc_bias_walk, gyro_bias_walk,
 //           gravity_init_std_deg
 //   spline: knot_hz, iterations, init_std, pos_noise, ort_noise,
@@ -43,9 +43,8 @@ struct Config {
   double max_range = 100.0;
   double time_offset = 0.0;  // s, added to every point time
 
-  // imu. Noise as per-sample standard deviations; biases drift as a random
-  // walk (sigma per sqrt(s)).
-  double imu_normalized = -1.0;  // < 0 autodetect, 0 m/s^2, > 0 in g
+  // imu (input in m/s^2 and rad/s). Noise as per-sample standard deviations;
+  // biases drift as a random walk (sigma per sqrt(s)).
   Eigen::Vector3d acc_noise_std = Eigen::Vector3d::Constant(1.0);           // m/s^2
   Eigen::Vector3d gyro_noise_std = Eigen::Vector3d::Constant(std::sqrt(0.1));  // rad/s
   Eigen::Vector3d acc_bias_init_std = Eigen::Vector3d::Constant(std::sqrt(0.2));   // m/s^2
@@ -100,7 +99,7 @@ struct Config {
 inline constexpr const char* kKeys[] = {
     "calibration.translation", "calibration.rotation",
     "lidar.min_range_m", "lidar.max_range_m", "lidar.time_offset_s",
-    "imu.normalized", "imu.acc_noise_std", "imu.gyro_noise_std", "imu.acc_bias_init_std",
+    "imu.acc_noise_std", "imu.gyro_noise_std", "imu.acc_bias_init_std",
     "imu.gyro_bias_init_std", "imu.acc_bias_walk", "imu.gyro_bias_walk", "imu.gravity_init_std_deg",
     "spline.knot_hz", "spline.iterations", "spline.init_std", "spline.pos_noise",
     "spline.ort_noise", "spline.new_pos_noise", "spline.new_ort_noise",
@@ -210,7 +209,6 @@ inline bool loadConfig(const std::vector<std::string>& yaml_paths, Config& c) {
   c.time_offset = yaml.get<double>("lidar", "time_offset_s", c.time_offset);
 
   // --- imu ---
-  c.imu_normalized = yaml.get<double>("imu", "normalized", c.imu_normalized);
   if (!detail::getVector3(yaml, "imu", "acc_noise_std", c.acc_noise_std) ||
       !detail::getVector3(yaml, "imu", "gyro_noise_std", c.gyro_noise_std) ||
       !detail::getVector3(yaml, "imu", "acc_bias_init_std", c.acc_bias_init_std) ||

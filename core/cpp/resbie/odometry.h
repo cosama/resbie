@@ -110,13 +110,12 @@ class Odometry {
     NUM_OF_THREAD = cfg_.max_num_threads > 0 ? cfg_.max_num_threads : omp_get_num_procs();
     estimator_.n_iter = cfg_.iterations;
     estimator_.gate_chi2 = cfg_.gate_sigma * cfg_.gate_sigma;
-    if (cfg_.imu_normalized == 0.0) acc_scale_ = 1.0;
-    if (cfg_.imu_normalized > 0.0) acc_scale_ = kGravity;
   }
 
   void setObserver(SweepObserver observer) { observer_ = std::move(observer); }
 
-  // False if the sample is not strictly after the previous one.
+  // acc in m/s^2, gyro in rad/s. False if the sample is not strictly after
+  // the previous one.
   bool addImu(int64_t t_ns, const Eigen::Vector3d& acc, const Eigen::Vector3d& gyro) {
     if (t_ns <= last_imu_ns_) {
       ++imu_rejected_;
@@ -128,7 +127,7 @@ class Odometry {
     // come long after the first sample: it waits for a dense sweep).
     init_imu_.emplace_back(t_ns, gyro, acc);
     if (init_imu_.size() > kInitImuSamples) init_imu_.pop_front();
-    imu_buff_.emplace_back(t_ns, gyro, acc * (acc_scale_ > 0 ? acc_scale_ : 1.0));
+    imu_buff_.emplace_back(t_ns, gyro, acc);
     imu_hist_.emplace_back(t_ns, acc);
     process();
     return true;
@@ -157,7 +156,6 @@ class Odometry {
   }
 
   bool initialized() const { return initialized_; }
-  double accScale() const { return acc_scale_; }  // m/s^2 per input unit; <= 0 until known
   const bievr::BIEVRMap& map() const { return map_; }
   Eigen::Vector3d accBias() const { return initialized_ ? estimator_.biasAcc() : Eigen::Vector3d::Zero(); }
   Eigen::Vector3d gyroBias() const { return initialized_ ? estimator_.biasGyro() : Eigen::Vector3d::Zero(); }
@@ -167,13 +165,12 @@ class Odometry {
     size_t imu_accepted, imu_rejected, lidar_accepted, lidar_rejected;
     size_t sweeps_dropped_init, sweeps_finalized, sweeps_unfinished;
     size_t updates, imu_only_updates, gap_knots, points_measured, points_effective, map_voxels;
-    double acc_scale;
   };
   Stats stats() const {
     return {imu_accepted_,   imu_rejected_,      lidar_accepted_,   lidar_rejected_,
             sweeps_dropped_init_, sweeps_finalized_, sweeps_unfinished_,
             updates_, imu_only_updates_, gap_knots_, points_measured_, points_effective_,
-            map_.size(), acc_scale_ > 0 ? acc_scale_ : 0.0};
+            map_.size()};
   }
 
  private:
@@ -330,10 +327,6 @@ class Odometry {
     Eigen::Vector3d gravity_sum = Eigen::Vector3d::Zero();
     for (const ImuData& imu : init_imu_) gravity_sum += imu.accel;
     gravity_sum /= double(init_imu_.size());
-    if (acc_scale_ <= 0) {  // BIEVR's autodetection: ~1 means the IMU reports g
-      acc_scale_ = gravity_sum.norm() < 0.5 * kGravity ? kGravity : 1.0;
-      for (ImuData& imu : imu_buff_) imu.accel *= acc_scale_;
-    }
     // RESPLE initialization(): level the first pose on the mean specific
     // force, zero yaw. That pose is the gauge of the map frame; the mean force
     // (motion included on a moving start) only sets gravity's linearisation
@@ -493,7 +486,7 @@ class Odometry {
   // (Estimator::prepIMU), integrated here over the sweep's IMU samples.
   void checkImuPosterior(Sweep& sweep) {
     while (!imu_hist_.empty() && imu_hist_.front().first < sweep.start_ns - 1000000000LL) imu_hist_.pop_front();
-    if (sweep.end_ns <= sweep.start_ns || sweep.start_ns < spline_->minTimeNs() || acc_scale_ <= 0) return;
+    if (sweep.end_ns <= sweep.start_ns || sweep.start_ns < spline_->minTimeNs()) return;
     const Eigen::Vector3d ba = estimator_.biasAcc();
     const Eigen::Vector3d g = estimator_.gravityVector();
     Eigen::Vector3d dv_imu = Eigen::Vector3d::Zero();
@@ -504,7 +497,7 @@ class Odometry {
       Eigen::Quaterniond q;
       spline_->itpQuaternion(t, &q);
       const double dt = double(t - prev) * 1e-9;
-      dv_imu += (q * (a * acc_scale_ - ba) - g) * dt;
+      dv_imu += (q * (a - ba) - g) * dt;
       sum_dt2 += dt * dt;
       prev = t;
     }
@@ -593,7 +586,6 @@ class Odometry {
   Estimator<32> estimator_;
   SplineState* spline_ = nullptr;
   bool initialized_ = false;
-  double acc_scale_ = -1.0;  // < 0 until decided
   int64_t covered_until_ = std::numeric_limits<int64_t>::min();  // LiDAR seen up to here
 
   std::deque<ImuData> init_imu_;

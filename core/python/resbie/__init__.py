@@ -10,7 +10,8 @@ source of defaults); only ``calibration`` has to be set.
 Every call is synchronous: when ``push_imu``/``push_lidar`` return, all
 processing they triggered is done, so results depend only on the pushed data.
 
-* IMU: seconds, m/s^2 (or g, see ``imu.normalized``), rad/s, in the IMU frame.
+* IMU: seconds, m/s^2, rad/s, in the IMU frame (an IMU reporting g needs
+  its acceleration multiplied by 9.81 first).
 * LiDAR: points in the LiDAR frame; ``calibration`` maps LiDAR -> IMU.
 * Poses are the IMU frame in the map frame, one per sweep, stamped at the
   sweep's last point. A pose is reported once the spline over its sweep is

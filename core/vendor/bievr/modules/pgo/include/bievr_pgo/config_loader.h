@@ -49,6 +49,7 @@ inline constexpr const char* kLoopClosureKeys[] = {
     "loop_fitness_score_threshold",
     "use_sc_yaw_guess",
     "sc_yaw_guess_min_deg",
+    "loop_max_correction_z",
     "prior_noise_score",
     "odom_noise_rotation",
     "odom_noise_translation",
@@ -113,6 +114,7 @@ inline bool loadLoopClosureConfig(const std::vector<std::string>& yaml_paths,
       yaml.get<double>(s, "loop_fitness_score_threshold", c.loop_fitness_score_threshold);
   c.use_sc_yaw_guess = yaml.get<bool>(s, "use_sc_yaw_guess", c.use_sc_yaw_guess);
   c.sc_yaw_guess_min_deg = yaml.get<double>(s, "sc_yaw_guess_min_deg", c.sc_yaw_guess_min_deg);
+  c.loop_max_correction_z = yaml.get<double>(s, "loop_max_correction_z", c.loop_max_correction_z);
 
   c.prior_noise_score = yaml.get<double>(s, "prior_noise_score", c.prior_noise_score);
   c.odom_noise_rotation = yaml.get<double>(s, "odom_noise_rotation", c.odom_noise_rotation);

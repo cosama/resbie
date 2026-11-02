@@ -430,6 +430,7 @@ py::dict defaultConfig() {
       py::arg("loop_fitness_score_threshold") = lc.loop_fitness_score_threshold,
       py::arg("use_sc_yaw_guess") = lc.use_sc_yaw_guess,
       py::arg("sc_yaw_guess_min_deg") = lc.sc_yaw_guess_min_deg,
+      py::arg("loop_max_correction_z") = lc.loop_max_correction_z,
       py::arg("prior_noise_score") = lc.prior_noise_score,
       py::arg("odom_noise_rotation") = lc.odom_noise_rotation,
       py::arg("odom_noise_translation") = lc.odom_noise_translation,

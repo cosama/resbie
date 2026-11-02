@@ -12,6 +12,8 @@
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <sstream>
+#include <string>
 
 #include "bievr_lio/utils.h"
 
@@ -52,6 +54,15 @@ double headingOf(const Eigen::Matrix3d& R) { return std::atan2(R(1, 0), R(0, 0))
 // mounted upside down (H420's imu_link is rolled by pi).
 gtsam::Pose3 levelFrame(const gtsam::Pose3& pose) {
   return gtsam::Pose3(gtsam::Rot3::Yaw(headingOf(pose.rotation().matrix())), pose.translation());
+}
+
+// x y z rx ry rz (rotation vector), for the loop log lines.
+std::string poseLog(const gtsam::Pose3& p) {
+  const gtsam::Vector3 r = gtsam::Rot3::Logmap(p.rotation());
+  std::ostringstream s;
+  s.precision(9);
+  s << p.x() << ' ' << p.y() << ' ' << p.z() << ' ' << r.x() << ' ' << r.y() << ' ' << r.z();
+  return s.str();
 }
 
 }  // namespace
@@ -137,6 +148,13 @@ void LoopCloser::addFrame(uint64_t stamp, const Transform& T_W_I, const Pointclo
       ++num_loops_;
       std::cout << "[resbie::pgo] >>> Loop ACCEPTED between kf=" << candidate.from
                 << " and kf=" << candidate.to << " (total accepted: " << num_loops_ << ")" << std::endl;
+      // What the loop asserts (from^-1 to) next to what the graph held when it
+      // came, so a log alone tells true loops from false ones afterwards.
+      const gtsam::Pose3 held =
+          keyframe_poses_.at(candidate.from).between(keyframe_poses_.at(candidate.to));
+      std::cout << "[resbie::pgo]     loop stamps " << keyframe_stamps_.at(candidate.from) << ' '
+                << keyframe_stamps_.at(candidate.to) << " constraint " << poseLog(*constraint)
+                << " graph " << poseLog(held) << std::endl;
     } else {
       ++num_rejected_;
       std::cout << "[resbie::pgo] --- Loop REJECTED between kf=" << candidate.from
@@ -356,6 +374,8 @@ std::optional<gtsam::Pose3> LoopCloser::computeLoopConstraint(const LoopCandidat
     if (converged) {
       std::cout << "[resbie::pgo]   Loop rejected: best fitness " << best_fitness
                 << " > threshold " << config_.loop_fitness_score_threshold << std::endl;
+      logRejected(candidate, pose_loop.between(gtsam::Pose3(best_transformation.cast<double>()) * pose_curr),
+                  best_fitness);
     } else {
       std::cout << "[resbie::pgo]   Loop rejected: ICP did not converge for any guess." << std::endl;
     }
@@ -366,7 +386,25 @@ std::optional<gtsam::Pose3> LoopCloser::computeLoopConstraint(const LoopCandidat
   // keyframe in the world frame: P_corrected = T_icp * P_curr. BetweenFactor
   // wants P_loop^-1 * P_corrected.
   const gtsam::Pose3 correction(best_transformation.cast<double>());
+  // Where the loop would move the current keyframe, with the loop keyframe held: the part of the
+  // graph's estimate the loop contradicts. World z is gravity-aligned.
+  const gtsam::Point3 shift = (correction * pose_curr).translation() - pose_curr.translation();
+  if (std::abs(shift.z()) > config_.loop_max_correction_z) {
+    std::cout << "[resbie::pgo]   Loop rejected: vertical correction " << shift.z() << " m > "
+              << config_.loop_max_correction_z << " m" << std::endl;
+    logRejected(candidate, pose_loop.between(correction * pose_curr), best_fitness);
+    return std::nullopt;
+  }
   return pose_loop.between(correction * pose_curr);
+}
+
+void LoopCloser::logRejected(const LoopCandidate& candidate, const gtsam::Pose3& asserted,
+                             double fitness) const {
+  const gtsam::Pose3 held =
+      keyframe_poses_.at(candidate.from).between(keyframe_poses_.at(candidate.to));
+  std::cout << "[resbie::pgo]     rejected stamps " << keyframe_stamps_.at(candidate.from) << ' '
+            << keyframe_stamps_.at(candidate.to) << " fitness " << fitness << " constraint "
+            << poseLog(asserted) << " graph " << poseLog(held) << std::endl;
 }
 
 void LoopCloser::optimize() {

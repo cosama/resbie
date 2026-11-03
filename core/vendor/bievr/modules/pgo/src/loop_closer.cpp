@@ -30,6 +30,7 @@ constexpr double kLooseVelocitySigma = 10.0;  // m/s
 constexpr double kFreeRotationVariance = 1.0;  // rad^2
 // GTSAM's integration noise (position from velocity); negligible by design.
 constexpr double kIntegrationVariance = 1e-8;
+constexpr double kGravity = 9.81;  // m/s^2, the front end's
 
 gtsam::Pose3 toPose3(const Transform& t) {
   return gtsam::Pose3(gtsam::Rot3(t.linear()), gtsam::Point3(t.translation()));
@@ -94,7 +95,7 @@ void LoopCloser::initNoiseModels() {
       gtsam::noiseModel::Diagonal::Variances(loop_variance));
 }
 
-void LoopCloser::addFrame(uint64_t stamp, const Transform& T_W_I, const Pointcloud& cloud_body) {
+bool LoopCloser::addFrame(uint64_t stamp, const Transform& T_W_I, const PointsView& cloud_body) {
   // Gate first: it is a pose delta only, and it saves copying the clouds of
   // frames that will not become keyframes.
   bool is_keyframe = !has_previous_frame_;
@@ -113,7 +114,7 @@ void LoopCloser::addFrame(uint64_t stamp, const Transform& T_W_I, const Pointclo
   previous_pose_ = T_W_I;
   previous_stamp_ = stamp;
   has_previous_frame_ = true;
-  if (!is_keyframe) return;
+  if (!is_keyframe) return false;
 
   translation_accumulated_ = 0.0;
   rotation_accumulated_ = 0.0;
@@ -123,11 +124,10 @@ void LoopCloser::addFrame(uint64_t stamp, const Transform& T_W_I, const Pointclo
   frame.pose = T_W_I;
   frame.velocity = velocity;
   frame.cloud = Cloud::Ptr(new Cloud());
-  const auto& data = cloud_body.data();
-  frame.cloud->resize(data.cols());
-  for (Eigen::Index i = 0; i < data.cols(); ++i) {
-    frame.cloud->points[i] = PointT(static_cast<float>(data(0, i)), static_cast<float>(data(1, i)),
-                                    static_cast<float>(data(2, i)));
+  frame.cloud->resize(cloud_body.rows());
+  for (Eigen::Index i = 0; i < cloud_body.rows(); ++i) {
+    frame.cloud->points[i] = PointT(static_cast<float>(cloud_body(i, 0)), static_cast<float>(cloud_body(i, 1)),
+                                    static_cast<float>(cloud_body(i, 2)));
   }
 
   // BIEVR's keyframe, loop-detect, ICP and iSAM2 workers, one pass each, in
@@ -162,6 +162,7 @@ void LoopCloser::addFrame(uint64_t stamp, const Transform& T_W_I, const Pointclo
     }
   }
   optimize();
+  return true;
 }
 
 void LoopCloser::integrateKeyframe(PendingFrame frame) {
@@ -231,7 +232,8 @@ void LoopCloser::integrateKeyframe(PendingFrame frame) {
 }
 
 void LoopCloser::addImu(uint64_t stamp, const Eigen::Vector3d& acc, const Eigen::Vector3d& gyro) {
-  if (keyframe_stamps_.empty() || stamp <= keyframe_stamps_.back()) return;
+  // Samples at or before the newest keyframe belong to factors already built.
+  if (!keyframe_stamps_.empty() && stamp <= keyframe_stamps_.back()) return;
   if (!imu_.empty() && stamp <= imu_.back().stamp) return;
   imu_.push_back({stamp, acc, gyro});
 }
@@ -239,7 +241,7 @@ void LoopCloser::addImu(uint64_t stamp, const Eigen::Vector3d& acc, const Eigen:
 // GTSAM wants continuous noise densities: a per-sample standard deviation
 // sigma at sample interval dt is sigma^2 * dt. Gravity points down world z.
 boost::shared_ptr<gtsam::PreintegrationCombinedParams> LoopCloser::makeImuParams(double dt) const {
-  auto p = gtsam::PreintegrationCombinedParams::MakeSharedU(config_.gravity);
+  auto p = gtsam::PreintegrationCombinedParams::MakeSharedU(kGravity);
   p->accelerometerCovariance = config_.acc_noise_std.cwiseAbs2().asDiagonal() * dt;
   p->gyroscopeCovariance = config_.gyro_noise_std.cwiseAbs2().asDiagonal() * dt;
   p->integrationCovariance = kIntegrationVariance * gtsam::I_3x3;
@@ -370,15 +372,8 @@ std::optional<gtsam::Pose3> LoopCloser::computeLoopConstraint(const LoopCandidat
     }
   }
 
-  if (!converged || best_fitness > config_.loop_fitness_score_threshold) {
-    if (converged) {
-      std::cout << "[resbie::pgo]   Loop rejected: best fitness " << best_fitness
-                << " > threshold " << config_.loop_fitness_score_threshold << std::endl;
-      logRejected(candidate, pose_loop.between(gtsam::Pose3(best_transformation.cast<double>()) * pose_curr),
-                  best_fitness);
-    } else {
-      std::cout << "[resbie::pgo]   Loop rejected: ICP did not converge for any guess." << std::endl;
-    }
+  if (!converged) {
+    std::cout << "[resbie::pgo]   Loop rejected: ICP did not converge for any guess." << std::endl;
     return std::nullopt;
   }
 
@@ -386,16 +381,23 @@ std::optional<gtsam::Pose3> LoopCloser::computeLoopConstraint(const LoopCandidat
   // keyframe in the world frame: P_corrected = T_icp * P_curr. BetweenFactor
   // wants P_loop^-1 * P_corrected.
   const gtsam::Pose3 correction(best_transformation.cast<double>());
+  const gtsam::Pose3 asserted = pose_loop.between(correction * pose_curr);
+  if (best_fitness > config_.loop_fitness_score_threshold) {
+    std::cout << "[resbie::pgo]   Loop rejected: best fitness " << best_fitness
+              << " > threshold " << config_.loop_fitness_score_threshold << std::endl;
+    logRejected(candidate, asserted, best_fitness);
+    return std::nullopt;
+  }
   // Where the loop would move the current keyframe, with the loop keyframe held: the part of the
   // graph's estimate the loop contradicts. World z is gravity-aligned.
   const gtsam::Point3 shift = (correction * pose_curr).translation() - pose_curr.translation();
   if (std::abs(shift.z()) > config_.loop_max_correction_z) {
     std::cout << "[resbie::pgo]   Loop rejected: vertical correction " << shift.z() << " m > "
               << config_.loop_max_correction_z << " m" << std::endl;
-    logRejected(candidate, pose_loop.between(correction * pose_curr), best_fitness);
+    logRejected(candidate, asserted, best_fitness);
     return std::nullopt;
   }
-  return pose_loop.between(correction * pose_curr);
+  return asserted;
 }
 
 void LoopCloser::logRejected(const LoopCandidate& candidate, const gtsam::Pose3& asserted,
@@ -433,12 +435,10 @@ void LoopCloser::readEstimate(const gtsam::Values& estimate) {
   }
 }
 
-std::vector<LoopCloser::Keyframe> LoopCloser::keyframes() const {
-  std::vector<Keyframe> out(keyframe_poses_.size());
-  for (size_t i = 0; i < keyframe_poses_.size(); ++i) {
-    out[i].stamp = keyframe_stamps_[i];
-    out[i].pose = toTransform(keyframe_poses_[i]);
-  }
+std::vector<Transform> LoopCloser::keyframePoses() const {
+  std::vector<Transform> out;
+  out.reserve(keyframe_poses_.size());
+  for (const gtsam::Pose3& pose : keyframe_poses_) out.push_back(toTransform(pose));
   return out;
 }
 

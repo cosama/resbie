@@ -20,20 +20,64 @@ def _room(rng: np.random.Generator, n: int) -> np.ndarray:
     return pts
 
 
-def _config(tmp_path, threads: int = 0, extra: str = "") -> str:
-    path = tmp_path / f"resbie_{threads}.yaml"
-    path.write_text(
-        "calibration: {translation: [0, 0, 0], rotation: [1, 0, 0, 0, 1, 0, 0, 0, 1]}\n"
-        f"max_num_threads: {threads}\n" + extra
-    )
+def _config(tmp_path, extra: str = "") -> str:
+    path = tmp_path / f"resbie_{abs(hash(extra))}.yaml"
+    path.write_text("calibration: {translation: [0, 0, 0], rotation: [1, 0, 0, 0, 1, 0, 0, 0, 1]}\n" + extra)
     return str(path)
 
 
-def _run(config: str, seconds: float = 6.0, velocity=(0.0, 0.0, 0.0)) -> resbie.Resbie:
+class _Run:
+    """A FrontEnd, and a BackEnd if ``back`` is a config, wired as a caller does."""
+
+    def __init__(self, config: str, back=None, threads: int = 0):
+        self.front = resbie.FrontEnd(config, max_num_threads=threads, diagnostics=True)
+        self.back = None if back is None else resbie.BackEnd(back)
+        self.results = []
+        self.diag = [self.front.drain_diagnostics()]
+
+    def push_imu(self, stamp, acc, gyro) -> bool:
+        accepted = self.front.push_imu(stamp, acc, gyro)
+        if self.back is not None:
+            assert self.back.push_imu(stamp, acc, gyro) == accepted
+        self._drain()
+        return accepted
+
+    def push_lidar(self, stamp, points, relative_times) -> bool:
+        accepted = self.front.push_lidar(stamp, points, relative_times)
+        self._drain()
+        return accepted
+
+    def finish(self) -> None:
+        self.front.finish()
+        self._drain()
+        if self.back is not None:
+            self.back.finish()
+
+    def _drain(self) -> None:
+        for stamp, pose, points in self.front.drain():
+            self.results.append((stamp, pose, points))
+            if self.back is not None:
+                self.back.push_lio(stamp, pose, points)
+        self.diag.append(self.front.drain_diagnostics())
+
+    def trajectory(self) -> np.ndarray:
+        """(N, 8): t, x, y, z, qx, qy, qz, qw, one row per sweep."""
+        return np.array([[t, *pose] for t, pose, _ in self.results]).reshape(-1, 8)
+
+    def diagnostics(self) -> tuple[np.ndarray, dict[str, int]]:
+        """Rows and {column name: index}."""
+        return np.vstack(self.diag), _columns(resbie.FrontEnd)
+
+
+def _columns(cls) -> dict[str, int]:
+    return {c: i for i, c in enumerate(cls.DIAGNOSTIC_COLUMNS)}
+
+
+def _run(config: str, seconds: float = 6.0, velocity=(0.0, 0.0, 0.0), back=None, threads: int = 0) -> _Run:
     """Sensor moving at constant velocity through a static room."""
     rng = np.random.default_rng(0)
     v = np.asarray(velocity)
-    s = resbie.Resbie(config, map_point_stride=7)
+    s = _Run(config, back, threads)
     t0 = 1.0
     n_imu = int(seconds / IMU_DT)
     for k in range(n_imu):
@@ -50,17 +94,59 @@ def _run(config: str, seconds: float = 6.0, velocity=(0.0, 0.0, 0.0)) -> resbie.
 
 def test_static_sensor_stays_put(tmp_path):
     s = _run(_config(tmp_path))
-    status = s.status()
-    assert status["initialized"]
-    assert status["sweeps_finalized"] == status["poses"] > 50
-    assert status["points_effective"] > 0.6 * status["points_measured"]
+    status = s.front.status()
     traj = s.trajectory()
+    assert status["initialized"]
+    assert status["sweeps_finalized"] == len(traj) > 50
+    assert status["points_effective"] > 0.6 * status["points_measured"]
     assert np.all(np.diff(traj[:, 0]) > 0)
-    # 5 cm: at the default 0.2 m point filter the small synthetic room keeps
+    # 5 cm: at the default 0.25 m point filter the small synthetic room keeps
     # only a few hundred points per sweep.
     assert np.abs(traj[:, 1:4]).max() < 0.05
-    assert len(s.drain_map_scans()) == status["poses"]
-    assert s.drain_map_scans() == []
+    assert s.front.drain() == []
+
+
+def _static_room(config: str, point_stride: int) -> list:
+    """LIO results of a static sensor in the room, 2990 range-filtered points each."""
+    front = resbie.FrontEnd(config, point_stride=point_stride)
+    rng = np.random.default_rng(1)
+    for k in range(int(3.0 / IMU_DT)):
+        assert front.push_imu(1.0 + k * IMU_DT, [0.0, 0.0, 9.81], [0.0, 0.0, 0.0])
+        if k % SWEEP_IMU == SWEEP_IMU - 1:
+            room = _room(rng, 3000)
+            xyzi = np.column_stack((room, rng.uniform(0, 255, len(room))))
+            xyzi[:10, :3] = 0.0  # inside min range: dropped
+            rel = np.sort(rng.uniform(0.0, 0.0999, len(room)))
+            assert front.push_lidar(1.0 + (k - SWEEP_IMU + 1) * IMU_DT, xyzi, rel)
+    front.finish()
+    return front.drain()
+
+
+def test_lio_results_carry_every_point_deskewed(tmp_path):
+    """Each LIO result holds every range-filtered point, with its intensity, in the
+    IMU frame (for a static sensor: the room itself)."""
+    results = _static_room(_config(tmp_path), 1)
+    assert len(results) > 20
+    for stamp, pose, points in results:
+        assert isinstance(stamp, float)
+        assert pose.shape == (7,) and abs(np.linalg.norm(pose[3:]) - 1.0) < 1e-12 and pose[6] >= 0
+        assert points.dtype == np.float64 and points.shape == (2990, 4)
+        assert np.all((points[:, 3] >= 0) & (points[:, 3] <= 255))
+        # On a wall, to within the pose error (a wrong frame would be metres off).
+        assert np.abs(np.abs(points[:, :3]) - HALF).min(axis=1).max() < 0.15
+
+
+def test_point_stride_thins_the_points_only(tmp_path):
+    config = _config(tmp_path)
+    full = _static_room(config, 1)
+    for stride, n in ((3, 997), (0, 0)):
+        thin = _static_room(config, stride)
+        assert len(thin) == len(full)
+        for (s0, p0, x0), (s1, p1, x1) in zip(full, thin):
+            assert s0 == s1
+            np.testing.assert_array_equal(p0, p1)  # the estimate does not change
+            np.testing.assert_array_equal(x1, x0[::stride] if stride else x0[:0])
+            assert x1.shape == (n, 4)
 
 
 def test_constant_velocity_is_tracked(tmp_path):
@@ -76,8 +162,8 @@ def test_constant_velocity_is_tracked(tmp_path):
 
 @pytest.mark.parametrize("threads", [1, 3])
 def test_deterministic_across_runs_and_threads(tmp_path, threads):
-    reference = _run(_config(tmp_path, 0), seconds=3.0, velocity=(0.3, 0.0, 0.0)).trajectory()
-    again = _run(_config(tmp_path, threads), seconds=3.0, velocity=(0.3, 0.0, 0.0)).trajectory()
+    reference = _run(_config(tmp_path), seconds=3.0, velocity=(0.3, 0.0, 0.0)).trajectory()
+    again = _run(_config(tmp_path), seconds=3.0, velocity=(0.3, 0.0, 0.0), threads=threads).trajectory()
     np.testing.assert_array_equal(reference, again)
 
 
@@ -90,7 +176,7 @@ def test_deterministic_across_p_and_e_cores(tmp_path):
     if not hasattr(os, "sched_setaffinity") or (os.cpu_count() or 1) < 2:
         pytest.skip("CPU affinity pinning requires >= 2 cores and sched_setaffinity")
 
-    cfg = _config(tmp_path, 0)
+    cfg = _config(tmp_path)
     e_cpu = min(12, (os.cpu_count() or 2) - 1)
     test_dir = str(os.path.dirname(os.path.abspath(__file__)))
 
@@ -111,7 +197,7 @@ def test_deterministic_across_p_and_e_cores(tmp_path):
 
 
 def test_rejects_out_of_order_input(tmp_path):
-    s = resbie.Resbie(_config(tmp_path))
+    s = resbie.FrontEnd(_config(tmp_path))
     assert s.push_imu(2.0, [0, 0, 9.81], [0, 0, 0])
     assert not s.push_imu(2.0, [0, 0, 9.81], [0, 0, 0])
     pts = np.ones((10, 3))
@@ -119,22 +205,24 @@ def test_rejects_out_of_order_input(tmp_path):
     assert not s.push_lidar(1.5, pts, np.zeros(10))
     # all inside min range: kept as an empty sweep (a gap marker for the filter)
     assert s.push_lidar(3.0, np.zeros((10, 3)), np.zeros(10))
+    # same start, but not ending after the previous sweep: its stamp would not increase
+    assert not s.push_lidar(3.0, pts, np.zeros(10))
     status = s.status()
-    assert (status["imu_rejected"], status["lidar_rejected"], status["lidar_empty"]) == (1, 1, 1)
+    assert (status["imu_rejected"], status["lidar_rejected"], status["lidar_empty"]) == (1, 2, 1)
 
 
 def test_bad_config_raises(tmp_path):
     path = tmp_path / "bad.yaml"
     path.write_text("calibration: {translation: [0, 0], rotation: [1, 0, 0, 0, 1, 0, 0, 0, 1]}\n")
     with pytest.raises(ValueError):
-        resbie.Resbie(str(path))
+        resbie.FrontEnd(str(path))
 
 
 def test_blackout_is_bridged_by_imu(tmp_path):
     """1.5 s of empty sweeps mid-run: the spline steps through on IMU alone."""
     rng = np.random.default_rng(0)
     v = np.array([0.4, 0.0, 0.0])
-    s = resbie.Resbie(_config(tmp_path))
+    s = _Run(_config(tmp_path))
     t0 = 1.0
     for k in range(int(8.0 / IMU_DT)):
         assert s.push_imu(t0 + k * IMU_DT, [0.0, 0.0, 9.81], [0.0, 0.0, 0.0])
@@ -146,7 +234,7 @@ def test_blackout_is_bridged_by_imu(tmp_path):
                 body = np.zeros((3000, 3))  # all inside min range: empty sweep
             assert s.push_lidar(start, body, rel)
     s.finish()
-    status = s.status()
+    status = s.front.status()
     assert status["gap_knots"] > 100 and status["imu_only_updates"] > 100
     traj = s.trajectory()
     err = traj[:, 1:4] - v * (traj[:, 0] - 1.0)[:, None]
@@ -155,31 +243,102 @@ def test_blackout_is_bridged_by_imu(tmp_path):
     before = err[(traj[:, 0] > t0 + 3.5) & (traj[:, 0] < t0 + 4.0)].mean(0)
     after = err[traj[:, 0] > t0 + 6.0]
     assert np.linalg.norm(after - before, axis=1).max() < 0.05
-    diag = s.sweep_diagnostics()
-    assert diag.shape == (len(traj), len(resbie.DIAGNOSTIC_COLUMNS))
+    diag, col = s.diagnostics()
+    assert diag.shape == (len(traj), len(resbie.FrontEnd.DIAGNOSTIC_COLUMNS))
+    assert s.front.drain_diagnostics().shape == (0, len(col))
+    np.testing.assert_array_equal(diag[:, col["stamp"]], traj[:, 0])
     blackout = (diag[:, 0] > t0 + 4.2) & (diag[:, 0] < t0 + 5.4)
-    assert np.all(diag[blackout, 3] == 0) and np.all(diag[blackout, 5] > 0)  # no matched point, IMU-only updates
+    # no matched point, IMU-only updates
+    assert np.all(diag[blackout, col["points_effective"]] == 0)
+    assert np.all(diag[blackout, col["imu_only_updates"]] > 0)
 
 
 @pytest.mark.parametrize(
     "extra",
-    ["resple: {knot_hz: 50}\n", "points: {downsample: 0.3}\n", "points: {per_update: 100}\n"],
+    [
+        "resple: {knot_hz: 50}\n",
+        "points: {downsample: 0.3}\n",
+        "points: {per_update: 100}\n",
+        "loop_closure: {enable: false}\n",  # the back end's, not the front end's
+        "max_num_threads: 2\n",  # how it runs, a constructor argument
+    ],
 )
-def test_unknown_keys_raise(tmp_path, extra):
-    # Old (pre-schema) or misspelled keys must not silently fall back to defaults.
-    with pytest.raises(Exception):
-        resbie.Resbie(_config(tmp_path, extra=extra))
+def test_front_end_rejects_unknown_keys(tmp_path, extra):
+    # Old (pre-schema), misspelled or misplaced keys must not silently fall back to defaults.
+    with pytest.raises(ValueError):
+        resbie.FrontEnd(_config(tmp_path, extra=extra))
 
 
-def test_default_config_loads_as_is(tmp_path):
-    import json
+@pytest.mark.parametrize(
+    "config",
+    [{"enable": False}, {"loop_closure": {"keyframe_meter_gap": 2.0}}, {"knot_hz": 100},
+     {"max_speed_mps": 30.0}],
+)
+def test_back_end_rejects_unknown_keys(config):
+    with pytest.raises(ValueError):
+        resbie.BackEnd(config)
 
-    path = tmp_path / "defaults.yaml"
-    path.write_text(json.dumps(resbie.DEFAULT_CONFIG))  # JSON is valid YAML
-    resbie.Resbie(str(path))
-    assert set(resbie.DEFAULT_CONFIG) == {
-        "calibration", "lidar", "imu", "spline", "points", "map", "loop_closure", "max_num_threads",
-    }
+
+def test_default_configs_load_as_is():
+    # calibration has no default: it must be set.
+    calibration = {"calibration": {"translation": [0, 0, 0], "rotation": [1, 0, 0, 0, 1, 0, 0, 0, 1]}}
+    with pytest.raises(ValueError):
+        resbie.FrontEnd(resbie.FrontEnd.DEFAULT_CONFIG)
+    resbie.FrontEnd([resbie.FrontEnd.DEFAULT_CONFIG, calibration])
+    resbie.BackEnd(resbie.BackEnd.DEFAULT_CONFIG)
+    assert set(resbie.FrontEnd.DEFAULT_CONFIG) == {"lidar", "imu", "spline", "points", "map"}
+    assert "keyframe_meter_gap" in resbie.BackEnd.DEFAULT_CONFIG
+
+
+def test_configs_merge_files_and_dicts(tmp_path):
+    # A later document wins per key; an invalid value in it is still caught.
+    base = _config(tmp_path)
+    resbie.FrontEnd([base, {"points": {"noise_std_m": 0.05}}])
+    with pytest.raises(ValueError):
+        resbie.FrontEnd([base, {"points": {"noise_std_m": -1.0}}])
+    resbie.BackEnd([{"keyframe_meter_gap": 2.0}, {"keyframe_meter_gap": 3.0}])
+
+
+@pytest.mark.parametrize(
+    "lidar", [{"min_range_m": -1.0}, {"min_range_m": 5.0, "max_range_m": 5.0}, {"max_range_m": 0.1}]
+)
+def test_front_end_rejects_bad_ranges(tmp_path, lidar):
+    with pytest.raises(ValueError):
+        resbie.FrontEnd([_config(tmp_path), {"lidar": lidar}])
+
+
+@pytest.mark.parametrize(
+    "config",
+    [{"acc_noise_std": -1.0}, {"sc_num_rings": 0}, {"icp_max_iterations": -5},
+     {"keyframe_filter_size": 0.0}, {"loop_noise_cauchy_c": 0.0}, {"gyro_noise_std": [0.1, 0.1]}],
+)
+def test_back_end_rejects_bad_values(config):
+    with pytest.raises(ValueError):
+        resbie.BackEnd(config)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{"points": {"informed_voxels": -1}}, {"map": {"max_size": 0}}, {"spline": {"knot_hz": 1.5}},
+     {"imu": {"acc_noise_std": [1.0, 1.0]}}, {"imu": {"gyro_bias_walk": -0.1}},
+     {"imu": {"gyro_noise_std": 0.0}}],
+)
+def test_front_end_rejects_bad_values(tmp_path, extra):
+    with pytest.raises(ValueError):
+        resbie.FrontEnd([_config(tmp_path), extra])
+
+
+def test_imu_stds_take_one_number_or_three(tmp_path):
+    for std in (0.5, [0.5, 0.6, 0.7]):
+        resbie.FrontEnd([_config(tmp_path), {"imu": {"acc_noise_std": std}}])
+        resbie.BackEnd({"acc_noise_std": std})
+
+
+def test_wrong_types_are_value_errors(tmp_path):
+    with pytest.raises(ValueError):
+        resbie.FrontEnd([_config(tmp_path), {"spline": {"knot_hz": "fast"}}])
+    with pytest.raises(ValueError):
+        resbie.BackEnd({"sc_num_rings": "many"})
 
 
 def test_log_level_rejects_unknown_names():
@@ -191,7 +350,7 @@ def test_log_level_rejects_unknown_names():
 def test_debug_logs_one_line_per_sweep(tmp_path, capfd, level, lines):
     resbie.set_log_level(level)
     try:
-        s = _run(_config(tmp_path, extra="loop_closure: {enable: false}\n"), seconds=3.0)
+        s = _run(_config(tmp_path), seconds=3.0)
     finally:
         resbie.set_log_level("info")
     out, err = capfd.readouterr()
@@ -200,10 +359,8 @@ def test_debug_logs_one_line_per_sweep(tmp_path, capfd, level, lines):
 
 
 def test_diagnostics_velocity_follows_the_motion(tmp_path):
-    s = _run(_config(tmp_path, extra="loop_closure: {enable: false}\n"), seconds=4.0,
-             velocity=(0.5, 0.0, 0.0))
-    diag = s.sweep_diagnostics()
-    col = {c: i for i, c in enumerate(resbie.DIAGNOSTIC_COLUMNS)}
+    s = _run(_config(tmp_path), seconds=4.0, velocity=(0.5, 0.0, 0.0))
+    diag, col = s.diagnostics()
     late = diag[diag[:, 0] > diag[0, 0] + 1.0]
     vel = late[:, [col["vel_x"], col["vel_y"], col["vel_z"]]]
     assert np.abs(vel - [0.5, 0.0, 0.0]).max() < 0.05, vel
@@ -217,10 +374,10 @@ def test_diagnostics_velocity_follows_the_motion(tmp_path):
 
 
 def _run_accelerating_start(config: str, accel: float = 0.5, accel_s: float = 1.0,
-                            seconds: float = 6.0) -> resbie.Resbie:
+                            seconds: float = 6.0) -> _Run:
     """Level sensor accelerating along x from rest for accel_s, then coasting."""
     rng = np.random.default_rng(0)
-    s = resbie.Resbie(config, map_point_stride=7)
+    s = _Run(config)
     t0 = 1.0
 
     def x(t):
@@ -253,10 +410,7 @@ def test_moving_start_learns_gravity(tmp_path):
     f0 = np.array([accel, 0.0, 9.81])
     f0 /= np.linalg.norm(f0)
     true_tilt = np.degrees(np.arccos(f0[2]))
-    extra = "loop_closure: {enable: false}\n"
-    col = {c: i for i, c in enumerate(resbie.DIAGNOSTIC_COLUMNS)}
-
-    diag = _run_accelerating_start(_config(tmp_path, extra=extra), accel).sweep_diagnostics()
+    diag, col = _run_accelerating_start(_config(tmp_path), accel).diagnostics()
     up = diag[-1, [col["up_x"], col["up_y"], col["up_z"]]]
     assert abs(np.linalg.norm(up) - 1.0) < 1e-9
     tilt = np.degrees(np.arccos(np.clip(up[2], -1.0, 1.0)))
@@ -269,8 +423,8 @@ def test_moving_start_learns_gravity(tmp_path):
     ba = diag[-1, [col["acc_bias_x"], col["acc_bias_y"], col["acc_bias_z"]]]
     assert np.abs(ba).max() < 0.1, ba
 
-    pinned = _run_accelerating_start(
-        _config(tmp_path, extra=extra + "imu: {gravity_init_std_deg: 0}\n"), accel).sweep_diagnostics()
+    pinned, _ = _run_accelerating_start(
+        _config(tmp_path, extra="imu: {gravity_init_std_deg: 0}\n"), accel).diagnostics()
     assert np.allclose(pinned[:, [col["up_x"], col["up_y"], col["up_z"]]], [0.0, 0.0, 1.0], atol=1e-9)
 
 
@@ -283,7 +437,7 @@ def test_turning_start_separates_gravity_from_bias(tmp_path):
     accel, accel_s, omega, seconds = 0.5, 0.6, 1.0, 8.0
     bias = np.array([0.2, -0.1, 0.0])
     rng = np.random.default_rng(0)
-    s = resbie.Resbie(_config(tmp_path, extra="loop_closure: {enable: false}\n"), map_point_stride=7)
+    s = _Run(_config(tmp_path))
     t0 = 1.0
 
     def pose(t):
@@ -315,8 +469,7 @@ def test_turning_start_separates_gravity_from_bias(tmp_path):
     # (start levelling, a smeared seed sweep). Gravity must agree with that.
     qx, qy, qz, qw = s.trajectory()[-1, 4:8]
     up_true = np.array([2 * (qx * qz + qw * qy), 2 * (qy * qz - qw * qx), 1 - 2 * (qx**2 + qy**2)])
-    col = {c: i for i, c in enumerate(resbie.DIAGNOSTIC_COLUMNS)}
-    diag = s.sweep_diagnostics()
+    diag, col = s.diagnostics()
     up = diag[-1, [col["up_x"], col["up_y"], col["up_z"]]]
     err = np.degrees(np.arccos(np.clip(up @ up_true, -1.0, 1.0)))
     assert err < 0.3, (err, up, up_true)
@@ -331,17 +484,17 @@ def _tilt_deg(q):
 
 
 def test_graph_levels_the_odometry(tmp_path):
-    # The pose graph (on by default) adds IMU factors between keyframes, with
+    # The back end's pose graph adds IMU factors between keyframes, with
     # gravity along world z. Here the odometry drifts in tilt by ~1 degree; the
     # graph keyframes must come out level, more level than the odometry, and
     # horizontally where the odometry is. A gravity sign or frame error would
     # break all three. The first keyframe is excused: without any rotation in
     # this test, tilt and accelerometer bias cannot be told apart there yet.
-    s = _run(_config(tmp_path), seconds=8.0, velocity=(0.5, 0.0, 0.0))
-    kf, odom = s.keyframe_trajectory(), s.trajectory()
+    s = _run(_config(tmp_path), seconds=8.0, velocity=(0.5, 0.0, 0.0), back={})
+    kf, odom = s.back.keyframes(), s.trajectory()
     assert len(kf) >= 3
     odom_at_kf = odom[np.searchsorted(odom[:, 0], kf[:, 0])]
-    assert np.allclose(kf[:, 0], odom_at_kf[:, 0])
+    np.testing.assert_array_equal(kf[:, 0], odom_at_kf[:, 0])  # the pushed stamps, exactly
     assert np.abs(kf[:, 1:3] - odom_at_kf[:, 1:3]).max() < 0.02
     tilt_kf, tilt_odom = _tilt_deg(kf[1:, 4:6]), _tilt_deg(odom_at_kf[1:, 4:6])
     assert tilt_kf.max() < 0.5, tilt_kf
@@ -350,20 +503,20 @@ def test_graph_levels_the_odometry(tmp_path):
 
 def test_map_max_size_lru_eviction(tmp_path):
     extra = "map: {max_size: 40, init_min_voxels: 20}\n"
-    s1 = _run(_config(tmp_path, 0, extra=extra), seconds=4.0, velocity=(0.5, 0.2, 0.0))
-    st = s1.status()
+    s1 = _run(_config(tmp_path, extra=extra), seconds=4.0, velocity=(0.5, 0.2, 0.0))
+    st = s1.front.status()
     assert st["initialized"]
     assert st["map_voxels"] == 40
-    s2 = _run(_config(tmp_path, 3, extra=extra), seconds=4.0, velocity=(0.5, 0.2, 0.0))
+    s2 = _run(_config(tmp_path, extra=extra), seconds=4.0, velocity=(0.5, 0.2, 0.0), threads=3)
     np.testing.assert_array_equal(s1.trajectory(), s2.trajectory())
-    np.testing.assert_array_equal(s1.sweep_diagnostics(), s2.sweep_diagnostics())
+    np.testing.assert_array_equal(s1.diagnostics()[0], s2.diagnostics()[0])
 
 
-def test_step1_low_risk_fixes(tmp_path):
-    # 1. Single-voxel scan: the old group loop initialized prev_hash = hashed_points_.back().first,
-    # which skipped the entire scan whenever all points landed in a single voxel (front == back).
-    extra = "map: {voxel_size_m: 100.0, init_min_voxels: 1}\nloop_closure: {enable: false}\n"
-    s = resbie.Resbie(_config(tmp_path, 0, extra=extra))
+def test_single_voxel_sweep_initializes(tmp_path):
+    # The old group loop initialized prev_hash = hashed_points_.back().first, which skipped the
+    # entire sweep whenever all points landed in a single voxel (front == back).
+    extra = "map: {voxel_size_m: 100.0, init_min_voxels: 1}\n"
+    s = resbie.FrontEnd(_config(tmp_path, extra=extra))
     rng = np.random.default_rng(42)
     pts = rng.uniform(1.5, 4.5, (200, 3))
     rel = np.sort(rng.uniform(0.0, 0.09, len(pts)))
@@ -375,9 +528,12 @@ def test_step1_low_risk_fixes(tmp_path):
     assert st["initialized"]
     assert st["map_voxels"] == 1
 
-    # 2. 24-col normal equations with gated IMU spike (verifies gated axis sets w_imu(k) = 0.0
-    # in R_inv so rejected spikes do not count as full-confidence bias measurements):
-    s_spike = resbie.Resbie(_config(tmp_path, 0, extra="loop_closure: {enable: false}\n"))
+
+def test_gated_imu_spike_is_ignored(tmp_path):
+    # A gated axis sets w_imu(k) = 0 in R_inv, so a rejected spike does not count as a
+    # full-confidence bias measurement.
+    rng = np.random.default_rng(42)
+    s_spike = _Run(_config(tmp_path))
     t0 = 1.0
     for k in range(int(3.0 / IMU_DT)):
         acc = [50.0, 0.0, 9.81] if k == 250 else [0.0, 0.0, 9.81]
@@ -394,13 +550,51 @@ def test_step1_low_risk_fixes(tmp_path):
     assert np.abs(traj[:, 1:4]).max() < 0.05
 
 
-def test_step2_one_update_per_knot_and_imu_counted_once(tmp_path):
-    assert "per_update" not in resbie.DEFAULT_CONFIG["points"]
-    s = _run(_config(tmp_path, 0, extra="loop_closure: {enable: false}\n"), seconds=2.0)
-    diag = s.sweep_diagnostics()
-    col = {c: i for i, c in enumerate(resbie.DIAGNOSTIC_COLUMNS)}
+def test_one_update_per_knot_and_imu_counted_once(tmp_path):
+    assert "per_update" not in resbie.FrontEnd.DEFAULT_CONFIG["points"]
+    s = _run(_config(tmp_path), seconds=2.0)
+    diag, col = s.diagnostics()
     # Steady-state sweeps (0.1 s at 100 Hz knots, 200 Hz IMU): 10 updates and 20 IMU samples each.
     np.testing.assert_array_equal(diag[2:, col["updates"]], 10)
     np.testing.assert_array_equal(diag[2:, col["imu_samples"]], SWEEP_IMU)
 
 
+def test_back_end_imu_model_defaults_to_the_front_ends():
+    front, back = resbie.FrontEnd.DEFAULT_CONFIG["imu"], resbie.BackEnd.DEFAULT_CONFIG
+    for key in ("acc_noise_std", "gyro_noise_std", "acc_bias_init_std", "gyro_bias_init_std",
+                "acc_bias_walk", "gyro_bias_walk"):
+        assert back[key] == front[key], key
+
+
+def test_back_end_order_and_diagnostics():
+    back = resbie.BackEnd({}, diagnostics=True)
+    room = _room(np.random.default_rng(0), 500)
+    pose = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+    assert back.push_imu(1.0, [0, 0, 9.81], [0, 0, 0])
+    assert not back.push_imu(1.0, [0, 0, 9.81], [0, 0, 0])
+    assert back.push_lio(1.0, pose, room)
+    assert back.push_lio(1.1, pose + [2.0, 0, 0, 0, 0, 0, 0], np.zeros((0, 4)))  # empty
+    assert back.push_lio(1.2, pose + [0.5, 0, 0, 0, 0, 0, 0], room)  # < 1 m from the last keyframe
+    assert back.push_lio(1.3, pose + [2.5, 0, 0, 0, 0, 0, 0], room)
+    assert not back.push_lio(1.3, pose, room)  # stamp did not increase
+    for stamp, bad_pose in ((1.4, pose * 2.0), (0.0, pose)):
+        with pytest.raises(ValueError):  # not a unit quaternion, not positive
+            back.push_lio(stamp, bad_pose, room)
+    back.finish()
+    status = back.status()
+    assert (status["imu_accepted"], status["imu_rejected"]) == (1, 1)
+    assert (status["lio_accepted"], status["lio_rejected"], status["keyframes"]) == (4, 1, 2)
+    rows, col = back.drain_diagnostics(), _columns(resbie.BackEnd)
+    assert back.drain_diagnostics().shape == (0, len(col))
+    np.testing.assert_array_equal(rows[:, col["stamp"]], [1.0, 1.1, 1.2, 1.3])
+    np.testing.assert_array_equal(rows[:, col["keyframe"]], [1, 0, 0, 1])
+    np.testing.assert_array_equal(rows[:, col["points"]], [500, 0, 500, 500])
+    np.testing.assert_array_equal(back.keyframes()[:, 0], [1.0, 1.3])
+
+
+def test_diagnostics_are_a_switch(tmp_path):
+    front = resbie.FrontEnd(_config(tmp_path))
+    back = resbie.BackEnd({})
+    assert front.drain_diagnostics().shape == (0, len(resbie.FrontEnd.DIAGNOSTIC_COLUMNS))
+    back.push_lio(1.0, [0, 0, 0, 0, 0, 0, 1], np.ones((10, 3)))
+    assert back.drain_diagnostics().shape == (0, len(resbie.BackEnd.DIAGNOSTIC_COLUMNS))

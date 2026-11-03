@@ -12,6 +12,7 @@
 // whatever the odometry drifted to; the first keyframe's prior fixes only
 // yaw and position.
 
+#include <cmath>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -35,6 +36,9 @@ class LoopCloser {
  public:
   using PointT = pcl::PointXYZ;
   using Cloud = pcl::PointCloud<PointT>;
+  // resbie: N x (3 or more) points, x, y, z first, read in place.
+  using PointsView =
+      Eigen::Ref<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>;
 
   struct Config {
     // Keyframing: a frame is kept once either threshold is exceeded.
@@ -73,20 +77,14 @@ class LoopCloser {
     double isam_relinearize_threshold = 0.01;
     int isam_relinearize_skip = 1;
 
-    // IMU (resbie fills these from its imu section): per-sample noise, bias
-    // random walk per sqrt(s), initial bias uncertainty; gravity in m/s^2.
-    double gravity = 9.81;
+    // IMU: per-sample noise, bias random walk per sqrt(s), initial bias
+    // uncertainty (defaults: the front end's).
     Eigen::Vector3d acc_noise_std = Eigen::Vector3d::Constant(1.0);
-    Eigen::Vector3d gyro_noise_std = Eigen::Vector3d::Constant(0.1);
+    Eigen::Vector3d gyro_noise_std = Eigen::Vector3d::Constant(std::sqrt(0.1));
     double acc_bias_walk = 0.001;
     double gyro_bias_walk = 0.0001;
-    Eigen::Vector3d acc_bias_init_std = Eigen::Vector3d::Constant(0.5);
-    Eigen::Vector3d gyro_bias_init_std = Eigen::Vector3d::Constant(0.5);
-  };
-
-  struct Keyframe {
-    uint64_t stamp = 0;
-    Transform pose;  // optimized
+    Eigen::Vector3d acc_bias_init_std = Eigen::Vector3d::Constant(std::sqrt(0.2));
+    Eigen::Vector3d gyro_bias_init_std = Eigen::Vector3d::Constant(std::sqrt(0.2));
   };
 
   struct Stats {
@@ -100,15 +98,17 @@ class LoopCloser {
   LoopCloser(const LoopCloser&) = delete;
   LoopCloser& operator=(const LoopCloser&) = delete;
 
-  // Keyframe gating, then (for a keyframe) every stage inline.
-  void addFrame(uint64_t stamp, const Transform& T_W_I, const Pointcloud& cloud_body);
+  // Keyframe gating, then (for a keyframe) every stage inline. True if the
+  // frame became a keyframe.
+  bool addFrame(uint64_t stamp, const Transform& T_W_I, const PointsView& cloud_body);
   // One IMU sample in the IMU frame (acc in m/s^2), in time order and ahead of
   // the keyframes it falls before.
   void addImu(uint64_t stamp, const Eigen::Vector3d& acc, const Eigen::Vector3d& gyro);
   // End of input: one batch optimization of the whole graph.
   void finish();
 
-  std::vector<Keyframe> keyframes() const;
+  // The keyframes' current (optimized) poses, in keyframe order.
+  std::vector<Transform> keyframePoses() const;
   Stats stats() const;
 
  private:

@@ -1,10 +1,15 @@
-// pybind11 bindings for resbie: RESPLE's spline filter on BIEVR's map, with
-// BIEVR's loop closer downstream.
+// pybind11 bindings for resbie: a front end and a back end, wired together by
+// the caller (python/resbie/__init__.py shows how).
 //
-// Synchronous like the BIEVR bridge: every push returns after all processing
-// it triggered has finished, so results depend only on the pushed data. The
-// API mirrors bievr's (push_imu / push_lidar / trajectory /
-// keyframe_trajectory / drain_map_scans / status) plus finish().
+// FrontEnd: RESPLE's spline filter on BIEVR's map. IMU and LiDAR in; each
+//   finished sweep out as a LIO result: (stamp, pose, points deskewed into the IMU
+//   frame there).
+// BackEnd: BIEVR's loop closer (Scan Context, ICP, GTSAM graph with IMU
+//   factors). IMU and the front end's LIO results in; loop-closed keyframes out.
+//
+// Each owns its configuration and drains its own outputs. Both are synchronous:
+// every push returns after all processing it triggered has finished, so
+// results depend only on the pushed data and its order.
 
 #include <dlfcn.h>
 #include <link.h>
@@ -15,10 +20,12 @@
 #include <tbb/task_arena.h>
 
 #include <cmath>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "bievr_pgo/config_loader.h"
@@ -38,6 +45,7 @@ namespace py = pybind11;
 namespace {
 
 using Array = py::array_t<double, py::array::c_style | py::array::forcecast>;
+using Documents = std::vector<std::string>;  // YAML texts, later ones win
 
 int64_t secondsToNs(double s) {
   if (!std::isfinite(s) || s <= 0.0) {
@@ -54,13 +62,16 @@ Eigen::Vector3d toV3(const Array& a, const char* name) {
   return Eigen::Vector3d(p[0], p[1], p[2]);
 }
 
+std::vector<double> vec(const Eigen::Vector3d& v) { return {v.x(), v.y(), v.z()}; }
+
 // Eigen sizes its matrix-product blocks from the cache sizes CPUID reports on
 // the core that runs the first product. On hybrid CPUs (P cores 48 KB L1d, E
 // cores 32 KB) that changes the summation order, so a run's last bits depend
 // on where it started, and the filter grows them into metres. resbie's own
 // Eigen is built with EIGEN_NO_CPUID (CMakeLists.txt). The prebuilt GTSAM and
 // PCL keep their own copy of that state (Eigen 3.4: an exported function-local
-// static and its guard); pin every loaded copy to the same fixed sizes.
+// static and its guard); pin every loaded copy to the same fixed sizes. Runs
+// once, at import: every copy is loaded by then and none has run a product.
 void pinEigenCacheSizes() {
   struct CacheSizes {
     std::ptrdiff_t l1, l2, l3;  // Eigen::internal::CacheSizes
@@ -85,42 +96,111 @@ void pinEigenCacheSizes() {
       nullptr);
 }
 
-class Resbie {
+// Every config error is a ValueError: a value of the wrong type included.
+template <typename Config>
+Config loadOrThrow(const Documents& documents, bool (*load)(const Documents&, Config&), const char* which) {
+  Config config;
+  bool ok = false;
+  try {
+    ok = load(documents, config);
+  } catch (const YAML::Exception& e) {
+    throw std::invalid_argument(std::string("resbie rejected the ") + which + " configuration: " + e.what());
+  }
+  if (!ok) throw std::invalid_argument(std::string("resbie rejected the ") + which + " configuration (see log above)");
+  return config;
+}
+
+// One diagnostics row: column names with their values, in column order.
+using Row = std::vector<std::pair<const char*, double>>;
+
+std::vector<std::string> columnsOf(const Row& row) {
+  std::vector<std::string> out;
+  for (const auto& c : row) out.push_back(c.first);
+  return out;
+}
+
+// Diagnostics rows since the last drain; none kept unless enabled.
+class Diagnostics {
  public:
-  Resbie(const std::vector<std::string>& config_files, size_t map_point_stride)
-      : map_point_stride_(map_point_stride) {
-    pinEigenCacheSizes();
-    if (!resbie::loadConfig(config_files, config_)) {
-      throw std::invalid_argument("resbie rejected the configuration (see log above)");
-    }
-    if (config_.max_num_threads > 0) {
+  Diagnostics(size_t columns, bool enabled) : columns_(columns), enabled_(enabled) {}
+
+  void add(const Row& row) {
+    if (!enabled_) return;
+    for (const auto& c : row) values_.push_back(c.second);
+  }
+
+  py::array_t<double> drain() {
+    const py::ssize_t cols = static_cast<py::ssize_t>(columns_);
+    py::array_t<double> out({static_cast<py::ssize_t>(values_.size()) / cols, cols});
+    std::copy(values_.begin(), values_.end(), out.mutable_data());
+    values_.clear();
+    return out;
+  }
+
+ private:
+  size_t columns_;
+  bool enabled_;
+  std::vector<double> values_;
+};
+
+// ---------------------------------------------------------------- front end
+
+// One row per sweep, in the order the sweeps are reported.
+Row frontEndRow(const resbie::LioResult& s) {
+  const resbie::SweepDiagnostics& g = s.diag;
+  return {
+      {"stamp", nsToS(s.stamp_ns)},                // sweep end, s
+      {"points", double(g.points)},                // range-filtered points in the sweep
+      {"points_measured", double(g.points_measured)},    // handed to the filter for it
+      {"points_effective", double(g.points_effective)},  // of those, matched to the map
+      {"updates", double(g.updates)},              // filter updates ending in the sweep (incl. a preceding gap)
+      {"imu_only_updates", double(g.imu_only_updates)},  // updates without a matched point
+      {"info_rotation", g.info_rotation},          // smallest eigenvalue of the LiDAR information, rotation, 1/rad^2
+      {"info_translation", g.info_translation},    // same, translation, 1/m^2
+      {"pos_sigma", g.pos_sigma},                  // position sigma of the newest control point, m
+      {"nis_mean", g.nis_count ? g.nis_sum / double(g.nis_count) : NAN},  // mean point zp^2 / (HPH' + R) (prior); ~1 if honest
+      {"weak_x", g.weak_translation.x()},          // world direction of info_translation (unit; sign arbitrary)
+      {"weak_y", g.weak_translation.y()},
+      {"weak_z", g.weak_translation.z()},
+      {"imu_samples", double(g.imu_samples)},      // IMU samples measured
+      {"acc_gated", double(g.acc_gated)},          // of their acceleration axes, dropped by the 10 m/s^2 residual gate
+      {"vel_x", g.velocity.x()},                   // final spline velocity, mean over the sweep, world, m/s
+      {"vel_y", g.velocity.y()},
+      {"vel_z", g.velocity.z()},
+      {"acc_bias_x", g.acc_bias.x()},              // accelerometer bias at the sweep's last update, m/s^2
+      {"acc_bias_y", g.acc_bias.y()},
+      {"acc_bias_z", g.acc_bias.z()},
+      {"matched_voxels", double(g.matched_voxels)},  // distinct map voxels of the matched points, summed over updates
+      {"points_gated", double(g.points_gated)},    // matched points the Mahalanobis gate rejected (last iteration)
+      {"imu_post_dv_x", g.imu_post_dv.x()},        // final spline's velocity change over the sweep minus the IMU's, world, m/s
+      {"imu_post_dv_y", g.imu_post_dv.y()},
+      {"imu_post_dv_z", g.imu_post_dv.z()},
+      {"imu_post_sigma", g.imu_post_sigma},        // its std under the configured accelerometer noise, m/s
+      {"gyro_bias_x", g.gyro_bias.x()},            // gyro bias at the sweep's last update, rad/s
+      {"gyro_bias_y", g.gyro_bias.y()},
+      {"gyro_bias_z", g.gyro_bias.z()},
+      {"up_x", g.gravity_up.x()},                  // estimated gravity up direction, world (unit), at the last update
+      {"up_y", g.gravity_up.y()},
+      {"up_z", g.gravity_up.z()},
+      {"up_sigma", g.gravity_sigma},               // its largest std, rad
+  };
+}
+
+class FrontEnd {
+ public:
+  FrontEnd(const Documents& config, int max_num_threads, size_t point_stride, bool diagnostics)
+      : config_(loadOrThrow(config, resbie::loadConfig, "front-end")),
+        diagnostics_(frontEndRow({}).size(), diagnostics) {
+    if (max_num_threads < 0) throw std::invalid_argument("max_num_threads must be >= 0");
+    if (max_num_threads > 0) {
       tbb_control_ = std::make_unique<tbb::global_control>(
-          tbb::global_control::max_allowed_parallelism, config_.max_num_threads);
+          tbb::global_control::max_allowed_parallelism, max_num_threads);
     }
-    odometry_ = std::make_unique<resbie::Odometry>(config_);
-
-    bievr::LoopClosureConfig loop_closure_config;
-    // The graph's IMU model has its own loop_closure keys (acc_noise_std, ...);
-    // a key left out falls back to resbie's imu section, set here first.
-    auto& lc = loop_closure_config.closer;
-    lc.gravity = resbie::Odometry::kGravity;
-    lc.acc_noise_std = config_.acc_noise_std;
-    lc.gyro_noise_std = config_.gyro_noise_std;
-    lc.acc_bias_walk = config_.acc_bias_walk;
-    lc.gyro_bias_walk = config_.gyro_bias_walk;
-    lc.acc_bias_init_std = config_.acc_bias_init_std;
-    lc.gyro_bias_init_std = config_.gyro_bias_init_std;
-    if (!bievr::loadLoopClosureConfig(config_files, loop_closure_config)) {
-      throw std::invalid_argument("resbie rejected the loop_closure configuration");
-    }
-    if (loop_closure_config.enable) {
-      loop_closer_ = std::make_unique<bievr::LoopCloser>(lc);
-    }
-
-    odometry_->setObserver([this](int64_t stamp, const bievr::Transform& T_W_I,
-                                  const bievr::Pointcloud& deskewed_I,
-                                  const resbie::Sweep& sweep) {
-      onSweep(stamp, T_W_I, deskewed_I, sweep);
+    odometry_ = std::make_unique<resbie::Odometry>(config_, max_num_threads, point_stride);
+    // Runs inside Odometry, mutex_ held.
+    odometry_->setObserver([this](resbie::LioResult&& result) {
+      diagnostics_.add(frontEndRow(result));
+      results_.push_back(std::move(result));
     });
   }
 
@@ -130,15 +210,12 @@ class Resbie {
     const Eigen::Vector3d w = toV3(gyro, "angular_velocity");
     py::gil_scoped_release release;
     std::lock_guard<std::mutex> lock(mutex_);
-    const bool accepted = odometry_->addImu(t, a, w);
-    // The graph integrates the same samples.
-    if (accepted && loop_closer_) loop_closer_->addImu(static_cast<uint64_t>(t), a, w);
-    return accepted;
+    return odometry_->addImu(t, a, w);
   }
 
   bool pushLidar(double stamp, const Array& points, const Array& times) {
     if (points.ndim() != 2 || (points.shape(1) != 3 && points.shape(1) != 4)) {
-      throw std::invalid_argument("points must be (N, 3) or (N, 4) [x, y, z(, intensity)]");
+      throw std::invalid_argument("points must be (N, 3) or (N, 4): x, y, z[, intensity]");
     }
     const size_t n = static_cast<size_t>(points.shape(0));
     const size_t cols = static_cast<size_t>(points.shape(1));
@@ -148,45 +225,44 @@ class Resbie {
     const int64_t t0 = secondsToNs(stamp) + std::llround(config_.time_offset * 1e9);
     const double* p = points.data();
     const double* t = times.data();
+    resbie::Sweep sweep;
+    sweep.start_ns = sweep.end_ns = t0;
+    sweep.times.resize(n);
     for (size_t i = 0; i < n; ++i) {
       if (!std::isfinite(t[i]) || t[i] < 0.0) {
         throw std::invalid_argument("relative_times must be finite and >= 0");
       }
+      sweep.times[i] = t0 + std::llround(t[i] * 1e9);
+      sweep.end_ns = std::max(sweep.end_ns, sweep.times[i]);
     }
 
     py::gil_scoped_release release;
     // Range filter in the LiDAR frame (BIEVR), then into the IMU frame.
     const double min2 = config_.min_range * config_.min_range;
     const double max2 = config_.max_range * config_.max_range;
-    resbie::Sweep sweep;
-    sweep.start_ns = t0;
-    sweep.end_ns = t0;
-    for (size_t i = 0; i < n; ++i) sweep.end_ns = std::max<int64_t>(sweep.end_ns, t0 + std::llround(t[i] * 1e9));
-    std::vector<size_t> keep;
-    keep.reserve(n);
+    sweep.points.resize(n);
+    sweep.intensity.resize(n);
+    sweep.ranges.resize(n);
+    size_t kept = 0;  // points kept so far, compacted in place
     for (size_t i = 0; i < n; ++i) {
-      const double x = p[i * cols], y = p[i * cols + 1], z = p[i * cols + 2];
-      const double r2 = x * x + y * y + z * z;
-      if (std::isfinite(r2) && r2 >= min2 && r2 <= max2) keep.push_back(i);
-    }
-    sweep.points.resize(keep.size());
-    sweep.times.resize(keep.size());
-    sweep.intensity.resize(keep.size());
-    sweep.ranges.resize(keep.size());
-    for (size_t j = 0; j < keep.size(); ++j) {
-      const size_t i = keep[j];
       const Eigen::Vector3d p_L(p[i * cols], p[i * cols + 1], p[i * cols + 2]);
+      const double r2 = p_L.squaredNorm();
+      if (!(std::isfinite(r2) && r2 >= min2 && r2 <= max2)) continue;
       const Eigen::Vector3d p_I = config_.T_I_L * p_L;
-      sweep.points[j] = p_I;
-      sweep.times[j] = t0 + std::llround(t[i] * 1e9);
-      sweep.intensity[j] = cols == 4 ? static_cast<float>(p[i * cols + 3]) : 0.0f;
-      sweep.ranges[j] = p_I.norm();
+      sweep.points[kept] = p_I;
+      sweep.times[kept] = sweep.times[i];
+      sweep.intensity[kept] = cols == 4 ? p[i * cols + 3] : 0.0;
+      sweep.ranges[kept] = p_I.norm();
+      ++kept;
     }
+    sweep.points.resize(kept);
+    sweep.times.resize(kept);
+    sweep.intensity.resize(kept);
+    sweep.ranges.resize(kept);
 
     std::lock_guard<std::mutex> lock(mutex_);
     // An empty sweep still goes in: it tells the filter LiDAR saw nothing over
     // [start, end], so the spline may step through on IMU alone.
-    if (keep.empty()) ++lidar_empty_;
     return odometry_->addSweep(std::move(sweep));
   }
 
@@ -194,52 +270,35 @@ class Resbie {
     py::gil_scoped_release release;
     std::lock_guard<std::mutex> lock(mutex_);
     odometry_->finish();
-    if (loop_closer_) loop_closer_arena_.execute([&] { loop_closer_->finish(); });
   }
 
-  py::object latestPose() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (trajectory_.empty()) return py::none();
-    py::array_t<double> out(8);
-    std::copy(trajectory_.end() - 8, trajectory_.end(), out.mutable_data());
-    return out;
-  }
-
-  py::array_t<double> trajectory() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const py::ssize_t rows = static_cast<py::ssize_t>(trajectory_.size() / 8);
-    py::array_t<double> out({rows, py::ssize_t{8}});
-    std::copy(trajectory_.begin(), trajectory_.end(), out.mutable_data());
-    return out;
-  }
-
-  py::array_t<double> keyframeTrajectory() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto kfs =
-        loop_closer_ ? loop_closer_->keyframes() : std::vector<bievr::LoopCloser::Keyframe>{};
-    py::array_t<double> out({static_cast<py::ssize_t>(kfs.size()), py::ssize_t{8}});
-    auto r = out.mutable_unchecked<2>();
-    for (size_t i = 0; i < kfs.size(); ++i) {
-      const Eigen::Vector3d& t = kfs[i].pose.translation();
-      const Eigen::Quaterniond q = kfs[i].pose.quaternion();
-      const double row[8] = {nsToS(static_cast<int64_t>(kfs[i].stamp)), t.x(), t.y(), t.z(),
-                             q.x(), q.y(), q.z(), q.w()};
-      std::copy(row, row + 8, r.mutable_data(i, 0));
+  // LIO results since the last call: (stamp, pose, points). The point
+  // buffers go to numpy as they are, without a copy.
+  py::list drain() {
+    std::vector<resbie::LioResult> results;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      results.swap(results_);
     }
-    return out;
-  }
-
-  py::list drainMapScans() {
-    std::lock_guard<std::mutex> lock(mutex_);
     py::list out;
-    for (const MapScan& scan : map_scans_) {
-      const py::ssize_t rows = static_cast<py::ssize_t>(scan.points.size() / 4);
-      py::array_t<float> points({rows, py::ssize_t{4}});
-      std::copy(scan.points.begin(), scan.points.end(), points.mutable_data());
-      out.append(py::make_tuple(scan.stamp, points));
+    for (resbie::LioResult& result : results) {
+      const Eigen::Vector3d& p = result.p_W_I;
+      const Eigen::Quaterniond& q = result.q_W_I;
+      py::array_t<double> pose(7);
+      const double row[7] = {p.x(), p.y(), p.z(), q.x(), q.y(), q.z(), q.w()};
+      std::copy(row, row + 7, pose.mutable_data());
+      auto* points = new std::vector<double>(std::move(result.points));
+      py::capsule owner(points, [](void* v) { delete static_cast<std::vector<double>*>(v); });
+      const py::ssize_t rows = static_cast<py::ssize_t>(points->size() / 4);
+      out.append(py::make_tuple(nsToS(result.stamp_ns), pose,
+                                py::array_t<double>({rows, py::ssize_t{4}}, points->data(), owner)));
     }
-    map_scans_.clear();
     return out;
+  }
+
+  py::array_t<double> drainDiagnostics() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return diagnostics_.drain();
   }
 
   py::dict status() {
@@ -250,7 +309,7 @@ class Resbie {
     d["imu_rejected"] = s.imu_rejected;
     d["lidar_accepted"] = s.lidar_accepted;
     d["lidar_rejected"] = s.lidar_rejected;
-    d["lidar_empty"] = lidar_empty_;
+    d["lidar_empty"] = s.lidar_empty;
     d["initialized"] = odometry_->initialized();
     d["sweeps_dropped_init"] = s.sweeps_dropped_init;
     d["sweeps_finalized"] = s.sweeps_finalized;
@@ -258,125 +317,151 @@ class Resbie {
     d["filter_updates"] = s.updates;
     d["imu_only_updates"] = s.imu_only_updates;
     d["gap_knots"] = s.gap_knots;
-    d["loop_closer_skipped"] = loop_closer_skipped_;
     d["points_measured"] = s.points_measured;
     d["points_effective"] = s.points_effective;
     d["map_voxels"] = s.map_voxels;
-    d["poses"] = trajectory_.size() / 8;
-    const Eigen::Vector3d ba = odometry_->accBias(), bg = odometry_->gyroBias();
-    d["acc_bias"] = std::vector<double>(ba.data(), ba.data() + 3);
-    d["gyro_bias"] = std::vector<double>(bg.data(), bg.data() + 3);
-    const Eigen::Vector3d up = odometry_->gravityUp();
-    d["gravity_up"] = std::vector<double>(up.data(), up.data() + 3);
-    py::dict pgo;
-    pgo["enabled"] = loop_closer_ != nullptr;
-    if (loop_closer_) {
-      const auto ls = loop_closer_->stats();
-      pgo["keyframes"] = ls.num_keyframes;
-      pgo["loops"] = ls.num_loops;
-      pgo["rejected"] = ls.num_rejected;
-    }
-    d["loop_closure"] = pgo;
+    d["acc_bias"] = vec(odometry_->accBias());
+    d["gyro_bias"] = vec(odometry_->gyroBias());
+    d["gravity_up"] = vec(odometry_->gravityUp());
     return d;
   }
 
  private:
-  // Called from inside Odometry (mutex_ held) once a sweep's poses are final.
-  void onSweep(int64_t stamp, const bievr::Transform& T_W_I, const bievr::Pointcloud& deskewed_I,
-               const resbie::Sweep& sweep) {
-    const Eigen::Quaterniond q = T_W_I.quaternion();
-    const Eigen::Vector3d& t = T_W_I.translation();
-    trajectory_.insert(trajectory_.end(),
-                       {nsToS(stamp), t.x(), t.y(), t.z(), q.x(), q.y(), q.z(), q.w()});
-    // Loop closer guard: an empty or implausibly fast sweep never becomes a
-    // keyframe (a diverged run otherwise stalls the closer forever).
-    bool to_closer = loop_closer_ != nullptr && deskewed_I.size() > 0;
-    if (has_last_pose_) {
-      const double dt = nsToS(stamp) - last_stamp_;
-      if (dt > 0 && (T_W_I.translation() - last_pos_).norm() / dt > config_.loop_closure_max_speed_mps) {
-        to_closer = false;
-      }
-    }
-    has_last_pose_ = true;
-    last_stamp_ = nsToS(stamp);
-    last_pos_ = T_W_I.translation();
-    if (loop_closer_ && !to_closer) ++loop_closer_skipped_;
-    const resbie::SweepDiagnostics& g = sweep.diag;
-    diagnostics_.insert(diagnostics_.end(),
-                        {nsToS(stamp), double(sweep.points.size()), double(g.points_measured),
-                         double(g.points_effective), double(g.updates), double(g.imu_only_updates),
-                         g.info_rotation, g.info_translation, g.pos_sigma, double(to_closer),
-                         g.nis_count ? g.nis_sum / double(g.nis_count) : NAN,
-                         g.weak_translation.x(), g.weak_translation.y(), g.weak_translation.z(),
-                         double(g.imu_samples), double(g.acc_gated),
-                         g.velocity.x(), g.velocity.y(), g.velocity.z(),
-                         g.acc_bias.x(), g.acc_bias.y(), g.acc_bias.z(),
-                         double(g.matched_voxels), double(g.points_gated), g.imu_post_dv.x(),
-                         g.imu_post_dv.y(), g.imu_post_dv.z(), g.imu_post_sigma,
-                         g.gyro_bias.x(), g.gyro_bias.y(), g.gyro_bias.z(),
-                         g.gravity_up.x(), g.gravity_up.y(), g.gravity_up.z(), g.gravity_sigma});
-    if (to_closer) {
-      // GTSAM's ISAM2 parallelizes through TBB and then depends on scheduling;
-      // one thread keeps the loop closer deterministic (as the bievr bridge).
-      loop_closer_arena_.execute(
-          [&] { loop_closer_->addFrame(static_cast<uint64_t>(stamp), T_W_I, deskewed_I); });
-    }
-    if (map_point_stride_ == 0 || deskewed_I.size() == 0) return;
-    MapScan& scan = map_scans_.emplace_back();
-    scan.stamp = nsToS(stamp);
-    scan.points.reserve((deskewed_I.size() / map_point_stride_ + 1) * 4);
-    for (size_t i = 0; i < deskewed_I.size(); i += map_point_stride_) {
-      const auto pt = deskewed_I[i];
-      scan.points.insert(scan.points.end(),
-                         {static_cast<float>(pt(0)), static_cast<float>(pt(1)),
-                          static_cast<float>(pt(2)), sweep.intensity[i]});
-    }
-  }
-
-  struct MapScan {
-    double stamp;
-    std::vector<float> points;  // rows of x, y, z, intensity
-  };
-
   resbie::Config config_;
-  size_t map_point_stride_;
+  Diagnostics diagnostics_;
   std::unique_ptr<tbb::global_control> tbb_control_;
   std::unique_ptr<resbie::Odometry> odometry_;
-  std::unique_ptr<bievr::LoopCloser> loop_closer_;
-  tbb::task_arena loop_closer_arena_{1};
   std::mutex mutex_;
 
-  std::vector<double> trajectory_;  // rows of t, x, y, z, qx, qy, qz, qw
-  std::vector<MapScan> map_scans_;
-  size_t lidar_empty_ = 0;
-  std::vector<double> diagnostics_;  // rows of kDiagColumns
-  bool has_last_pose_ = false;
-  double last_stamp_ = 0.0;
-  Eigen::Vector3d last_pos_ = Eigen::Vector3d::Zero();
-  size_t loop_closer_skipped_ = 0;
-
- public:
-  static constexpr size_t kDiagColumns = 35;
-  py::array_t<double> sweepDiagnostics() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const py::ssize_t rows = static_cast<py::ssize_t>(diagnostics_.size() / kDiagColumns);
-    py::array_t<double> out({rows, py::ssize_t(kDiagColumns)});
-    std::copy(diagnostics_.begin(), diagnostics_.end(), out.mutable_data());
-    return out;
-  }
+  std::vector<resbie::LioResult> results_;  // not yet drained
 };
 
-}  // namespace
+// ----------------------------------------------------------------- back end
+
+// One row per pushed LIO result.
+Row backEndRow(double stamp, size_t points, bool keyframe) {
+  return {
+      {"stamp", stamp},                 // s, as pushed
+      {"points", double(points)},       // 0: never a keyframe
+      {"keyframe", double(keyframe)},   // became a pose-graph keyframe
+  };
+}
+
+class BackEnd {
+ public:
+  BackEnd(const Documents& config, bool diagnostics)
+      : diagnostics_(backEndRow(0.0, 0, false).size(), diagnostics),
+        loop_closer_(loadOrThrow(config, bievr::loadLoopClosureConfig, "back-end")) {}
+
+  bool pushImu(double stamp, const Array& acc, const Array& gyro) {
+    const int64_t t = secondsToNs(stamp);
+    const Eigen::Vector3d a = toV3(acc, "acceleration");
+    const Eigen::Vector3d w = toV3(gyro, "angular_velocity");
+    py::gil_scoped_release release;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (t <= last_imu_ns_) {
+      ++imu_rejected_;
+      return false;
+    }
+    last_imu_ns_ = t;
+    ++imu_accepted_;
+    loop_closer_.addImu(static_cast<uint64_t>(t), a, w);
+    return true;
+  }
+
+  bool pushLio(double stamp, const Array& pose, const Array& points) {
+    const int64_t t = secondsToNs(stamp);
+    if (pose.size() != 7) throw std::invalid_argument("pose must be [x, y, z, qx, qy, qz, qw]");
+    if (points.ndim() != 2 || points.shape(1) < 3) {
+      throw std::invalid_argument("points must be (N, 3) or wider: x, y, z[, ...]");
+    }
+    const double* v = pose.data();
+    const Eigen::Quaterniond q(v[6], v[3], v[4], v[5]);
+    if (!(std::abs(q.norm() - 1.0) < 1e-6)) throw std::invalid_argument("pose quaternion must be unit");
+    const bievr::Transform T_W_I(q, Eigen::Vector3d(v[0], v[1], v[2]));
+    const bievr::LoopCloser::PointsView cloud(
+        Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>(
+            points.data(), points.shape(0), points.shape(1)));
+
+    py::gil_scoped_release release;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (t <= last_lio_ns_) {
+      ++lio_rejected_;
+      return false;
+    }
+    ++lio_accepted_;
+    last_lio_ns_ = t;
+    // Without points there is nothing to match: never a keyframe.
+    bool keyframe = false;
+    if (cloud.rows() > 0) {
+      // GTSAM's ISAM2 parallelizes through TBB and then depends on scheduling;
+      // one thread keeps the loop closer deterministic.
+      arena_.execute([&] { keyframe = loop_closer_.addFrame(static_cast<uint64_t>(t), T_W_I, cloud); });
+    }
+    // Keyframes report the stamp as pushed, so it matches the caller's exactly.
+    if (keyframe) keyframe_stamps_.push_back(stamp);
+    diagnostics_.add(backEndRow(stamp, cloud.rows(), keyframe));
+    return true;
+  }
+
+  void finish() {
+    py::gil_scoped_release release;
+    std::lock_guard<std::mutex> lock(mutex_);
+    arena_.execute([&] { loop_closer_.finish(); });
+  }
+
+  py::array_t<double> keyframes() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const std::vector<bievr::Transform> poses = loop_closer_.keyframePoses();
+    py::array_t<double> out({static_cast<py::ssize_t>(poses.size()), py::ssize_t{8}});
+    auto r = out.mutable_unchecked<2>();
+    for (size_t i = 0; i < poses.size(); ++i) {
+      const Eigen::Vector3d& t = poses[i].translation();
+      const Eigen::Quaterniond q = poses[i].quaternion();
+      const double row[8] = {keyframe_stamps_[i], t.x(), t.y(), t.z(), q.x(), q.y(), q.z(), q.w()};
+      std::copy(row, row + 8, r.mutable_data(i, 0));
+    }
+    return out;
+  }
+
+  py::array_t<double> drainDiagnostics() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return diagnostics_.drain();
+  }
+
+  py::dict status() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto ls = loop_closer_.stats();
+    py::dict d;
+    d["imu_accepted"] = imu_accepted_;
+    d["imu_rejected"] = imu_rejected_;
+    d["lio_accepted"] = lio_accepted_;
+    d["lio_rejected"] = lio_rejected_;
+    d["keyframes"] = ls.num_keyframes;
+    d["loops"] = ls.num_loops;
+    d["rejected"] = ls.num_rejected;
+    return d;
+  }
+
+ private:
+  Diagnostics diagnostics_;
+  bievr::LoopCloser loop_closer_;
+  tbb::task_arena arena_{1};
+  std::mutex mutex_;
+
+  int64_t last_imu_ns_ = std::numeric_limits<int64_t>::min();
+  size_t imu_accepted_ = 0, imu_rejected_ = 0;
+  size_t lio_accepted_ = 0, lio_rejected_ = 0;
+  int64_t last_lio_ns_ = std::numeric_limits<int64_t>::min();
+  std::vector<double> keyframe_stamps_;  // s, as pushed, one per loop-closer keyframe
+};
 
 // Every default, as the nested dict a YAML config file would hold. The
-// single source of defaults; resbie.DEFAULT_CONFIG is this.
-py::dict defaultConfig() {
+// single source of defaults; resbie.FrontEnd.DEFAULT_CONFIG is this.
+// calibration has none: it must be set.
+py::dict frontEndDefaultConfig() {
   const resbie::Config c;
-  const bievr::LoopCloser::Config lc;
-  const auto vec = [](const Eigen::Vector3d& v) { return std::vector<double>{v.x(), v.y(), v.z()}; };
   py::dict d;
-  d["calibration"] = py::dict(py::arg("translation") = std::vector<double>{0, 0, 0},
-                              py::arg("rotation") = std::vector<double>{1, 0, 0, 0, 1, 0, 0, 0, 1});
   d["lidar"] = py::dict(py::arg("min_range_m") = c.min_range, py::arg("max_range_m") = c.max_range,
                         py::arg("time_offset_s") = c.time_offset);
   d["imu"] = py::dict(py::arg("acc_noise_std") = vec(c.acc_noise_std),
@@ -402,10 +487,14 @@ py::dict defaultConfig() {
                       py::arg("smooth") = c.map.smooth, py::arg("weighted") = c.map.weighted,
                       py::arg("max_size") = c.map.max_size,
                       py::arg("init_min_voxels") = c.init_min_voxels);
+  return d;
+}
+
+// Same for the back end (flat keys); resbie.BackEnd.DEFAULT_CONFIG.
+py::dict backEndDefaultConfig() {
+  const bievr::LoopCloser::Config lc;
   const auto& sc = lc.scan_context;
-  d["loop_closure"] = py::dict(
-      py::arg("enable") = bievr::LoopClosureConfig{}.enable,
-      py::arg("max_speed_mps") = c.loop_closure_max_speed_mps,
+  return py::dict(
       py::arg("keyframe_meter_gap") = lc.keyframe_meter_gap,
       py::arg("keyframe_deg_gap") = lc.keyframe_deg_gap,
       py::arg("keyframe_filter_size") = lc.keyframe_filter_size,
@@ -433,14 +522,20 @@ py::dict defaultConfig() {
       py::arg("loop_noise_score") = lc.loop_noise_score,
       py::arg("loop_noise_cauchy_c") = lc.loop_noise_cauchy_c,
       py::arg("isam_relinearize_threshold") = lc.isam_relinearize_threshold,
-      py::arg("isam_relinearize_skip") = lc.isam_relinearize_skip);
-  d["max_num_threads"] = c.max_num_threads;
-  return d;
+      py::arg("isam_relinearize_skip") = lc.isam_relinearize_skip,
+      py::arg("acc_noise_std") = vec(lc.acc_noise_std),
+      py::arg("gyro_noise_std") = vec(lc.gyro_noise_std),
+      py::arg("acc_bias_walk") = lc.acc_bias_walk,
+      py::arg("gyro_bias_walk") = lc.gyro_bias_walk,
+      py::arg("acc_bias_init_std") = vec(lc.acc_bias_init_std),
+      py::arg("gyro_bias_init_std") = vec(lc.gyro_bias_init_std));
 }
 
+}  // namespace
+
 PYBIND11_MODULE(_core, m) {
-  m.doc() = "resbie: RESPLE spline filter on the BIEVR map";
-  m.def("default_config", &defaultConfig, "Every default, as a nested config dict.");
+  m.doc() = "resbie: RESPLE spline filter on the BIEVR map (FrontEnd), BIEVR loop closer (BackEnd)";
+  pinEigenCacheSizes();
   m.def(
       "set_log_level",
       [](const std::string& level) {
@@ -448,21 +543,29 @@ PYBIND11_MODULE(_core, m) {
           throw std::invalid_argument("log level must be debug, info, warn or error, not '" + level + "'");
         }
       },
-      py::arg("level"),
-      "Process-wide log level: debug (adds a line per sweep with the filter diagnostics), info, warn, "
-      "error.");
-  py::class_<Resbie>(m, "Resbie")
-      .def(py::init<const std::vector<std::string>&, size_t>(), py::arg("config_files"),
-           py::arg("map_point_stride") = 0)
-      .def("push_imu", &Resbie::pushImu, py::arg("stamp"), py::arg("acceleration"),
+      py::arg("level"));
+  py::class_<FrontEnd>(m, "FrontEnd")
+      .def(py::init<const Documents&, int, size_t, bool>(), py::arg("config"), py::arg("max_num_threads"),
+           py::arg("point_stride"), py::arg("diagnostics"))
+      .def("push_imu", &FrontEnd::pushImu, py::arg("stamp"), py::arg("acceleration"),
            py::arg("angular_velocity"))
-      .def("push_lidar", &Resbie::pushLidar, py::arg("stamp"), py::arg("points"),
+      .def("push_lidar", &FrontEnd::pushLidar, py::arg("stamp"), py::arg("points"),
            py::arg("relative_times"))
-      .def("finish", &Resbie::finish)
-      .def("latest_pose", &Resbie::latestPose)
-      .def("trajectory", &Resbie::trajectory)
-      .def("keyframe_trajectory", &Resbie::keyframeTrajectory)
-      .def("drain_map_scans", &Resbie::drainMapScans)
-      .def("status", &Resbie::status)
-      .def("sweep_diagnostics", &Resbie::sweepDiagnostics);
+      .def("finish", &FrontEnd::finish)
+      .def("drain", &FrontEnd::drain)
+      .def("drain_diagnostics", &FrontEnd::drainDiagnostics)
+      .def("status", &FrontEnd::status)
+      .attr("DEFAULT_CONFIG") = frontEndDefaultConfig();
+  m.attr("FrontEnd").attr("DIAGNOSTIC_COLUMNS") = py::tuple(py::cast(columnsOf(frontEndRow({}))));
+  py::class_<BackEnd>(m, "BackEnd")
+      .def(py::init<const Documents&, bool>(), py::arg("config"), py::arg("diagnostics"))
+      .def("push_imu", &BackEnd::pushImu, py::arg("stamp"), py::arg("acceleration"),
+           py::arg("angular_velocity"))
+      .def("push_lio", &BackEnd::pushLio, py::arg("stamp"), py::arg("pose"), py::arg("points"))
+      .def("finish", &BackEnd::finish)
+      .def("keyframes", &BackEnd::keyframes)
+      .def("drain_diagnostics", &BackEnd::drainDiagnostics)
+      .def("status", &BackEnd::status)
+      .attr("DEFAULT_CONFIG") = backEndDefaultConfig();
+  m.attr("BackEnd").attr("DIAGNOSTIC_COLUMNS") = py::tuple(py::cast(columnsOf(backEndRow(0.0, 0, false))));
 }

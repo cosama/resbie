@@ -1,163 +1,140 @@
-"""Offline resbie session: RESPLE's B-spline filter on BIEVR's map.
+"""resbie: RESPLE's B-spline filter on BIEVR's map, BIEVR's loop closer behind it.
 
-Configuration is one or more YAML files, later ones winning per key, with the
-sections ``calibration``, ``lidar``, ``imu``, ``spline``, ``points``, ``map``,
-``loop_closure`` and the top-level ``max_num_threads``. Noises are standard
-deviations in SI units. Unknown keys are an error. ``resbie.DEFAULT_CONFIG``
-holds every key with its default (read from the C++ loader, the single
-source of defaults); only ``calibration`` has to be set.
+Two independent classes, wired together by the caller::
 
-Every call is synchronous: when ``push_imu``/``push_lidar`` return, all
-processing they triggered is done, so results depend only on the pushed data.
+    front = resbie.FrontEnd("front_end.yaml", diagnostics=True)
+    back = resbie.BackEnd("back_end.yaml")  # optional
+    for kind, stamp, *data in stream:          # time order
+        if kind == "imu":
+            front.push_imu(stamp, acc, gyro)
+            back.push_imu(stamp, acc, gyro)
+        else:
+            front.push_lidar(stamp, points, relative_times)
+        for stamp, pose, points in front.drain():
+            back.push_lio(stamp, pose, points)
+    front.finish()
+    for stamp, pose, points in front.drain():
+        back.push_lio(stamp, pose, points)
+    back.finish()
+    keyframes = back.keyframes()
+    diagnostics = front.drain_diagnostics()  # rows since the last call, FrontEnd.DIAGNOSTIC_COLUMNS
 
-* IMU: seconds, m/s^2, rad/s, in the IMU frame (an IMU reporting g needs
-  its acceleration multiplied by 9.81 first).
-* LiDAR: points in the LiDAR frame; ``calibration`` maps LiDAR -> IMU.
-* Poses are the IMU frame in the map frame, one per sweep, stamped at the
-  sweep's last point. A pose is reported once the spline over its sweep is
-  final (about 50 ms of data later); ``finish()`` reports the rest with the
-  current estimate.
-* The filter starts once the IMU has started and a sweep covers
-  ``map.init_min_voxels`` map voxels. The map frame is the first pose,
-  levelled on the 15 IMU samples before it (yaw zero); gravity's direction in
-  it is estimated from then on (``up_*`` in the sweep diagnostics,
-  ``gravity_up`` in ``stats()``), so the map frame is only as level as that
-  start.
+The front end alone is a LiDAR-inertial odometry: one LIO result per sweep,
+its poses the trajectory, its points placed on them the map. The back end adds
+loop closure and a pose graph with IMU factors; it takes every LIO result (not
+only keyframes) and every IMU sample up to a result's stamp before that result.
+
+Units: every stamp in s, acceleration in m/s^2 (an IMU reporting g needs it
+multiplied by 9.81 first), angular velocity in rad/s; every number float64.
+Poses are [x, y, z, qx, qy, qz, qw]: the IMU frame in the map frame.
+
+Each class owns its configuration, which decides the results: one or more
+YAML files or dicts, later ones winning per key. Unknown keys are an error;
+``DEFAULT_CONFIG`` holds every key with its default (read from the C++
+loader, the single source of defaults). How a run executes (threads, which
+points come out, diagnostics) are constructor arguments.
+
+Diagnostics (``diagnostics=True``): ``drain_diagnostics()`` returns the rows
+since the last call as an (N, len(DIAGNOSTIC_COLUMNS)) array: one row per
+sweep (FrontEnd) or per LIO result (BackEnd).
+
+Every call is synchronous: when a push returns, all processing it triggered
+is done, so results depend only on the pushed data and its order.
 """
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
-import numpy as np
+from . import _core
+from ._core import set_log_level
 
-from ._core import Resbie as _NativeResbie, default_config, set_log_level
-
-__all__ = ["Resbie", "DEFAULT_CONFIG", "DIAGNOSTIC_COLUMNS", "set_log_level"]
-
-# Columns of Resbie.sweep_diagnostics(), one row per reported sweep.
-DIAGNOSTIC_COLUMNS = (
-    "stamp",             # sweep end, s (as trajectory())
-    "points",            # range-filtered points in the sweep
-    "points_measured",   # points handed to the filter for it
-    "points_effective",  # of those, matched to the map
-    "updates",           # filter updates ending in the sweep (incl. a preceding gap)
-    "imu_only_updates",  # updates without a matched point
-    "info_rotation",     # smallest eigenvalue of the LiDAR information, rotation, 1/rad^2
-    "info_translation",  # same, translation, 1/m^2
-    "pos_sigma",         # position sigma of the newest control point, m
-    "to_loop_closer",    # 1 if handed to the loop closer
-    "nis_mean",          # mean point zp^2 / (HPH' + R) (prior); ~1 if variances are honest
-    "weak_x",            # world direction of info_translation (unit; sign arbitrary)
-    "weak_y",
-    "weak_z",
-    "imu_samples",       # IMU samples measured
-    "acc_gated",         # of their acceleration axes, dropped by the 10 m/s^2 residual gate
-    "vel_x",             # final spline velocity, mean over the sweep, world, m/s
-    "vel_y",
-    "vel_z",
-    "acc_bias_x",        # accelerometer bias at the sweep's last update, m/s^2
-    "acc_bias_y",
-    "acc_bias_z",
-    "matched_voxels",    # distinct map voxels of the matched points, summed over updates
-    "points_gated",      # matched points the Mahalanobis gate rejected (last iteration of each update)
-    "imu_post_dv_x",     # final spline's velocity change over the sweep minus the IMU's, world, m/s
-    "imu_post_dv_y",
-    "imu_post_dv_z",
-    "imu_post_sigma",    # its std under the configured accelerometer noise, m/s
-    "gyro_bias_x",       # gyro bias at the sweep's last update, rad/s
-    "gyro_bias_y",
-    "gyro_bias_z",
-    "up_x",              # estimated gravity up direction, world (unit), at the sweep's last update
-    "up_y",
-    "up_z",
-    "up_sigma",          # its largest std, rad
-)
+__all__ = ["FrontEnd", "BackEnd", "set_log_level"]
 
 PathLike = str | os.PathLike
-
-# Every key the loader reads, with its default (from the C++ loader).
-DEFAULT_CONFIG: dict[str, Any] = default_config()
+Config = PathLike | Mapping[str, Any] | Sequence[PathLike | Mapping[str, Any]]
 
 
-class Resbie:
-    """One resbie session."""
+def _documents(config: Config) -> list[str]:
+    """YAML texts from files and dicts (JSON is YAML)."""
+    if isinstance(config, (str, os.PathLike, Mapping)):
+        config = [config]
+    documents = []
+    for item in config:
+        if isinstance(item, Mapping):
+            documents.append(json.dumps(item))
+        else:
+            documents.append(Path(item).read_text())
+    return documents
+
+
+class FrontEnd(_core.FrontEnd):
+    """The odometry: IMU and LiDAR in, one LIO result per sweep out.
+
+    * ``push_imu(stamp, acceleration, angular_velocity) -> bool``: False if
+      not after the previous sample.
+    * ``push_lidar(stamp, points, relative_times) -> bool``: ``stamp`` is the
+      earliest point's time, ``points`` (N, 3) or (N, 4) XYZ[I] in the LiDAR
+      frame (``calibration`` maps LiDAR -> IMU), ``relative_times`` (N,) s
+      after ``stamp``. False if it starts before the previous sweep or does
+      not end after it. A sweep left empty by the range filter still counts:
+      LiDAR saw nothing then.
+    * ``drain() -> [(stamp, pose, points)]``: the LIO results since the last
+      call, one per sweep. ``stamp`` is the sweep's last point, ``pose`` (7,)
+      the IMU there, ``points`` (N, 4) [x, y, z, intensity] every
+      ``point_stride``-th range-filtered point (0: none) deskewed into the IMU
+      frame at ``stamp``. A sweep is finished once the spline over it is final
+      (about 50 ms of data later); ``finish()`` finishes the rest with the
+      current estimate.
+    * ``finish()``: end of input.
+    * ``drain_diagnostics() -> (N, C)``: per sweep, how the filter fared
+      (``DIAGNOSTIC_COLUMNS``; documented in ``frontEndRow()``,
+      cpp/bindings.cpp). Empty unless ``diagnostics``.
+    * ``status() -> dict``: counters, biases, gravity.
+    * ``DEFAULT_CONFIG``, ``DIAGNOSTIC_COLUMNS``: every config key with its
+      default; the diagnostics' column names.
+
+    The filter starts once the IMU has started and a sweep covers
+    ``map.init_min_voxels`` map voxels. The map frame is the first pose,
+    levelled on the 15 IMU samples before it (yaw zero); gravity's direction
+    in it is estimated from then on (``up_*`` in the diagnostics), so the map
+    frame is only as level as that start.
+    """
 
     def __init__(
         self,
-        config_files: PathLike | Sequence[PathLike],
+        config: Config,
         *,
-        map_point_stride: int = 0,
+        max_num_threads: int = 0,
+        point_stride: int = 1,
+        diagnostics: bool = False,
     ):
-        """``config_files``: one or more YAML files, later ones win.
+        """``max_num_threads``: 0 = all cores (results do not depend on it).
+        ``point_stride``: every N-th point of a sweep goes into its result, 0:
+        none (the filter and its map use every point regardless)."""
+        super().__init__(_documents(config), max_num_threads, point_stride, diagnostics)
 
-        ``map_point_stride > 0`` exports every N-th point of each sweep,
-        deskewed into the IMU frame at the sweep's pose (see
-        ``drain_map_scans``).
-        """
-        if isinstance(config_files, (str, os.PathLike)):
-            config_files = [config_files]
-        self.config_files = [Path(p) for p in config_files]
-        for path in self.config_files:
-            if not path.is_file():
-                raise FileNotFoundError(path)
-        if map_point_stride < 0:
-            raise ValueError("map_point_stride must be >= 0")
-        self._native = _NativeResbie(
-            [str(p) for p in self.config_files], int(map_point_stride)
-        )
 
-    def push_imu(self, stamp: float, acceleration, angular_velocity) -> bool:
-        """Push one IMU sample. False if rejected (not after the previous one)."""
-        return self._native.push_imu(float(stamp), acceleration, angular_velocity)
+class BackEnd(_core.BackEnd):
+    """The loop closer: IMU and the front end's LIO results in, keyframes out.
 
-    def push_lidar(
-        self, stamp: float, points: np.ndarray, relative_times: np.ndarray
-    ) -> bool:
-        """Push one sweep. False if dropped (out of order).
+    * ``push_imu(stamp, acceleration, angular_velocity) -> bool``: as the
+      front end's.
+    * ``push_lio(stamp, pose, points) -> bool``: one LIO result, as the front
+      end's ``drain()`` returns it; every point given is used (``points``
+      (N, 3) or wider; without points never a keyframe). False if not after
+      the previous result.
+    * ``finish()``: one batch optimization of the whole graph.
+    * ``keyframes() -> (K, 8)``: t, x, y, z, qx, qy, qz, qw, the current
+      loop-closed keyframe poses; each t is the pushed stamp, exactly.
+    * ``drain_diagnostics() -> (N, C)``: per LIO result, whether it became a
+      keyframe (``DIAGNOSTIC_COLUMNS``). Empty unless ``diagnostics``.
+    * ``status() -> dict``: counters, keyframes, loops accepted and rejected.
+    * ``DEFAULT_CONFIG``, ``DIAGNOSTIC_COLUMNS``: as the front end's.
+    """
 
-        A sweep left empty by the range filter is still accepted: it tells the
-        filter LiDAR saw nothing over its time span (counted as lidar_empty).
-
-        ``stamp`` is the time of the earliest point, ``points`` is (N, 3) or
-        (N, 4) XYZ[I], ``relative_times`` (N,) are offsets from ``stamp`` in s.
-        """
-        return self._native.push_lidar(float(stamp), points, relative_times)
-
-    def finish(self) -> None:
-        """End of input: report the sweeps still waiting for final poses."""
-        self._native.finish()
-
-    def latest_pose(self) -> np.ndarray | None:
-        """Latest pose [t, x, y, z, qx, qy, qz, qw], or None before the first."""
-        return self._native.latest_pose()
-
-    def trajectory(self) -> np.ndarray:
-        """Odometry poses so far, one per sweep, (N, 8): t, x, y, z, qx, qy, qz, qw."""
-        return self._native.trajectory()
-
-    def keyframe_trajectory(self) -> np.ndarray:
-        """Loop-closed keyframe poses, (K, 8), from BIEVR's pose graph.
-
-        Every keyframe stamp is also a ``trajectory()`` stamp. Empty when
-        loop closure is disabled.
-        """
-        return self._native.keyframe_trajectory()
-
-    def drain_map_scans(self) -> list[tuple[float, np.ndarray]]:
-        """Sweeps reported since the last call, as ``(stamp, points)``.
-
-        ``points`` (N, 4) float32 [x, y, z, intensity] are deskewed into the
-        IMU frame at ``stamp``, the sweep's trajectory stamp.
-        """
-        return self._native.drain_map_scans()
-
-    def sweep_diagnostics(self) -> np.ndarray:
-        """Per-sweep filter diagnostics, (N, len(DIAGNOSTIC_COLUMNS))."""
-        return self._native.sweep_diagnostics()
-
-    def status(self) -> dict[str, Any]:
-        """Counters, filter statistics, biases and loop-closure state."""
-        return dict(self._native.status())
+    def __init__(self, config: Config, *, diagnostics: bool = False):
+        super().__init__(_documents(config), diagnostics)

@@ -1,14 +1,14 @@
 #ifndef BIEVR_PGO_CONFIG_LOADER_H_
 #define BIEVR_PGO_CONFIG_LOADER_H_
 
-// Parses the `loop_closure:` section of the same YAML files bievr_lio loads, so
-// the module configures itself without the core knowing it exists. Header-only;
-// consumers need yaml-cpp on their include path (as with bievr_lio's loader).
+// resbie: the back end's configuration, its own YAML documents with flat keys
+// (the front end's is resbie/config.h). Only the keys the synchronous closer
+// uses (no publishing, GPS, worker rates or map bundle). Header-only;
+// consumers need yaml-cpp on their include path.
 
 #include <bievr_lio/config_loader.h>
 
-#include <cmath>
-#include <limits>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -16,17 +16,8 @@
 
 namespace bievr {
 
-// resbie: only the keys the synchronous closer uses (no publishing, GPS,
-// worker rates or map bundle).
-struct LoopClosureConfig {
-  bool enable = true;  // resbie: the graph (gravity, loops) runs by default
-  LoopCloser::Config closer;
-};
-
-// resbie: every loop_closure key the loader below reads (for strict
-// validation of the YAML; keep in step with the loader).
+// Every key loadLoopClosureConfig reads; anything else is an error.
 inline constexpr const char* kLoopClosureKeys[] = {
-    "enable",
     "keyframe_meter_gap",
     "keyframe_deg_gap",
     "keyframe_filter_size",
@@ -65,81 +56,62 @@ inline constexpr const char* kLoopClosureKeys[] = {
     "gyro_bias_init_std",
 };
 
-inline bool loadLoopClosureConfig(const std::vector<std::string>& yaml_paths,
-                                  LoopClosureConfig& config) {
-  config_internal::MergedYaml yaml;
-  for (const std::string& path : yaml_paths) {
-    if (path.empty()) continue;
-    try {
-      yaml.add(YAML::LoadFile(path));
-    } catch (const std::exception& e) {
-      LOG(E, "Failed to load YAML config '" << path << "': " << e.what());
-      return false;
-    }
+// `documents`: YAML texts, later ones winning per key. False (logged) on an
+// unknown key or a value out of range.
+inline bool loadLoopClosureConfig(const std::vector<std::string>& documents,
+                                  LoopCloser::Config& c) {
+  namespace ci = config_internal;
+  using ci::Min;
+  ci::MergedYaml yaml;
+  if (!yaml.load(documents) ||
+      !yaml.onlyKeys(std::begin(kLoopClosureKeys), std::end(kLoopClosureKeys))) {
+    return false;
   }
-
-  const std::string s = "loop_closure";
-  auto& c = config.closer;
-
-  config.enable = yaml.get<bool>(s, "enable", config.enable);
-  if (!config.enable) return true;
-
-  c.keyframe_meter_gap = yaml.get<double>(s, "keyframe_meter_gap", c.keyframe_meter_gap);
-  c.keyframe_deg_gap = yaml.get<double>(s, "keyframe_deg_gap", c.keyframe_deg_gap);
-  c.keyframe_filter_size = yaml.get<double>(s, "keyframe_filter_size", c.keyframe_filter_size);
-  c.icp_filter_size = yaml.get<double>(s, "icp_filter_size", c.icp_filter_size);
+  bool ok = true;
+  ok &= ci::read(yaml, "keyframe_meter_gap", c.keyframe_meter_gap, Min::kZero);
+  ok &= ci::read(yaml, "keyframe_deg_gap", c.keyframe_deg_gap, Min::kZero);
+  ok &= ci::read(yaml, "keyframe_filter_size", c.keyframe_filter_size, Min::kPositive);
+  ok &= ci::read(yaml, "icp_filter_size", c.icp_filter_size, Min::kPositive);
 
   auto& sc = c.scan_context;
-  sc.num_rings = yaml.get<int>(s, "sc_num_rings", sc.num_rings);
-  sc.num_sectors = yaml.get<int>(s, "sc_num_sectors", sc.num_sectors);
-  sc.max_radius = yaml.get<double>(s, "sc_max_radius", sc.max_radius);
-  sc.lidar_height = yaml.get<double>(s, "sc_lidar_height", sc.lidar_height);
-  sc.num_exclude_recent = yaml.get<int>(s, "sc_num_exclude_recent", sc.num_exclude_recent);
-  sc.num_candidates = yaml.get<int>(s, "sc_num_candidates", sc.num_candidates);
-  sc.search_ratio = yaml.get<double>(s, "sc_search_ratio", sc.search_ratio);
-  sc.dist_threshold = yaml.get<double>(s, "sc_dist_threshold", sc.dist_threshold);
-  sc.tree_making_period = yaml.get<int>(s, "sc_tree_making_period", sc.tree_making_period);
+  ok &= ci::read(yaml, "sc_num_rings", sc.num_rings, Min::kPositive);
+  ok &= ci::read(yaml, "sc_num_sectors", sc.num_sectors, Min::kPositive);
+  ok &= ci::read(yaml, "sc_max_radius", sc.max_radius, Min::kPositive);
+  ok &= ci::read(yaml, "sc_lidar_height", sc.lidar_height);
+  ok &= ci::read(yaml, "sc_num_exclude_recent", sc.num_exclude_recent, Min::kZero);
+  ok &= ci::read(yaml, "sc_num_candidates", sc.num_candidates, Min::kPositive);
+  ok &= ci::read(yaml, "sc_search_ratio", sc.search_ratio, Min::kPositive);
+  ok &= ci::read(yaml, "sc_dist_threshold", sc.dist_threshold, Min::kPositive);
+  ok &= ci::read(yaml, "sc_tree_making_period", sc.tree_making_period, Min::kPositive);
 
-  c.history_keyframe_search_num =
-      yaml.get<int>(s, "history_keyframe_search_num", c.history_keyframe_search_num);
-  c.icp_max_correspondence_distance =
-      yaml.get<double>(s, "icp_max_correspondence_distance", c.icp_max_correspondence_distance);
-  c.icp_max_iterations = yaml.get<int>(s, "icp_max_iterations", c.icp_max_iterations);
-  c.icp_transformation_epsilon =
-      yaml.get<double>(s, "icp_transformation_epsilon", c.icp_transformation_epsilon);
-  c.icp_euclidean_fitness_epsilon =
-      yaml.get<double>(s, "icp_euclidean_fitness_epsilon", c.icp_euclidean_fitness_epsilon);
-  c.icp_ransac_iterations = yaml.get<int>(s, "icp_ransac_iterations", c.icp_ransac_iterations);
-  c.loop_fitness_score_threshold =
-      yaml.get<double>(s, "loop_fitness_score_threshold", c.loop_fitness_score_threshold);
-  c.use_sc_yaw_guess = yaml.get<bool>(s, "use_sc_yaw_guess", c.use_sc_yaw_guess);
-  c.sc_yaw_guess_min_deg = yaml.get<double>(s, "sc_yaw_guess_min_deg", c.sc_yaw_guess_min_deg);
-  c.loop_max_correction_z = yaml.get<double>(s, "loop_max_correction_z", c.loop_max_correction_z);
+  ok &= ci::read(yaml, "history_keyframe_search_num", c.history_keyframe_search_num, Min::kZero);
+  ok &= ci::read(yaml, "icp_max_correspondence_distance", c.icp_max_correspondence_distance, Min::kPositive);
+  ok &= ci::read(yaml, "icp_max_iterations", c.icp_max_iterations, Min::kPositive);
+  ok &= ci::read(yaml, "icp_transformation_epsilon", c.icp_transformation_epsilon, Min::kZero);
+  ok &= ci::read(yaml, "icp_euclidean_fitness_epsilon", c.icp_euclidean_fitness_epsilon, Min::kZero);
+  ok &= ci::read(yaml, "icp_ransac_iterations", c.icp_ransac_iterations, Min::kZero);
+  ok &= ci::read(yaml, "loop_fitness_score_threshold", c.loop_fitness_score_threshold, Min::kPositive);
+  ok &= ci::read(yaml, "use_sc_yaw_guess", c.use_sc_yaw_guess);
+  ok &= ci::read(yaml, "sc_yaw_guess_min_deg", c.sc_yaw_guess_min_deg, Min::kZero);
+  ok &= ci::read(yaml, "loop_max_correction_z", c.loop_max_correction_z, Min::kPositive);
 
-  c.prior_noise_score = yaml.get<double>(s, "prior_noise_score", c.prior_noise_score);
-  c.odom_noise_rotation = yaml.get<double>(s, "odom_noise_rotation", c.odom_noise_rotation);
-  c.odom_noise_translation =
-      yaml.get<double>(s, "odom_noise_translation", c.odom_noise_translation);
-  c.loop_noise_score = yaml.get<double>(s, "loop_noise_score", c.loop_noise_score);
-  c.loop_noise_cauchy_c = yaml.get<double>(s, "loop_noise_cauchy_c", c.loop_noise_cauchy_c);
+  ok &= ci::read(yaml, "prior_noise_score", c.prior_noise_score, Min::kPositive);
+  ok &= ci::read(yaml, "odom_noise_rotation", c.odom_noise_rotation, Min::kPositive);
+  ok &= ci::read(yaml, "odom_noise_translation", c.odom_noise_translation, Min::kPositive);
+  ok &= ci::read(yaml, "loop_noise_score", c.loop_noise_score, Min::kPositive);
+  ok &= ci::read(yaml, "loop_noise_cauchy_c", c.loop_noise_cauchy_c, Min::kPositive);
 
-  c.isam_relinearize_threshold =
-      yaml.get<double>(s, "isam_relinearize_threshold", c.isam_relinearize_threshold);
-  c.isam_relinearize_skip = yaml.get<int>(s, "isam_relinearize_skip", c.isam_relinearize_skip);
+  ok &= ci::read(yaml, "isam_relinearize_threshold", c.isam_relinearize_threshold, Min::kZero);
+  ok &= ci::read(yaml, "isam_relinearize_skip", c.isam_relinearize_skip, Min::kPositive);
 
-  // resbie: the graph's own IMU model (isotropic, per-sample std as in the imu
-  // section). A key left out keeps the value the caller set beforehand.
-  const auto iso = [&](const char* key, Eigen::Vector3d& v) {
-    const double x = yaml.get<double>(s, key, std::numeric_limits<double>::quiet_NaN());
-    if (std::isfinite(x)) v = Eigen::Vector3d::Constant(x);
-  };
-  iso("acc_noise_std", c.acc_noise_std);
-  iso("gyro_noise_std", c.gyro_noise_std);
-  iso("acc_bias_init_std", c.acc_bias_init_std);
-  iso("gyro_bias_init_std", c.gyro_bias_init_std);
-  c.acc_bias_walk = yaml.get<double>(s, "acc_bias_walk", c.acc_bias_walk);
-  c.gyro_bias_walk = yaml.get<double>(s, "gyro_bias_walk", c.gyro_bias_walk);
-  return true;
+  // The graph's IMU model, per-sample stds: one number (every axis) or three.
+  ok &= ci::read(yaml, "acc_noise_std", c.acc_noise_std, Min::kPositive);
+  ok &= ci::read(yaml, "gyro_noise_std", c.gyro_noise_std, Min::kPositive);
+  ok &= ci::read(yaml, "acc_bias_init_std", c.acc_bias_init_std, Min::kPositive);
+  ok &= ci::read(yaml, "gyro_bias_init_std", c.gyro_bias_init_std, Min::kPositive);
+  ok &= ci::read(yaml, "acc_bias_walk", c.acc_bias_walk, Min::kZero);
+  ok &= ci::read(yaml, "gyro_bias_walk", c.gyro_bias_walk, Min::kZero);
+  return ok;
 }
 
 }  // namespace bievr

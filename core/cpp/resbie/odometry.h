@@ -24,7 +24,8 @@
 //   jumps the gap on its constant-velocity model, discarding the gap's IMU.
 //   Here the spline steps knot by knot through any stretch the arrived sweeps
 //   show to be point-free, with IMU-only updates.
-// * Diagnostics: per-sweep LiDAR information and consistency (SweepDiagnostics).
+// * Output: each sweep, once final, as a LioResult (pose at its end, points
+//   deskewed there, diagnostics) handed to one observer.
 
 #include <omp.h>
 
@@ -36,20 +37,20 @@
 #include <functional>
 #include <iomanip>
 #include <limits>
-#include <numeric>
-#include <stdexcept>
 #include <vector>
 
 #include "Estimator.h"
 #include "bievr_lio/bievr_map.h"
 #include "bievr_lio/preprocess.h"
 #include "resbie/config.h"
+#include "resbie/log.h"
 
 namespace resbie {
 
 // Per-sweep filter diagnostics, accumulated over the updates whose batch ends
 // inside the sweep.
 struct SweepDiagnostics {
+  size_t points = 0;            // range-filtered points in the sweep
   size_t points_measured = 0;   // points handed to the filter
   size_t points_effective = 0;  // of those, matched to the map
   size_t updates = 0;           // filter updates
@@ -87,9 +88,19 @@ struct Sweep {
   int64_t end_ns = 0;
   bievr::Pointcloud points;      // IMU frame
   std::vector<int64_t> times;    // ns, absolute
-  std::vector<float> intensity;
+  std::vector<double> intensity;
   std::vector<double> ranges;    // |p| in the IMU frame (BIEVR's weighted map update)
   bool in_map = false;           // the initialization sweep seeded the map already
+  SweepDiagnostics diag;
+};
+
+// A finished sweep: reported once the spline over it can no longer change.
+struct LioResult {
+  int64_t stamp_ns = 0;                                  // sweep end
+  Eigen::Vector3d p_W_I = Eigen::Vector3d::Zero();       // pose at stamp_ns
+  Eigen::Quaterniond q_W_I = Eigen::Quaterniond::Identity();  // the spline's own, w >= 0
+  std::vector<double> points;                            // rows of x, y, z, intensity: every N-th
+                                                         // range-filtered point, IMU frame at stamp_ns
   SweepDiagnostics diag;
 };
 
@@ -98,31 +109,30 @@ class Odometry {
   static constexpr int kInitImuSamples = 15;  // RESPLE initialization()
   static constexpr double kGravity = 9.81;  // RESPLE's constant
 
-  // Called once per sweep, in order, when the sweep's poses are final:
-  // stamp = sweep end, T_W_I = pose at the sweep end, deskewed_I = every point
-  // of the sweep moved to the IMU frame at the sweep end (index-aligned with
-  // sweep.points / intensity).
-  using SweepObserver = std::function<void(int64_t stamp_ns, const bievr::Transform& T_W_I,
-                                           const bievr::Pointcloud& deskewed_I, const Sweep& sweep)>;
+  // Called once per sweep, in order, when the sweep's poses are final.
+  using LioObserver = std::function<void(LioResult&& result)>;
 
-  explicit Odometry(const Config& config)
-      : cfg_(config), map_(config.map), dt_ns_(int64_t(1000000000) / config.knot_hz) {
-    NUM_OF_THREAD = cfg_.max_num_threads > 0 ? cfg_.max_num_threads : omp_get_num_procs();
+  // max_num_threads: 0 = all cores (results do not depend on it).
+  // point_stride: every N-th point of a sweep goes into its LioResult; 0: none.
+  Odometry(const Config& config, int max_num_threads, size_t point_stride)
+      : cfg_(config), map_(config.map), dt_ns_(int64_t(1000000000) / config.knot_hz),
+        point_stride_(point_stride) {
+    NUM_OF_THREAD = max_num_threads > 0 ? max_num_threads : omp_get_num_procs();
     estimator_.n_iter = cfg_.iterations;
     estimator_.gate_chi2 = cfg_.gate_sigma * cfg_.gate_sigma;
   }
 
-  void setObserver(SweepObserver observer) { observer_ = std::move(observer); }
+  void setObserver(LioObserver observer) { observer_ = std::move(observer); }
 
   // acc in m/s^2, gyro in rad/s. False if the sample is not strictly after
   // the previous one.
   bool addImu(int64_t t_ns, const Eigen::Vector3d& acc, const Eigen::Vector3d& gyro) {
     if (t_ns <= last_imu_ns_) {
-      ++imu_rejected_;
+      ++stats_.imu_rejected;
       return false;
     }
     last_imu_ns_ = t_ns;
-    if (imu_accepted_++ == 0) first_imu_ns_ = t_ns;
+    if (stats_.imu_accepted++ == 0) first_imu_ns_ = t_ns;
     // The last kInitImuSamples before initialization set gravity (init may
     // come long after the first sample: it waits for a dense sweep).
     init_imu_.emplace_back(t_ns, gyro, acc);
@@ -133,14 +143,17 @@ class Odometry {
     return true;
   }
 
-  // False if the sweep starts before the previous one.
+  // False if the sweep starts before the previous one or does not end after
+  // it (its end stamps its LioResult, and those must increase).
   bool addSweep(Sweep&& sweep) {
-    if (sweep.start_ns < last_sweep_ns_) {
-      ++lidar_rejected_;
+    if (sweep.start_ns < last_sweep_ns_ || sweep.end_ns <= last_sweep_end_ns_) {
+      ++stats_.lidar_rejected;
       return false;
     }
     last_sweep_ns_ = sweep.start_ns;
-    ++lidar_accepted_;
+    last_sweep_end_ns_ = sweep.end_ns;
+    ++stats_.lidar_accepted;
+    if (sweep.points.empty()) ++stats_.lidar_empty;
     sweeps_.push_back(std::move(sweep));
     process();
     return true;
@@ -150,27 +163,27 @@ class Odometry {
   // (no longer refined) estimate. Sweeps it does not reach are dropped.
   void finish() {
     finalizeSweeps(true);
-    sweeps_unfinished_ += pending_final_.size() + sweeps_.size();
+    stats_.sweeps_unfinished += pending_final_.size() + sweeps_.size();
     pending_final_.clear();
     sweeps_.clear();
   }
 
   bool initialized() const { return initialized_; }
-  const bievr::BIEVRMap& map() const { return map_; }
   Eigen::Vector3d accBias() const { return initialized_ ? estimator_.biasAcc() : Eigen::Vector3d::Zero(); }
   Eigen::Vector3d gyroBias() const { return initialized_ ? estimator_.biasGyro() : Eigen::Vector3d::Zero(); }
   Eigen::Vector3d gravityUp() const { return initialized_ ? estimator_.gravityUp() : Eigen::Vector3d::UnitZ(); }
 
   struct Stats {
-    size_t imu_accepted, imu_rejected, lidar_accepted, lidar_rejected;
-    size_t sweeps_dropped_init, sweeps_finalized, sweeps_unfinished;
-    size_t updates, imu_only_updates, gap_knots, points_measured, points_effective, map_voxels;
+    size_t imu_accepted = 0, imu_rejected = 0, lidar_accepted = 0, lidar_rejected = 0;
+    size_t lidar_empty = 0;  // accepted, but no point survived the range filter
+    size_t sweeps_dropped_init = 0, sweeps_finalized = 0, sweeps_unfinished = 0;
+    size_t updates = 0, imu_only_updates = 0, gap_knots = 0, points_measured = 0, points_effective = 0;
+    size_t map_voxels = 0;
   };
   Stats stats() const {
-    return {imu_accepted_,   imu_rejected_,      lidar_accepted_,   lidar_rejected_,
-            sweeps_dropped_init_, sweeps_finalized_, sweeps_unfinished_,
-            updates_, imu_only_updates_, gap_knots_, points_measured_, points_effective_,
-            map_.size()};
+    Stats s = stats_;
+    s.map_voxels = map_.size();
+    return s;
   }
 
  private:
@@ -254,10 +267,10 @@ class Odometry {
       std::sort(matched.begin(), matched.end());
       voxels = std::unique(matched.begin(), matched.end()) - matched.begin();
     }
-    ++updates_;
-    points_measured_ += pt_meas_.size();
-    points_effective_ += effective;
-    if (effective == 0) ++imu_only_updates_;
+    ++stats_.updates;
+    stats_.points_measured += pt_meas_.size();
+    stats_.points_effective += effective;
+    if (effective == 0) ++stats_.imu_only_updates;
 
     SweepDiagnostics* d = nullptr;
     for (Sweep& s : pending_final_) {
@@ -298,7 +311,7 @@ class Odometry {
     // before the first IMU sample would run the filter on LiDAR alone and
     // seed the map before gravity is ever measured.
     if (sweep.start_ns < first_imu_ns_) {
-      ++sweeps_dropped_init_;
+      ++stats_.sweeps_dropped_init;
       sweeps_.pop_front();
       return -1;
     }
@@ -309,7 +322,7 @@ class Odometry {
     std::vector<size_t> occupied;
     bievr::voxelDownsample(sweep.points, occupied, cfg_.map.voxel_size);
     if (occupied.size() < cfg_.init_min_voxels) {
-      ++sweeps_dropped_init_;
+      ++stats_.sweeps_dropped_init;
       sweeps_.pop_front();
       return -1;
     }
@@ -435,7 +448,7 @@ class Odometry {
     if (!point_before_next && lidar_known > next) {
       if (imu_buff_.empty() || imu_buff_.back().time_ns < next) return false;
       estimator_.propRCP(next);
-      ++gap_knots_;
+      ++stats_.gap_knots;
       takeImu(spline_->maxTimeNs());
       return true;
     }
@@ -549,20 +562,26 @@ class Odometry {
       p[k] = spline_->itpPosition(t);
       spline_->itpQuaternion(t, &q[k]);
     }
+    LioResult result;
+    result.stamp_ns = sweep.end_ns;
     Eigen::Quaterniond q_end;
     spline_->itpQuaternion(sweep.end_ns, &q_end);
-    const bievr::Transform T_W_I(q_end, spline_->itpPosition(sweep.end_ns));
-    const bievr::Transform T_I_W = T_W_I.inverse();
+    // Same rotation matrix either sign: its entries are products of pairs.
+    result.q_W_I = Quater::positify(q_end);
+    result.p_W_I = spline_->itpPosition(sweep.end_ns);
+    const bievr::Transform T_I_W = bievr::Transform(result.q_W_I, result.p_W_I).inverse();
     if (sweep.end_ns > t0) {
-      sweep.diag.velocity = (T_W_I.translation() - p[0]) / (double(sweep.end_ns - t0) * 1e-9);
+      sweep.diag.velocity = (result.p_W_I - p[0]) / (double(sweep.end_ns - t0) * 1e-9);
     }
     checkImuPosterior(sweep);
     if (debugEnabled()) logDiagnostics(sweep.end_ns, sweep.diag);
 
     const size_t n = sweep.points.size();
-    bievr::Pointcloud world, deskewed;
+    sweep.diag.points = n;
+    bievr::Pointcloud world;
     world.resize(n);
-    deskewed.resize(n);
+    const size_t stride = point_stride_;
+    result.points.resize(stride ? 4 * ((n + stride - 1) / stride) : 0);
     #pragma omp parallel for num_threads(NUM_OF_THREAD)
     for (size_t i = 0; i < n; ++i) {
       const int64_t dt = sweep.times[i] - t0;
@@ -573,16 +592,24 @@ class Odometry {
       const Eigen::Quaterniond qi = q[k].slerp(a, q[k + 1]);
       const Eigen::Vector3d pi = (1.0 - a) * p[k] + a * p[k + 1];
       world[i] = qi * Eigen::Vector3d(sweep.points[i]) + pi;
-      deskewed[i] = T_I_W * Eigen::Vector3d(world[i]);
+      if (stride == 0 || i % stride != 0) continue;
+      const Eigen::Vector3d deskewed = T_I_W * Eigen::Vector3d(world[i]);
+      double* out = &result.points[4 * (i / stride)];
+      out[0] = deskewed.x();
+      out[1] = deskewed.y();
+      out[2] = deskewed.z();
+      out[3] = sweep.intensity[i];
     }
     if (!sweep.in_map && n > 0) map_.integratePoints(world, &sweep.ranges);
-    ++sweeps_finalized_;
-    if (observer_) observer_(sweep.end_ns, T_W_I, deskewed, sweep);
+    ++stats_.sweeps_finalized;
+    result.diag = sweep.diag;
+    if (observer_) observer_(std::move(result));
   }
 
   Config cfg_;
   bievr::BIEVRMap map_;
   int64_t dt_ns_;
+  size_t point_stride_;
   Estimator<32> estimator_;
   SplineState* spline_ = nullptr;
   bool initialized_ = false;
@@ -597,15 +624,13 @@ class Odometry {
   Eigen::aligned_deque<PointData> pt_buff_;
   Eigen::aligned_deque<PointData> pt_meas_;
   SweepDiagnostics carry_diag_;
-  SweepObserver observer_;
+  LioObserver observer_;
 
   int64_t last_imu_ns_ = std::numeric_limits<int64_t>::min();
   int64_t first_imu_ns_ = 0;
   int64_t last_sweep_ns_ = std::numeric_limits<int64_t>::min();
-  size_t imu_accepted_ = 0, imu_rejected_ = 0, lidar_accepted_ = 0, lidar_rejected_ = 0;
-  size_t sweeps_dropped_init_ = 0, sweeps_finalized_ = 0, sweeps_unfinished_ = 0;
-  size_t updates_ = 0, imu_only_updates_ = 0, gap_knots_ = 0;
-  size_t points_measured_ = 0, points_effective_ = 0;
+  int64_t last_sweep_end_ns_ = std::numeric_limits<int64_t>::min();
+  Stats stats_;  // map_voxels unused here: stats() fills it
 };
 
 }  // namespace resbie

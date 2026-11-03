@@ -59,9 +59,8 @@ Every push runs all processing the new data allows before returning.
    - every point (the full range-filtered sweep, not just the sampled ones)
      is placed with the spline pose at its own timestamp;
    - the sweep goes into BIEVR's map, weighted by range as in BIEVR;
-   - one pose is reported at the sweep end;
-   - the sweep, deskewed to that pose, goes to the loop closer and the map
-     export.
+   - one LIO result is reported (`FrontEnd.drain()`): the pose at the
+     sweep end and every `point_stride`-th point deskewed to it.
 
 Results depend only on the pushed data and its order. This is tested
 bit-identical across runs and OpenMP/TBB thread counts
@@ -84,7 +83,7 @@ for continuing through areas with little or no LiDAR:
   the cache sizes CPUID reports on the core that runs the first product; on
   hybrid CPUs (P/E cores) a run's last bits depended on where it started, and
   the filter grows those into metres. resbie's Eigen is built with
-  `EIGEN_NO_CPUID`, and at construction the binding pins the cache sizes of
+  `EIGEN_NO_CPUID`, and at import the binding pins the cache sizes of
   the Eigen copies inside the prebuilt GTSAM and PCL to the same values.
   `EIGEN_DONT_PARALLELIZE` keeps Eigen's products on one thread: with OpenMP,
   Eigen blocks a large product differently on one thread than on several, so
@@ -102,11 +101,14 @@ for continuing through areas with little or no LiDAR:
   update. Tilt separates from the horizontal accelerometer bias only with
   heading changes; until then its std stays near `acc_bias_init_std / g`.
   Poses stay in the map frame (only as level as the start); the estimate is
-  reported as `up_*` in the diagnostics and `gravity_up` in `stats()`.
-- **Diagnostics** (`sweep_diagnostics()`, columns in `DIAGNOSTIC_COLUMNS`):
+  reported as `up_*` in the diagnostics and `gravity_up` in `status()`.
+- **Diagnostics** (`FrontEnd(..., diagnostics=True)`, then
+  `drain_diagnostics()`: one row per sweep since the last call, columns in
+  `FrontEnd.DIAGNOSTIC_COLUMNS`, documented in `frontEndRow()` in
+  `cpp/bindings.cpp`):
   per sweep, matched points, IMU-only updates, the smallest eigenvalues of the
   LiDAR information (rotation, translation) and the weakest translation
-  direction, position sigma, loop-closer use, point NIS, IMU samples and the
+  direction, position sigma, point NIS, IMU samples and the
   acceleration axes RESPLE's 10 m/s^2 residual gate dropped, the sweep's mean
   velocity, the accelerometer and gyro biases, the estimated up direction
   and its std, the points the gate rejected, and an a-posteriori IMU check (the final trajectory's velocity change per sweep
@@ -115,11 +117,50 @@ for continuing through areas with little or no LiDAR:
   option, not config) prints the same as one line per sweep, plus one line per
   filter update (what it measured, how far it moved the newest knot); the
   default `info` prints none of it.
-- **Loop-closer guard:** empty or implausibly fast sweeps
-  (`loop_closure.max_speed_mps`) never become keyframes, so a diverged run
-  cannot stall the synchronous closer.
 
-## The pose graph (on by default)
+## Front end and back end
+
+Two classes wired together by the caller (`python/resbie/__init__.py` shows
+the loop). Each owns its configuration, which decides the results; how a run
+executes is a constructor argument (`FrontEnd`: `max_num_threads`,
+`point_stride`, `diagnostics`; `BackEnd`: `diagnostics`). Neither writes
+files: every output is drained or read by the caller.
+
+- `FrontEnd`: the filter above. `push_imu`, `push_lidar`, `finish()`, and
+  `drain()`: the LIO results since the last call, one per finished sweep, each
+  `(stamp, pose, points)`: the time of the sweep's last point, the pose
+  `[x, y, z, qx, qy, qz, qw]` there (the spline's own quaternion, w >= 0), and
+  every `point_stride`-th range-filtered point (0: none) deskewed into the IMU
+  frame there, xyzi; the filter and its map use every point regardless. A sweep is finished once
+  the spline over it is final; one push can finish none or several. Its
+  poses are the odometry, its points on them the map; the front end alone is
+  a complete odometry. The points are written once, in `Odometry::finalize`
+  (only those the stride keeps), and reach numpy and the back end without a
+  copy.
+- `BackEnd`: the pose graph below. `push_imu`, `push_lio` (every LIO result, not
+  only keyframes), `finish()`, `keyframes()`. It needs every IMU sample up to a
+  result's stamp before that result, which any time-ordered merge gives. It
+  uses every point it is given; thinning them is the caller's choice. Its
+  diagnostics: one row per LIO result (points, keyframe).
+
+At the interface every time is float64 seconds and every number float64.
+Inside, both halves count integer nanoseconds (rounded once on the way in), so
+a LIO result's stamp lands in the back end up to ~120 ns (the resolution of a
+float64 second at Unix times) from where the front end had it; `keyframes()`
+reports the stamps exactly as pushed, so they match the caller's. Sweeps must
+start no earlier and end strictly later than the previous one, so the stamps
+increase.
+
+The back end needs nothing else from the front end: velocity comes from
+consecutive poses; a result without points never becomes a keyframe. A
+diverged front end is the caller's to catch, e.g. by stopping once the
+odometry moves implausibly fast: its map is corrupt, nothing downstream
+recovers it. Everything is
+synchronous, so offline runs are deterministic; live, the back end can run
+on its own thread from one queue of IMU samples and LIO results (`push_lio`
+releases the GIL) without changing its results.
+
+## The pose graph (the back end)
 
 The filter tracks against its own map, so once that map is built slightly
 tilted (it happens on stairs), the accelerometer can disagree for minutes
@@ -130,9 +171,9 @@ outputs:
   with pose, velocity and IMU bias.
 - Between consecutive keyframes: the odometry's relative pose, and a GTSAM
   `CombinedImuFactor` from every raw IMU sample in between (preintegrated,
-  bias random walk, gravity along world z). The noise comes from the `imu`
-  section; the per-sample standard deviations become GTSAM's continuous
-  densities at the measured IMU rate.
+  bias random walk, gravity along world z). The noise comes from the back
+  end's own IMU keys (defaults: the front end's); the per-sample standard
+  deviations become GTSAM's continuous densities at the measured IMU rate.
 - The first keyframe's prior fixes only yaw and position (the gauge); roll
   and pitch are left to gravity.
 - Loop closures (Scan Context + ICP) add relative poses as before. Scan
@@ -142,7 +183,7 @@ outputs:
 - iSAM2 updates incrementally per keyframe (loop search uses the corrected
   map); `finish()` runs one batch optimization of the whole graph.
 
-`keyframe_trajectory()` returns the optimized keyframes; carrying their
+`keyframes()` returns the optimized keyframes; carrying their
 correction to every pose (blend by distance and angle between keyframes)
 gives a gravity-aligned, loop-closed trajectory. Tilt and accelerometer bias
 separate only when the sensor rotates; a sensor that never turns keeps
@@ -150,12 +191,14 @@ some ambiguity at the start.
 
 ## Layout
 
-- `cpp/bindings.cpp`: pybind11 module `resbie._core`. Its API mirrors
-  `bievr`'s, plus `finish()`.
-- `cpp/resbie/config.h`: YAML loader, the single source of defaults (see
-  Configuration).
+- `cpp/bindings.cpp`: pybind11 module `resbie._core`: `FrontEnd`, `BackEnd`,
+  their diagnostics columns and default configs.
+- `cpp/resbie/config.h`: the front end's YAML loader, the single source of its
+  defaults (see Configuration). The back end's is
+  `vendor/bievr/modules/pgo/include/bievr_pgo/config_loader.h`.
 - `cpp/resbie/odometry.h`: the synchronous driver.
-- `python/resbie/__init__.py`: the `Resbie` session and `DEFAULT_CONFIG`.
+- `python/resbie/__init__.py`: `FrontEnd` and `BackEnd` (configs from files or
+  dicts).
 - `vendor/resple`: edited copies of the RESPLE headers, from upstream
   `2f8b09e` (`resple/include`).
 - `vendor/bievr`: edited copies of the BIEVR map, preprocess, and the pgo
@@ -190,10 +233,15 @@ voxel) the map stays just as sharp and the trajectory honest. Much coarser
 
 ## Configuration
 
-One YAML schema, sections by function, standard deviations in SI units.
-Later files override earlier ones per key; unknown keys are errors.
-`resbie.DEFAULT_CONFIG` lists every key with its default (taken from the C++
-loader); only `calibration` must be set.
+Each class owns its configuration, everything that decides the results:
+one or more YAML files or dicts, later ones overriding earlier ones per key,
+standard deviations in SI units.
+Unknown keys are errors (the other class's included). `FrontEnd.DEFAULT_CONFIG`
+and `BackEnd.DEFAULT_CONFIG` list every key with its default (taken from the
+C++ loaders), except the front end's `calibration`, which has none and must be
+set. Values are checked: out of range or of the wrong type is a `ValueError`.
+
+Front end, sections by function:
 
 | section | keys |
 |---|---|
@@ -202,9 +250,16 @@ loader); only `calibration` must be set.
 | `imu` | `acc_noise_std`, `gyro_noise_std` (per sample); `acc_bias_init_std`, `gyro_bias_init_std`; `acc_bias_walk`, `gyro_bias_walk` (per sqrt(s)); `gravity_init_std_deg` (prior on gravity's direction about the start's mean force; 0 fixes it) |
 | `spline` | `knot_hz` (at most the IMU rate, rounded: each knot interval needs >= 1 IMU sample when the LiDAR is starved; init warns otherwise), `iterations`, `init_std`; `pos_noise`, `ort_noise` (motion-model noise of settled control points, m/s and rad/s); `new_pos_noise`, `new_ort_noise` (newest control point) |
 | `points` | `downsample_m`, `informed_voxels`, `noise_std_m`, `huber_delta_m`, `gate_sigma` |
-| `map` | `pixel_size_m`, `voxel_size_m`, `normal_tolerance_deg`, `smooth`, `weighted`, `max_size`, `init_min_voxels` |
-| `loop_closure` | `enable` (the whole graph, default on), `max_speed_mps`, and the closer's keyframe, Scan Context, ICP and pose-graph keys |
-| (top level) | `max_num_threads` |
+| `map` | `pixel_size_m`, `voxel_size_m`, `normal_tolerance_deg`, `smooth`, `weighted`, `max_size` (voxels; least recently used ones are evicted beyond it), `init_min_voxels` |
+
+Back end, flat keys: `keyframe_meter_gap`,
+`keyframe_deg_gap`, `keyframe_filter_size`; Scan Context (`sc_*`); ICP
+(`icp_*`, `history_keyframe_search_num`, `loop_fitness_score_threshold`,
+`use_sc_yaw_guess`, `sc_yaw_guess_min_deg`, `loop_max_correction_z`); the
+graph's noises (`prior_noise_score`, `odom_noise_*`, `loop_noise_*`), iSAM2
+(`isam_relinearize_*`) and IMU (`acc_noise_std`, `gyro_noise_std`,
+`acc_bias_walk`, `gyro_bias_walk`, `acc_bias_init_std`, `gyro_bias_init_std`,
+isotropic).
 
 Noises and biases take one number (all axes) or three. RESPLE's parameters
 map one to one: `cov_*` variances become `*_std`, and `std_sys` times
@@ -226,7 +281,9 @@ export references a `libCppUnitLite.a` that the package does not ship; an
 empty one satisfies it: `ar cr /usr/lib/x86_64-linux-gnu/libCppUnitLite.a`.
 `docker/build.sh` builds an image with the package installed.
 
-Usage: write `resbie.DEFAULT_CONFIG` with your LiDAR -> IMU `calibration` to a
-YAML file, create `resbie.Resbie(path)`, push IMU (`push_imu`) and LiDAR
-(`push_lidar`: stamp of the earliest point, points, times relative to it) in
-time order, call `finish()`, read `trajectory()`. Every call is synchronous.
+Usage: create `resbie.FrontEnd` from `FrontEnd.DEFAULT_CONFIG` with your
+LiDAR -> IMU `calibration`, push IMU (`push_imu`) and LiDAR (`push_lidar`:
+stamp of the earliest point, points, times relative to it) in time order,
+`drain()` the LIO results after each push, call `finish()` and drain
+once more. Hand each one to a `resbie.BackEnd` (and each IMU sample) for
+loop closure. Every call is synchronous.

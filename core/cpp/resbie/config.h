@@ -12,10 +12,9 @@
 //           gravity_init_std_deg
 //   spline: knot_hz, iterations, init_std, pos_noise, ort_noise,
 //           new_pos_noise, new_ort_noise
-//   points: downsample_m, informed_voxels, noise_std_m,
-//           huber_delta_m, gate_sigma
-//   map:    pixel_size_m, voxel_size_m, normal_tolerance_deg, smooth,
-//           weighted, max_size, init_min_voxels
+//   points: downsample_m, informed_voxels, noise_std_m, huber_delta_m
+//   map:    pixel_size_m, voxel_size_m, normal_tolerance_deg, max_size,
+//           init_min_voxels
 //
 // Only what changes the results: how a run executes (threads, which points
 // come out) are the front end's constructor arguments.
@@ -54,9 +53,11 @@ struct Config {
 
   // spline: RESPLE's cubic B-spline and its iterated EKF. The motion model
   // adds, per knot, a random step of std noise * dt to every active control
-  // point (new_*: the newest one), so the noises are velocity-like.
+  // point (new_*: the newest one), so the noises are velocity-like. The
+  // orientation control points are quaternion logs (half the rotation angle),
+  // so the *_ort_noise rates are half the rotation rate's std.
   int knot_hz = 100;
-  int iterations = 3;
+  int iterations = 4;  // filter updates per knot, each re-associating
   double init_std = std::sqrt(0.02);                   // initial control points, per knot interval
   double pos_noise = 0.1 * std::sqrt(0.5);             // m/s
   double ort_noise = 0.1 * std::sqrt(0.5);             // rad/s
@@ -68,7 +69,6 @@ struct Config {
   size_t informed_voxels = 300;     // most informative map voxels kept (all their points)
   double point_noise_std = 0.1;     // m, against the map surface
   MapAssociationConfig association; // huber_delta_m
-  double gate_sigma = 3.0;          // Mahalanobis gate on the predicted residual
 
   // map (BIEVR bump-image map)
   bievr::BIEVRMap::Config map = [] {
@@ -92,7 +92,7 @@ inline constexpr const char* kKeys[] = {
     "spline.knot_hz", "spline.iterations", "spline.init_std", "spline.pos_noise",
     "spline.ort_noise", "spline.new_pos_noise", "spline.new_ort_noise",
     "points.downsample_m", "points.informed_voxels", "points.noise_std_m",
-    "points.huber_delta_m", "points.gate_sigma",
+    "points.huber_delta_m",
     "map.pixel_size_m", "map.voxel_size_m", "map.normal_tolerance_deg",
     "map.max_size", "map.init_min_voxels",
 };
@@ -140,7 +140,6 @@ inline bool loadConfig(const std::vector<std::string>& documents, Config& c) {
   ok &= ci::read(yaml, "points.informed_voxels", c.informed_voxels, Min::kPositive);
   ok &= ci::read(yaml, "points.noise_std_m", c.point_noise_std, Min::kPositive);
   ok &= ci::read(yaml, "points.huber_delta_m", c.association.huber_delta, Min::kPositive);
-  ok &= ci::read(yaml, "points.gate_sigma", c.gate_sigma, Min::kPositive);
 
   ok &= ci::read(yaml, "map.pixel_size_m", c.map.px_size, Min::kPositive);
   ok &= ci::read(yaml, "map.voxel_size_m", c.map.voxel_size, Min::kPositive);

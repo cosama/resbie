@@ -3,9 +3,9 @@
 // resbie: RESPLE's data association against BIEVR's bump-image map instead
 // of an ikd-tree. Each point is placed by the spline at its own timestamp and
 // linearized on its voxel's oriented height image exactly as BIEVR's
-// LsqRegistration::linearize does; the result is handed to the filter in
-// RESPLE's plane form (normvec, dist), so Estimator's Jacobians stay unchanged
-// (Estimator::prepLiDAR linearizes the filter on it, every iteration).
+// LsqRegistration::linearize does, then on the spline's control points with
+// RESPLE's Jacobians (upstream's Estimator::prepLiDAR, which placed every point
+// a second time), once per filter iteration.
 
 #include <eigen3/Eigen/Geometry>
 #include <eigen3/Eigen/Dense>
@@ -54,26 +54,43 @@ public:
         return true;
     }
 
-    static void findCorresp(int& effect_num_k, const SplineState* spline, const bievr::BIEVRMap& map,
-                            const MapAssociationConfig& cfg, Eigen::aligned_deque<PointData>& pt_meas)
+    // Associates and linearizes every point at the spline's current estimate:
+    // residual zp, its Jacobian H on the active control points, and the Huber
+    // factor. Points are all in the active window (Odometry collects them so).
+    static void linearize(int& effect_num_k, const SplineState& spline, const bievr::BIEVRMap& map,
+                          const MapAssociationConfig& cfg, Eigen::aligned_deque<PointData>& pt_meas)
     {
-        int num_pt = pt_meas.size();
+        const int num_pt = pt_meas.size();
+        const int rcp_start = spline.numKnots() - 4;
         #pragma omp parallel for num_threads(NUM_OF_THREAD) schedule(dynamic)
         for (int i = 0; i < num_pt; i++) {
             PointData& pt_data = pt_meas[i];
-            pt_data.if_valid = false;
-            if (!(spline->numKnots() == 4) && !(pt_data.time_ns <= spline->maxTimeNs() && pt_data.time_ns >= spline->maxTimeNs() - 4*spline->getKnotTimeIntervalNs())) {
-                continue;
-            }
-            pt_data.pt_w = pointBodyToWorld(pt_data.time_ns, spline, pt_data.pt_b);
+            Eigen::Quaterniond q_itp;
+            Jacobian43 J_ortdel;
+            Jacobian J_pos;
+            spline.itpQuaternion(pt_data.time_ns, &q_itp, nullptr, &J_ortdel);
+            const Eigen::Vector3d p_itp = spline.itpPosition(pt_data.time_ns, &J_pos);
+            pt_data.pt_w = q_itp * pt_data.pt_b + p_itp;
             double r;
             Eigen::Vector3d grad;
-            if (!mapResidual(map, pt_data.pt_w, r, grad, pt_data.voxel)) continue;
-            pt_data.if_valid = true;
+            pt_data.if_valid = mapResidual(map, pt_data.pt_w, r, grad, pt_data.voxel);
+            if (!pt_data.if_valid) continue;
             pt_data.normvec = grad;
-            pt_data.dist = r - grad.dot(pt_data.pt_w);
+            pt_data.zp = r;
             const double abs_r = std::abs(r);
             pt_data.var_scale = abs_r <= cfg.huber_delta ? 1.0 : abs_r / cfg.huber_delta;
+
+            Eigen::Matrix<double, 3, 4> drot;
+            Quater::drotInv(pt_data.pt_b, q_itp, drot);
+            const Eigen::Matrix<double, 1, 4> tmp = grad.transpose() * drot;
+            pt_data.H.setZero();
+            for (int k = 0; k < (int) J_pos.d_val_d_knot.size(); k++) {
+                const int j = (int) J_pos.start_idx + k - rcp_start;
+                if (j >= 0) {
+                    pt_data.H.block<1, 3>(0, j*6) = grad.transpose() * J_pos.d_val_d_knot[k];
+                    pt_data.H.block<1, 3>(0, j*6 + 3) = tmp * J_ortdel.d_val_d_knot[k];
+                }
+            }
         }
         for (int i = 0; i < num_pt; i++) {
             if (pt_meas[i].if_valid) effect_num_k++;

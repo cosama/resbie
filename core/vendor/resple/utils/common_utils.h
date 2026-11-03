@@ -92,18 +92,17 @@ public:
 // One LiDAR point as a filter measurement. Points arrive already in the IMU
 // (body) frame, so the spline pose maps them to the world directly.
 //
-// resbie: the measurement is BIEVR's bump-image residual linearized at the
-// point's world position: r(p_w) ~ normvec . p_w + dist, where normvec is the
-// residual gradient (not unit length) and dist the matching offset. RESPLE's
-// own point-to-plane model is the special case of a unit normal. var_scale is
-// the Huber IRLS factor on var_pt for that linearization.
+// resbie: the measurement is BIEVR's bump-image residual zp at the point's
+// world position pt_w, with normvec its gradient d zp / d pt_w (not unit
+// length; RESPLE's point-to-plane model is the special case of a unit normal)
+// and H its Jacobian on the active control points. var_scale is the Huber IRLS
+// factor on var_pt for that linearization.
 struct PointData {
     int64_t time_ns = 0;
     Eigen::Vector3d pt_b = Eigen::Vector3d::Zero();
     Eigen::Vector3d pt_w = Eigen::Vector3d::Zero();
     Eigen::Vector3d normvec = Eigen::Vector3d::Zero();
     bool if_valid = false;
-    double dist = 0;
     double zp = 0;
     Eigen::Matrix<double, 1, 24> H = Eigen::Matrix<double, 1, 24>::Zero();
     double var_pt = 0.01;

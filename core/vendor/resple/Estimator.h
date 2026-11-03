@@ -70,51 +70,28 @@ class Estimator
     {
         const Eigen::Matrix<double, XSIZE, XSIZE> cov_prop = cov_rcp;
         Eigen::Matrix<double, XSIZE, 1> rcp_prop = getState();
-        bool converged = true;
-        int num_tot_eff = 0;
-        int t = 0;
         point_nis.clear();
         imu_samples = imu_meas.size();
         acc_gated = 0;
+        // resbie: n_iter updates, each re-associating at the current iterate.
+        // Upstream's convergence test (step norm > 0.1 over the whole mixed-unit
+        // state) never fired, so it always ran n_iter + 1 updates.
         bool updated = false;
-        for (int i = 0; i < max_iter; i++) {
+        for (int i = 0; i < n_iter; i++) {
             record_nis_ = (i == 0);
-            Eigen::Matrix<double, XSIZE, 1> rcpi = getState();
-            if (converged) {
-                num_tot_eff = 0;
-                Association::findCorresp(num_tot_eff, &spl, map, assoc, pt_meas);
-            }
-            if (num_tot_eff > 0 || !imu_meas.empty()) {
-                // resbie: also without a matched point (IMU-only update).
-                // Upstream broke out then, so a LiDAR gap also dropped every
-                // IMU sample in it.
-                update(pt_meas, imu_meas, num_tot_eff, rcp_prop, cov_prop, cov_acc, cov_gyro);
-            } else {
-                // resbie: re-association found nothing to measure. Keep the
-                // last iteration's estimate with its posterior covariance
-                // (upstream kept the prior covariance for an updated state).
-                if (updated) cov_rcp = 0.5*(P_post_ + P_post_.transpose());
-                break;
-            }
+            int num_tot_eff = 0;
+            Association::linearize(num_tot_eff, spl, map, assoc, pt_meas);
+            // resbie: also without a matched point (IMU-only update). Upstream
+            // broke out then, so a LiDAR gap also dropped every IMU sample in it.
+            if (num_tot_eff == 0 && imu_meas.empty()) break;
+            update(pt_meas, imu_meas, num_tot_eff, rcp_prop, cov_prop, cov_acc, cov_gyro);
             updated = true;
-            converged = true;
-            Eigen::Matrix<double, XSIZE, 1> state_af = getState();
-            if ((state_af - rcpi).norm() > eps) {
-                converged = false;
-            } else {
-                t++;
-            }
-            if(!t && i == max_iter - 2) {
-                converged = true;
-            }
-            if ((t > n_iter) || (i == max_iter - 1)) {
-                // resbie: the last update's posterior covariance (see update());
-                // upstream's (I - KH) P lost positive definiteness on the first
-                // dense update after a long gap (huge P, precise points).
-                cov_rcp = 0.5*(P_post_ + P_post_.transpose());
-                break;
-            }              
         }
+        // resbie: the last update's posterior covariance (see update()); upstream's
+        // (I - KH) P lost positive definiteness on the first dense update after a
+        // long gap (huge P, precise points). Upstream also kept the prior
+        // covariance for an updated state when re-association found nothing.
+        if (updated) cov_rcp = 0.5*(P_post_ + P_post_.transpose());
         // resbie: the iterations work in the chart the update started in
         // (prior and iterate share u0); move to the estimate's own chart once,
         // at the exit.
@@ -139,13 +116,6 @@ class Estimator
         return &spl;
     }
 
-    // resbie: Mahalanobis point gate, zp^2 <= gate_chi2 * (HPH' + R):
-    // narrow when the filter is certain, wide when it is not. (RESPLE's gate
-    // accepted |zp| < nn_thresh, or anything while HPH' + R < coeff_cov * R,
-    // i.e. it widened only when certain.)
-    double gate_chi2 = 9.0;
-    bool gateAccepts(double zp, double lid_cov) const { return zp * zp <= gate_chi2 * lid_cov; }
-
     // resbie: consistency check. Normalized innovation squared of each
     // matched point in the last update's first iteration (prior, before the
     // update pulls it in); ~1 on average if HPH' + R is honest.
@@ -155,8 +125,6 @@ class Estimator
     // of their acceleration axes the 10 m/s^2 residual gate dropped.
     size_t imu_samples = 0;
     size_t acc_gated = 0;
-    // resbie: matched points the Mahalanobis gate rejected in the last iteration.
-    size_t points_gated = 0;
 
     // resbie: filter covariance (control points, then biases).
     const Eigen::Matrix<double, XSIZE, XSIZE>& covariance() const { return cov_rcp; }
@@ -188,8 +156,6 @@ class Estimator
     Eigen::Matrix<double, Eigen::Dynamic, 1> innv_buf_;
     Eigen::Matrix<double, Eigen::Dynamic, 1> R_inv_buf_;
     std::vector<int> imu_row_offsets_;
-    int max_iter = 5;
-    double eps = 0.1;
 
     void ensureMeasBuffers(int n)
     {
@@ -283,34 +249,6 @@ class Estimator
         imu_data.H_grav = -g_mag * RT * SO3::skew(u) * SO3::rightJacobian(-(B_grav * dg)) * B_grav;
     }    
 
-    void prepLiDAR(PointData& pt_data) const    
-    {
-        if (pt_data.if_valid) { 
-            Eigen::Matrix<double, 1, 24> Hi = Eigen::Matrix<double, 1, 24>::Zero();
-            Eigen::Quaterniond q_itp;
-            Jacobian43 J_ortdel;
-            Jacobian J_pos;
-            spl.itpQuaternion(pt_data.time_ns, &q_itp, nullptr, &J_ortdel);
-            Eigen::Vector3d p_itp = spl.itpPosition(pt_data.time_ns, &J_pos);
-            // resbie: points are already in the body frame.
-            Eigen::Vector3d pt_w = q_itp * pt_data.pt_b + p_itp;
-            pt_data.zp = pt_data.normvec.dot(pt_w) + pt_data.dist;
-
-            Eigen::Matrix<double, 3, 4> drot;
-            Quater::drotInv(pt_data.pt_b, q_itp, drot);
-            Eigen::Matrix<double, 1, 4> tmp = pt_data.normvec.transpose() * drot;
-            int RCP_st_id = spl.numKnots() - 4;
-            for (int i = 0; i < (int) J_pos.d_val_d_knot.size(); i++) {
-                int j = (int) J_pos.start_idx + i - RCP_st_id;
-                if (j >= 0) {
-                    Hi.block(0, j*6, 1, 3) = pt_data.normvec.transpose() * J_pos.d_val_d_knot[i];
-                    Hi.block(0, j*6 + 3, 1, 3) = tmp * J_ortdel.d_val_d_knot[i];
-                }
-            }  
-            pt_data.H = Hi;
-        }
-    } 
-
     void updateState(const Eigen::Matrix<double, XSIZE, 1>& xupd)
     {
         spl.updateRCPs(xupd.template segment<CP_SIZE>(0));
@@ -325,15 +263,10 @@ class Estimator
         const Eigen::Matrix<double, XSIZE, XSIZE>& P_prop, const Eigen::Vector3d& cov_acc, const Eigen::Vector3d& cov_gyro)
     {
         Eigen::Matrix<double, 6, 1> cov_imu_inv =  Eigen::Matrix<double, 6, 1>(1/cov_acc[0], 1/cov_acc[1], 1/cov_acc[2], 1/cov_gyro[0], 1/cov_gyro[1], 1/cov_gyro[2]);
-        #pragma omp parallel for num_threads(NUM_OF_THREAD) schedule(dynamic)
-        for (size_t i = 0; i < pt_meas.size(); i++) {
-            prepLiDAR(pt_meas[i]);
-        }
         #pragma omp parallel for num_threads(NUM_OF_THREAD) 
         for (size_t i = 0; i < imu_meas.size(); i++) {
             prepIMU(imu_meas[i]);
         }                
-        points_gated = 0;
         const int dim_meas = 6*imu_meas.size() + num_valid;
         const Eigen::Matrix<double, 24, 24> cov = cov_rcp.template topLeftCorner<24, 24>();
         ensureMeasBuffers(dim_meas);
@@ -351,19 +284,16 @@ class Estimator
                 (id_pt < pt_meas.size() && id_imu >= imu_meas.size())) {
                     PointData& pt_data = pt_meas[id_pt];
                     if (pt_data.if_valid) {
-                        // resbie: var_scale is the Huber weight of this linearization.
-                        const double var_pt = pt_data.var_pt * pt_data.var_scale;
-                        double lid_cov = (pt_data.H * cov * pt_data.H.transpose())(0, 0) + var_pt;
-                        if (record_nis_) point_nis.push_back(pt_data.zp * pt_data.zp / lid_cov);
-                        if (gateAccepts(pt_data.zp, lid_cov)) {
-                            innv(idx_offset) = - pt_data.zp;
-                            H_24.row(idx_offset) = pt_data.H;
-                        } else {
-                            innv(idx_offset) = 0.0;
-                            H_24.row(idx_offset).setZero();
-                            ++points_gated;
+                        // resbie: no point gate (RESPLE gated |zp| < nn_thresh unless
+                        // certain); the Huber weight var_scale bounds each point's pull.
+                        // NIS on the nominal variance: ~1 if HPH' + R is honest.
+                        if (record_nis_) {
+                            const double lid_cov = (pt_data.H * cov * pt_data.H.transpose())(0, 0) + pt_data.var_pt;
+                            point_nis.push_back(pt_data.zp * pt_data.zp / lid_cov);
                         }
-                        R_inv(idx_offset) = 1.0 / var_pt;
+                        innv(idx_offset) = - pt_data.zp;
+                        H_24.row(idx_offset) = pt_data.H;
+                        R_inv(idx_offset) = 1.0 / (pt_data.var_pt * pt_data.var_scale);
                         idx_offset++;
                     }
                     id_pt++;
@@ -378,14 +308,14 @@ class Estimator
                     imu.head<3>() = imu_data.accel;
                     imu.tail<3>() = imu_data.gyro;
                     for (int i = 0; i < 3; i++) {
-                        if (abs(imu(i) - imu_itp(i)) > 10.0) {
+                        if (std::abs(imu(i) - imu_itp(i)) > 10.0) {
                             if (record_nis_) ++acc_gated;
                             imu(i) = 0;
                             imu_itp(i) = 0;
                             Hi.row(i).setZero();
                             w_imu(i) = 0.0;
                         } 
-                        if (abs(imu(i+3) - imu_itp(i+3)) > 5.0) {
+                        if (std::abs(imu(i+3) - imu_itp(i+3)) > 5.0) {
                             imu(i+3) = 0;
                             imu_itp(i+3) = 0;
                             Hi.row(i+3).setZero();

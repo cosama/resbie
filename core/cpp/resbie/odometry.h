@@ -70,7 +70,6 @@ struct SweepDiagnostics {
   Eigen::Vector3d gyro_bias = Eigen::Vector3d::Zero();  // at the last update, rad/s
   Eigen::Vector3d gravity_up = Eigen::Vector3d::UnitZ();  // world up direction at the last update
   double gravity_sigma = NAN;    // its largest tangent std, rad
-  size_t points_gated = 0;       // matched points the Mahalanobis gate rejected (last iteration)
   // A-posteriori IMU check: the final spline's velocity change over the sweep
   // minus the IMU's (world, m/s, final orientation, current acc bias). Each
   // IMU sample is checked against the spline only once, before later updates
@@ -119,7 +118,6 @@ class Odometry {
         point_stride_(point_stride) {
     NUM_OF_THREAD = max_num_threads > 0 ? max_num_threads : omp_get_num_procs();
     estimator_.n_iter = cfg_.iterations;
-    estimator_.gate_chi2 = cfg_.gate_sigma * cfg_.gate_sigma;
   }
 
   void setObserver(LioObserver observer) { observer_ = std::move(observer); }
@@ -239,7 +237,7 @@ class Odometry {
     }
     if (!estimator_.point_nis.empty()) nis_mean /= double(estimator_.point_nis.size());
     LOG(D, std::fixed << std::setprecision(4) << "update " << t_ns * 1e-9 << " points " << matched << "/"
-        << pt_meas_.size() << " gated " << estimator_.points_gated << " imu " << imu_meas_.size()
+        << pt_meas_.size() << " imu " << imu_meas_.size()
         << " nis " << nis_mean << " max " << nis_max
         << " d_pos " << (after.segment<3>(18) - before.segment<3>(18)).norm()
         << " vel [" << vel(after).transpose() << "] d_vel [" << (vel(after) - vel(before)).transpose() << "]");
@@ -291,7 +289,6 @@ class Odometry {
     }
     d->imu_samples += estimator_.imu_samples;
     d->acc_gated += estimator_.acc_gated;
-    if (effective > 0) d->points_gated += estimator_.points_gated;
     d->acc_bias = estimator_.biasAcc();
     d->gyro_bias = estimator_.biasGyro();
     d->gravity_up = estimator_.gravityUp();
@@ -462,7 +459,7 @@ class Odometry {
     }
     const int64_t max_time_ns = spline_->maxTimeNs();
     while (!pt_buff_.empty() && pt_buff_.front().time_ns <= max_time_ns) {
-      if (spline_->numKnots() < 10 || pt_buff_.front().time_ns >= max_time_ns - dt_ns_) {
+      if (pt_buff_.front().time_ns >= max_time_ns - dt_ns_) {
         pt_meas_.push_back(pt_buff_.front());
       }
       pt_buff_.pop_front();
@@ -485,7 +482,7 @@ class Odometry {
   void finalizeSweeps(bool force) {
     while (!pending_final_.empty()) {
       Sweep& sweep = pending_final_.front();
-      const bool final_ready = sweep.end_ns + 5 * dt_ns_ <= spline_->maxTimeNs();
+      const bool final_ready = sweep.end_ns + 4 * dt_ns_ <= spline_->maxTimeNs();
       if (!final_ready && !(force && sweep.end_ns <= spline_->maxTimeNs())) return;
       finalize(sweep);
       pending_final_.pop_front();
@@ -540,7 +537,7 @@ class Odometry {
         << " vel [" << d.velocity.transpose() << "] acc_bias [" << d.acc_bias.transpose() << "]"
         << " gyro_bias [" << d.gyro_bias.transpose() << "] up [" << d.gravity_up.transpose() << "] (sigma "
         << d.gravity_sigma * 180.0 / M_PI << " deg)"
-        << " gated " << d.points_gated << " imu_post_dv [" << d.imu_post_dv.transpose() << "] (sigma "
+        << " imu_post_dv [" << d.imu_post_dv.transpose() << "] (sigma "
         << d.imu_post_sigma << ")");
   }
 

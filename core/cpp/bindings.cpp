@@ -171,7 +171,6 @@ Row frontEndRow(const resbie::LioResult& s) {
       {"acc_bias_y", g.acc_bias.y()},
       {"acc_bias_z", g.acc_bias.z()},
       {"matched_voxels", double(g.matched_voxels)},  // distinct map voxels of the matched points, summed over updates
-      {"points_gated", double(g.points_gated)},    // matched points the Mahalanobis gate rejected (last iteration)
       {"imu_post_dv_x", g.imu_post_dv.x()},        // final spline's velocity change over the sweep minus the IMU's, world, m/s
       {"imu_post_dv_y", g.imu_post_dv.y()},
       {"imu_post_dv_z", g.imu_post_dv.z()},
@@ -479,8 +478,7 @@ py::dict frontEndDefaultConfig() {
   d["points"] = py::dict(py::arg("downsample_m") = c.downsample,
                          py::arg("informed_voxels") = c.informed_voxels,
                          py::arg("noise_std_m") = c.point_noise_std,
-                         py::arg("huber_delta_m") = c.association.huber_delta,
-                         py::arg("gate_sigma") = c.gate_sigma);
+                         py::arg("huber_delta_m") = c.association.huber_delta);
   d["map"] = py::dict(py::arg("pixel_size_m") = c.map.px_size,
                       py::arg("voxel_size_m") = c.map.voxel_size,
                       py::arg("normal_tolerance_deg") = c.map.norm_tol_deg,

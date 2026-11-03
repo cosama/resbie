@@ -33,7 +33,10 @@ class ScanContext {
     int num_candidates = 3;       // kNN candidates pulled from the ring-key tree
     double search_ratio = 0.1;    // fraction of shifts searched around the sector-key guess
     double dist_threshold = 0.2;  // accept a match below this cosine distance
-    int tree_making_period = 30;  // rebuild the kd-tree every N queries
+    // Rebuild the ring-key kd-tree every N queries. Above 1, a keyframe can
+    // be matched only once a rebuild has picked it up (up to N queries after
+    // it left the exclusion window); 1 is exact, larger values save time online.
+    int tree_making_period = 1;
   };
 
   struct Match {

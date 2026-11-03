@@ -55,7 +55,7 @@ Every push runs all processing the new data allows before returning.
 3. **Filter.** This is RESPLE's `collectMeasurements` and
    `updateIEKFLiDARInertial`, on the map above and with the changes below.
 4. **Finalization.** Once the spline over a sweep has left the 4-knot active
-   window (`end + 5 dt <= maxTime`), the sweep is final:
+   window (`end + 4 dt <= maxTime`), the sweep is final:
    - every point (the full range-filtered sweep, not just the sampled ones)
      is placed with the spline pose at its own timestamp;
    - the sweep goes into BIEVR's map, weighted by range as in BIEVR;
@@ -76,9 +76,13 @@ with little or no LiDAR:
   Here the update runs IMU-only, and the spline steps knot by knot through
   any stretch the arrived sweeps show to be empty. Empty sweeps are passed in
   as gap markers.
-- **Mahalanobis point gate,** `zp^2 <= gate_sigma^2 (HPH' + R)` (`points.gate_sigma`, 3),
-  using RESPLE's own covariance. RESPLE's gate widened only when the filter
-  was certain.
+- **No point gate.** Every matched point is measured; the Huber weight
+  (`points.huber_delta_m`) caps each point's pull. RESPLE gated `|zp|` by a
+  fixed threshold unless the filter was certain; a Mahalanobis gate tried
+  before fired on about one matched point in 10^5-10^6.
+- **Fixed iteration count:** `spline.iterations` updates per knot, each
+  re-associating and linearizing every point once. RESPLE's convergence test
+  never fired, so it ran one update more than configured.
 - **Same bits on every core.** Eigen sizes its matrix-product blocks from
   the cache sizes CPUID reports on the core that runs the first product; on
   hybrid CPUs (P/E cores) a run's last bits depended on where it started, and
@@ -111,7 +115,7 @@ with little or no LiDAR:
   direction, position sigma, point NIS, IMU samples and the
   acceleration axes RESPLE's 10 m/s^2 residual gate dropped, the sweep's mean
   velocity, the accelerometer and gyro biases, the estimated up direction
-  and its std, the points the gate rejected, and an a-posteriori IMU check (the final trajectory's velocity change per sweep
+  and its std, and an a-posteriori IMU check (the final trajectory's velocity change per sweep
   minus the IMU's: each IMU sample is otherwise only checked once, before
   later updates reshape the trajectory). `resbie.set_log_level("debug")` (a run
   option, not config) prints the same as one line per sweep, plus one line per
@@ -255,8 +259,8 @@ Front end, sections by function:
 | `calibration` | `translation`, `rotation` (T_I_L, LiDAR to IMU, row-major) |
 | `lidar` | `min_range_m`, `max_range_m`, `time_offset_s` |
 | `imu` | `acc_noise_std`, `gyro_noise_std` (per sample); `acc_bias_init_std`, `gyro_bias_init_std`; `acc_bias_walk`, `gyro_bias_walk` (per sqrt(s)); `gravity_init_std_deg` (prior on gravity's direction about the start's mean force; 0 fixes it) |
-| `spline` | `knot_hz` (at most the IMU rate, rounded: each knot interval needs >= 1 IMU sample when the LiDAR is starved; init warns otherwise), `iterations`, `init_std`; `pos_noise`, `ort_noise` (motion-model noise of settled control points, m/s and rad/s); `new_pos_noise`, `new_ort_noise` (newest control point) |
-| `points` | `downsample_m`, `informed_voxels`, `noise_std_m`, `huber_delta_m`, `gate_sigma` |
+| `spline` | `knot_hz` (at most the IMU rate, rounded: each knot interval needs >= 1 IMU sample when the LiDAR is starved; init warns otherwise), `iterations` (filter updates per knot, each re-associating), `init_std`; `pos_noise`, `ort_noise` (motion-model noise of settled control points, m/s and rad/s of the quaternion log, i.e. half the rotation rate); `new_pos_noise`, `new_ort_noise` (newest control point) |
+| `points` | `downsample_m`, `informed_voxels`, `noise_std_m`, `huber_delta_m` |
 | `map` | `pixel_size_m`, `voxel_size_m`, `normal_tolerance_deg`, `max_size` (voxels; least recently used ones are evicted beyond it), `init_min_voxels` |
 
 Back end, flat keys: `keyframe_meter_gap`,

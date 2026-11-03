@@ -566,6 +566,19 @@ def test_back_end_imu_model_defaults_to_the_front_ends():
         assert back[key] == front[key], key
 
 
+def test_back_end_one_imu_sample_between_keyframes():
+    # One sample gives no IMU rate (the noise densities need one): the keyframes are linked by
+    # the bias walk alone instead of a preintegration without parameters (a crash).
+    back = resbie.BackEnd({})
+    room = _room(np.random.default_rng(0), 500)
+    assert back.push_imu(1.0, [0.0, 0.0, 9.81], [0.0, 0.0, 0.0])
+    assert back.push_lio(1.05, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], room)
+    assert back.push_imu(1.5, [0.0, 0.0, 9.81], [0.0, 0.0, 0.0])
+    assert back.push_lio(2.0, [2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], room)
+    back.finish()
+    np.testing.assert_array_equal(back.keyframes()[:, 0], [1.05, 2.0])
+
+
 def test_back_end_order_and_diagnostics():
     back = resbie.BackEnd({}, diagnostics=True)
     room = _room(np.random.default_rng(0), 500)

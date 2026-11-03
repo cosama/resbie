@@ -249,23 +249,34 @@ void LoopCloser::addMotionFactors(int index, const gtsam::Pose3& odom_delta, uin
                                   const Eigen::Vector3d& velocity) {
   graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(X(index - 1), X(index), odom_delta, odom_noise_));
 
+  // The noise densities need the IMU rate, so two samples.
   if (!imu_params_ && imu_.size() >= 2) {
     imu_params_ = makeImuParams(1e-9 * double(imu_.back().stamp - imu_.front().stamp) /
                                 double(imu_.size() - 1));
   }
-  gtsam::PreintegratedCombinedMeasurements pim(imu_params_, bias_);
-  uint64_t t = keyframe_stamps_[index - 1];
+  // Each sample covers the time since the previous one (the first: since the
+  // previous keyframe); the last also covers the rest up to this keyframe, so
+  // the factors tile the timeline.
+  const ImuSample* last = nullptr;
   for (const ImuSample& s : imu_) {
     if (s.stamp > stamp) break;
-    pim.integrateMeasurement(s.acc, s.gyro, 1e-9 * double(s.stamp - t));
-    t = s.stamp;
+    last = &s;
   }
-  if (imu_params_ && pim.deltaTij() > 0) {
+  if (imu_params_ && last) {
+    gtsam::PreintegratedCombinedMeasurements pim(imu_params_, bias_);
+    uint64_t t = keyframe_stamps_[index - 1];
+    for (const ImuSample& s : imu_) {
+      if (s.stamp > stamp) break;
+      pim.integrateMeasurement(s.acc, s.gyro, 1e-9 * double(s.stamp - t));
+      t = s.stamp;
+    }
+    if (t < stamp) pim.integrateMeasurement(last->acc, last->gyro, 1e-9 * double(stamp - t));
     graph_.add(gtsam::CombinedImuFactor(X(index - 1), V(index - 1), X(index), V(index), B(index - 1),
                                         B(index), pim));
   } else {
-    // No IMU between them (a gap in the IMU stream): the bias still drifts by
-    // its random walk over the interval, and the velocity is left loose.
+    // No IMU between them (a gap in the IMU stream, or no rate yet): the bias
+    // still drifts by its random walk over the interval, and the velocity is
+    // left loose.
     const double sqrt_dt = std::sqrt(1e-9 * double(stamp - keyframe_stamps_[index - 1]));
     gtsam::Vector6 walk;
     walk << gtsam::Vector3::Constant(config_.acc_bias_walk * sqrt_dt),

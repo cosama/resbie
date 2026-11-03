@@ -211,7 +211,6 @@ class Odometry {
         imu_meas_.pop_front();
       }
       const Eigen::Matrix<double, 32, 1> state_before = estimator_.getState();
-      for (PointData& p : pt_meas_) p.var_pt = pointVariance();
       estimator_.updateIEKFLiDARInertial(pt_meas_, map_, cfg_.association, imu_meas_,
                                          cfg_.acc_noise_std.cwiseAbs2(),
                                          cfg_.gyro_noise_std.cwiseAbs2());
@@ -307,7 +306,7 @@ class Odometry {
   int initialize() {
     if (sweeps_.empty() || init_imu_.size() < kInitImuSamples) return 0;
     Sweep& sweep = sweeps_.front();
-    // Start only with IMU coverage (as the RESPLE bridge): a sweep from
+    // Start only with IMU coverage: a sweep from
     // before the first IMU sample would run the filter on LiDAR alone and
     // seed the map before gravity is ever measured.
     if (sweep.start_ns < first_imu_ns_) {
@@ -315,10 +314,9 @@ class Odometry {
       sweeps_.pop_front();
       return -1;
     }
-    // Seed only from a sweep that covers enough distinct map voxels (as the
-    // RESPLE bridge waits for a dense window). A sparse start, e.g. a drone
-    // on the ground with few returns, would otherwise be dead-reckoned as
-    // if moving, and its smeared sweeps would seed the map.
+    // Seed only from a sweep that covers enough distinct map voxels. A sparse
+    // start, e.g. a drone on the ground with few returns, would otherwise be
+    // dead-reckoned as if moving, and its smeared sweeps would seed the map.
     std::vector<size_t> occupied;
     bievr::voxelDownsample(sweep.points, occupied, cfg_.map.voxel_size);
     if (occupied.size() < cfg_.init_min_voxels) {
@@ -347,14 +345,14 @@ class Odometry {
     const Eigen::Matrix3d R0 = CommonUtils::g2R(gravity_sum);
     const Eigen::Quaterniond q_WI = Quater::positify(Eigen::Quaterniond(R0));
 
-    const int64_t start_t_ns = std::max(sweep.start_ns, int64_t(0));
+    const int64_t start_t_ns = sweep.start_ns;
     initFilter(start_t_ns, q_WI);
     estimator_.setGravity((q_WI * gravity_sum).normalized(), kGravity);
     while (!imu_buff_.empty() && imu_buff_.front().time_ns < start_t_ns) imu_buff_.pop_front();
 
     // Seed the map with the whole sweep at the initial pose (static start).
     const bievr::Transform T_W_I(q_WI, Eigen::Vector3d::Zero());
-    map_.integratePoints(T_W_I * sweep.points, &sweep.ranges);
+    map_.integratePoints(T_W_I * sweep.points, sweep.ranges);
     sweep.in_map = true;
     covered_until_ = sweep.end_ns;
     pending_final_.push_back(std::move(sweep));
@@ -363,9 +361,8 @@ class Odometry {
     return 1;
   }
 
-  // RESPLE initFilter, with the resple bridge's fix (the new-knot noise goes
-  // to the newest control point's block, not the bias block) and a bias
-  // random walk (RESPLE: none).
+  // RESPLE initFilter, with the new-knot noise on the newest control point's
+  // block (RESPLE: the bias block) and a bias random walk (RESPLE: none).
   void initFilter(int64_t start_t_ns, const Eigen::Quaterniond& q_init) {
     const double dt_s = double(dt_ns_) * 1e-9;
     const double dt2 = dt_s * dt_s;
@@ -600,7 +597,7 @@ class Odometry {
       out[2] = deskewed.z();
       out[3] = sweep.intensity[i];
     }
-    if (!sweep.in_map && n > 0) map_.integratePoints(world, &sweep.ranges);
+    if (!sweep.in_map && n > 0) map_.integratePoints(world, sweep.ranges);
     ++stats_.sweeps_finalized;
     result.diag = sweep.diag;
     if (observer_) observer_(std::move(result));

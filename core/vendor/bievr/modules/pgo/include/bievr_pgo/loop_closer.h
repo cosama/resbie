@@ -2,10 +2,8 @@
 #define BIEVR_PGO_LOOP_CLOSER_H_
 
 // Scan Context loop closure + GTSAM pose graph, running downstream of the
-// odometry.
-// resbie: synchronous only. addFrame() runs keyframing, loop detection, ICP and
-// iSAM2 inline, so offline replay is deterministic; BIEVR's worker threads,
-// GPS altitude factors and map bundle are removed (map export is the caller's job).
+// odometry. addFrame() runs keyframing, loop detection, ICP and iSAM2 inline,
+// so a replay is deterministic.
 // resbie: the graph also holds the IMU. Consecutive keyframes are linked by a
 // CombinedImuFactor (preintegrated raw IMU, bias random walk) with gravity
 // along world z, so roll and pitch are measured by gravity instead of being
@@ -57,10 +55,6 @@ class LoopCloser {
     double icp_euclidean_fitness_epsilon = 1e-6;
     int icp_ransac_iterations = 0;
     double loop_fitness_score_threshold = 0.3;  // reject loops scoring above this
-    // Seed ICP with Scan Context's yaw instead of identity.
-    // only useful where revisits run in the opposite direction.
-    bool use_sc_yaw_guess = false;
-    double sc_yaw_guess_min_deg = 45.0;
     // Reject a loop whose ICP result would move the current keyframe vertically by more than this [m].
     // A match to the wrong floor or stairwell flight needs a floor height (>= 2-3 m); true loops need
     // < 0.8 m on 99% of the handheld and drone sets. A constant on purpose: a bound that widened with
@@ -99,10 +93,10 @@ class LoopCloser {
   LoopCloser& operator=(const LoopCloser&) = delete;
 
   // Keyframe gating, then (for a keyframe) every stage inline. True if the
-  // frame became a keyframe.
+  // frame became a keyframe. Stamps strictly increase.
   bool addFrame(uint64_t stamp, const Transform& T_W_I, const PointsView& cloud_body);
-  // One IMU sample in the IMU frame (acc in m/s^2), in time order and ahead of
-  // the keyframes it falls before.
+  // One IMU sample in the IMU frame (acc in m/s^2). Stamps strictly increase;
+  // a sample at or before the newest keyframe is dropped (its factor is built).
   void addImu(uint64_t stamp, const Eigen::Vector3d& acc, const Eigen::Vector3d& gyro);
   // End of input: one batch optimization of the whole graph.
   void finish();
@@ -112,13 +106,6 @@ class LoopCloser {
   Stats stats() const;
 
  private:
-  struct PendingFrame {
-    uint64_t stamp;
-    Transform pose;
-    Eigen::Vector3d velocity;  // world frame, from the odometry
-    Cloud::Ptr cloud;  // body frame, downsampled
-  };
-
   struct ImuSample {
     uint64_t stamp;
     Eigen::Vector3d acc, gyro;
@@ -127,10 +114,12 @@ class LoopCloser {
   struct LoopCandidate {
     int from;  // older keyframe
     int to;    // newer keyframe
-    float yaw_diff_rad;
   };
 
-  void integrateKeyframe(PendingFrame frame);
+  // Stores keyframe `cloud` (body frame) and adds its graph factors; `velocity`
+  // is the odometry's, in the world frame.
+  void integrateKeyframe(uint64_t stamp, const Transform& pose, const Eigen::Vector3d& velocity,
+                         const Cloud::Ptr& cloud);
   // World-frame submap of keyframes within +-span of `key`, each at its own pose.
   Cloud::Ptr buildSubmap(int key, int span) const;
   // Relative constraint from ICP, or nullopt if the fitness or vertical-correction test rejects it.

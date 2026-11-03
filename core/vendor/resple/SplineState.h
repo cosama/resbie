@@ -33,15 +33,13 @@ class SplineState
 
     SplineState() {};
 
-    void init(int64_t dt_ns_, int num_knot_, int64_t start_t_ns_, int start_i_ = 0, 
-              Eigen::Vector3d t0 = Eigen::Vector3d::Zero(), Eigen::Quaterniond q0 = Eigen::Quaterniond::Identity())
+    // An empty spline; addOneStateKnot() appends the knots.
+    void init(int64_t dt_ns_, int64_t start_t_ns_, const Eigen::Vector3d& t0, const Eigen::Quaterniond& q0)
     {
-        if_first = true;
         dt_ns = dt_ns_;
         start_t_ns = start_t_ns_;
-        num_knot = num_knot_;
+        num_knot = 0;
         inv_dt = 1e9 / dt_ns;
-        start_i = start_i_;
         pow_inv_dt[0] = 1.0;
         pow_inv_dt[1] = inv_dt;
         pow_inv_dt[2] = inv_dt * inv_dt;
@@ -50,16 +48,6 @@ class SplineState
         ort_delta_idle = {Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()};
         q_idle = {q0, q0, q0};
     }
-
-    void setTimeIntervalNs(int64_t t_ns)
-    {
-        dt_ns = t_ns;
-        inv_dt = 1e9 / dt_ns;
-        pow_inv_dt[0] = 1.0;
-        pow_inv_dt[1] = inv_dt;
-        pow_inv_dt[2] = inv_dt * inv_dt;
-        pow_inv_dt[3] = pow_inv_dt[2] * inv_dt;
-    }    
 
     Eigen::Matrix<double, 24, 1> getRCPs()
     {
@@ -104,96 +92,20 @@ class SplineState
         num_knot++;
     }    
 
-    void setIdles(int idx, const Eigen::Vector3d& t, const Eigen::Vector3d& ort_del, const Eigen::Quaterniond& q_idle0)
-    {
-        t_idle[idx] = t;
-        ort_delta_idle[idx] = ort_del;
-        Eigen::Quaterniond q_del;
-        Quater::exp(ort_del, q_del);        
-        if (idx == 2) {
-            assert(num_knot > 0);
-            q_knots[0] = q_idle[2] * q_del;
-        } else if (idx == 1) {
-            q_idle[2] = q_idle[1] * q_del;
-        } else if (idx == 0) {
-            q_idle[0] = q_idle0;
-            q_idle[1] = q_idle[0] * q_del;
-        }
-    }    
-
-    void setOneStateKnot(int i, const Eigen::Vector3d& pos, const Eigen::Vector3d& ort_del)
-    {
-        t_knots[i] = pos;
-
-        ort_delta[i] = ort_del;
-        Eigen::Quaterniond q_del;
-        Quater::exp(ort_del, q_del);
-        if (i > 0) {
-            q_knots[i] = q_knots[i - 1] * q_del;
-        } else if (i == 0) {
-            q_knots[i] = q_idle[2] * q_del;
-        } else {
-            assert(false && "i  < 0");
-        }
-    }    
-
-    void updateKnots(SplineState* other)
-    {
-        int64_t num_knots_other = other->numKnots();
-        Eigen::Quaterniond ref_ort_old;
-        Eigen::Vector3d ref_trans_old;
-        Eigen::Quaterniond ref_ort_new;
-        Eigen::Vector3d ref_trans_new;
-        if (num_knot <= num_knots_other) {
-            q_idle = other->q_idle;
-            ort_delta_idle = other->ort_delta_idle;
-            t_idle = other->t_idle;
-        }        
-        for (int64_t i = 0; i < num_knots_other; i++) {
-            if (i + other->start_i < num_knot) {
-                setOneStateKnot(i + other->start_i, other->t_knots[i], other->ort_delta[i]);
-            } else {
-                addOneStateKnot(other->t_knots[i], other->ort_delta[i]);
-            }
-        }
-    }    
-
-    int64_t getKnotTimeNs(size_t i) const
-    {
-        return start_t_ns + i * dt_ns;
-    }
-
     int64_t getKnotTimeIntervalNs() const
     {
         return dt_ns;
     }
 
-    Eigen::Vector3d getKnotPos(size_t i) const
-    {
-        return t_knots[i];
-    }
-
-    Eigen::Quaterniond getKnotOrt(size_t i) const
-    {
-        return q_knots.at(i);
-    }    
-
-    Eigen::Vector3d getKnotOrtDel(size_t i) const
-    {
-        return ort_delta.at(i);
-    }       
-
+    // The spline always holds >= 4 knots (Estimator::setState).
     int64_t maxTimeNs() const
     {
-        if (num_knot == 1) {
-           return start_t_ns;
-        }
         return start_t_ns + (num_knot - 1) * dt_ns - 1;
     }
 
     int64_t minTimeNs() const
     {
-        return start_t_ns + dt_ns * (!if_first ?  -1 : 0);
+        return start_t_ns;
     }
 
     int64_t numKnots() const
@@ -207,6 +119,7 @@ class SplineState
         return itpEuclidean<Eigen::Vector3d, Derivative>(time_ns, t_idle, t_knots, J);
     }
 
+    // w_out needs J_w (the only caller of either asks for both).
     void itpQuaternion(int64_t t_ns, Eigen::Quaterniond* q_out = nullptr,
                        Eigen::Vector3d* w_out = nullptr, Jacobian43* J_q = nullptr, Jacobian33* J_w = nullptr) const
     {
@@ -324,16 +237,6 @@ class SplineState
                 q_itps[3].normalize();
                 *q_out = q_itps[3];
             }
-            if (w_out) {
-                baseCoeffsWithTime<1>(p, u);
-                dcoeff = inv_dt * cumulative_blending_matrix * p;
-
-                w_itps[0].setZero();
-                w_itps[1] = 2 * dcoeff[1] * t_delta[1];
-                w_itps[2] = q_delta_scale[2].inverse() * w_itps[1] + 2 * dcoeff[2] * t_delta[2];
-                w_itps[3] = q_delta_scale[3].inverse() * w_itps[2] + 2 * dcoeff[3] * t_delta[3];
-                *w_out = w_itps[3];
-            }
         }
     }  
 
@@ -342,7 +245,6 @@ class SplineState
 
   private:
 
-    bool if_first;
     static const Eigen::Matrix4d blending_matrix;
     static const Eigen::Matrix4d base_coefficients;
     static const Eigen::Matrix4d cumulative_blending_matrix;
@@ -351,7 +253,6 @@ class SplineState
     double inv_dt;
     std::array<double, 4> pow_inv_dt;
     int64_t num_knot;
-    int64_t start_i;
     int64_t start_t_ns;
 
     std::array<Eigen::Vector3d, 3> t_idle;

@@ -51,7 +51,6 @@ RUN apt-get update \
         libmetis5 \
         libpcl-common1.14 \
         libpcl-filters1.14 \
-        libpcl-io1.14 \
         libpcl-registration1.14 \
         libtbb12 \
         libyaml-cpp0.8 \

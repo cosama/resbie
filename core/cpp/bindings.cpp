@@ -484,7 +484,6 @@ py::dict frontEndDefaultConfig() {
   d["map"] = py::dict(py::arg("pixel_size_m") = c.map.px_size,
                       py::arg("voxel_size_m") = c.map.voxel_size,
                       py::arg("normal_tolerance_deg") = c.map.norm_tol_deg,
-                      py::arg("smooth") = c.map.smooth, py::arg("weighted") = c.map.weighted,
                       py::arg("max_size") = c.map.max_size,
                       py::arg("init_min_voxels") = c.init_min_voxels);
   return d;
@@ -513,8 +512,6 @@ py::dict backEndDefaultConfig() {
       py::arg("icp_euclidean_fitness_epsilon") = lc.icp_euclidean_fitness_epsilon,
       py::arg("icp_ransac_iterations") = lc.icp_ransac_iterations,
       py::arg("loop_fitness_score_threshold") = lc.loop_fitness_score_threshold,
-      py::arg("use_sc_yaw_guess") = lc.use_sc_yaw_guess,
-      py::arg("sc_yaw_guess_min_deg") = lc.sc_yaw_guess_min_deg,
       py::arg("loop_max_correction_z") = lc.loop_max_correction_z,
       py::arg("prior_noise_score") = lc.prior_noise_score,
       py::arg("odom_noise_rotation") = lc.odom_noise_rotation,

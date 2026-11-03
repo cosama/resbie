@@ -2,9 +2,8 @@
 #define BIEVR_PGO_CONFIG_LOADER_H_
 
 // resbie: the back end's configuration, its own YAML documents with flat keys
-// (the front end's is resbie/config.h). Only the keys the synchronous closer
-// uses (no publishing, GPS, worker rates or map bundle). Header-only;
-// consumers need yaml-cpp on their include path.
+// (the front end's is resbie/config.h). Header-only; consumers need yaml-cpp
+// on their include path.
 
 #include <bievr_lio/config_loader.h>
 
@@ -38,8 +37,6 @@ inline constexpr const char* kLoopClosureKeys[] = {
     "icp_euclidean_fitness_epsilon",
     "icp_ransac_iterations",
     "loop_fitness_score_threshold",
-    "use_sc_yaw_guess",
-    "sc_yaw_guess_min_deg",
     "loop_max_correction_z",
     "prior_noise_score",
     "odom_noise_rotation",
@@ -91,8 +88,6 @@ inline bool loadLoopClosureConfig(const std::vector<std::string>& documents,
   ok &= ci::read(yaml, "icp_euclidean_fitness_epsilon", c.icp_euclidean_fitness_epsilon, Min::kZero);
   ok &= ci::read(yaml, "icp_ransac_iterations", c.icp_ransac_iterations, Min::kZero);
   ok &= ci::read(yaml, "loop_fitness_score_threshold", c.loop_fitness_score_threshold, Min::kPositive);
-  ok &= ci::read(yaml, "use_sc_yaw_guess", c.use_sc_yaw_guess);
-  ok &= ci::read(yaml, "sc_yaw_guess_min_deg", c.sc_yaw_guess_min_deg, Min::kZero);
   ok &= ci::read(yaml, "loop_max_correction_z", c.loop_max_correction_z, Min::kPositive);
 
   ok &= ci::read(yaml, "prior_noise_score", c.prior_noise_score, Min::kPositive);

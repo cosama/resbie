@@ -256,15 +256,15 @@ def test_blackout_is_bridged_by_imu(tmp_path):
 @pytest.mark.parametrize(
     "extra",
     [
-        "resple: {knot_hz: 50}\n",
+        "spline: {knot_rate: 50}\n",
         "points: {downsample: 0.3}\n",
-        "points: {per_update: 100}\n",
+        "map: {smooth: false}\n",  # removed: always on
         "loop_closure: {enable: false}\n",  # the back end's, not the front end's
         "max_num_threads: 2\n",  # how it runs, a constructor argument
     ],
 )
 def test_front_end_rejects_unknown_keys(tmp_path, extra):
-    # Old (pre-schema), misspelled or misplaced keys must not silently fall back to defaults.
+    # Misspelled, removed or misplaced keys must not silently fall back to defaults.
     with pytest.raises(ValueError):
         resbie.FrontEnd(_config(tmp_path, extra=extra))
 
@@ -272,7 +272,7 @@ def test_front_end_rejects_unknown_keys(tmp_path, extra):
 @pytest.mark.parametrize(
     "config",
     [{"enable": False}, {"loop_closure": {"keyframe_meter_gap": 2.0}}, {"knot_hz": 100},
-     {"max_speed_mps": 30.0}],
+     {"max_speed_mps": 30.0}, {"use_sc_yaw_guess": False}],
 )
 def test_back_end_rejects_unknown_keys(config):
     with pytest.raises(ValueError):
@@ -513,8 +513,8 @@ def test_map_max_size_lru_eviction(tmp_path):
 
 
 def test_single_voxel_sweep_initializes(tmp_path):
-    # The old group loop initialized prev_hash = hashed_points_.back().first, which skipped the
-    # entire sweep whenever all points landed in a single voxel (front == back).
+    # A sweep whose points all land in one voxel still reaches the map (the voxel grouping once
+    # started from the last hash and skipped the only voxel).
     extra = "map: {voxel_size_m: 100.0, init_min_voxels: 1}\n"
     s = resbie.FrontEnd(_config(tmp_path, extra=extra))
     rng = np.random.default_rng(42)

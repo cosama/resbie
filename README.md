@@ -110,9 +110,8 @@ order. Honest point timestamps only.
   dad put his license on, so the uncle showed up without one. We're
   assuming he meant dad's BSD-3, like any good uncle would.
 - **Distant relatives:** Giseop Kim and Ayoung Kim, whose Scan Context
-  (IROS 2018) the uncle reimplemented; nanoflann (BSD), unordered_dense (MIT),
-  and helpers from basalt-headers and log++ (BSD-3), each with its license in
-  its header.
+  (IROS 2018) the uncle reimplemented; nanoflann (BSD) and helpers from
+  basalt-headers (BSD-3), each with its license in its header.
 
 ## Credits
 

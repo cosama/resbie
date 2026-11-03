@@ -21,7 +21,7 @@ class Estimator
     void setState(int64_t dt_ns, int64_t start_t_ns, const Eigen::Vector3d& t0, const Eigen::Quaterniond& q0, 
         const Eigen::Matrix<double, XSIZE, XSIZE>& Q, const Eigen::Matrix<double, XSIZE, XSIZE>& P)
     {
-        spl.init(dt_ns, 0, start_t_ns, 0, t0, q0);
+        spl.init(dt_ns, start_t_ns, t0, q0);
         for (int i = 0; i < 4; i++) {
             spl.addOneStateKnot(t0, Eigen::Vector3d::Zero());
         }        
@@ -77,25 +77,18 @@ class Estimator
         imu_samples = imu_meas.size();
         acc_gated = 0;
         bool updated = false;
-        bool reassociated = false;
         for (int i = 0; i < max_iter; i++) {
             record_nis_ = (i == 0);
             Eigen::Matrix<double, XSIZE, 1> rcpi = getState();
             if (converged) {
                 num_tot_eff = 0;
                 Association::findCorresp(num_tot_eff, &spl, map, assoc, pt_meas);
-                reassociated = true;
-            } else {
-                reassociated = false;
             }
-            if (num_tot_eff > 0 && imu_meas.empty()) {
-                updateLiDAR(pt_meas, num_tot_eff, rcp_prop, cov_prop, reassociated);
-            } else if (num_tot_eff > 0) {
-                updateLiDARInertial(pt_meas, imu_meas, num_tot_eff, rcp_prop, cov_prop, cov_acc, cov_gyro, reassociated);
-            } else if (!imu_meas.empty()) {
-                // resbie: no matched point -> IMU-only update. Upstream broke
-                // out here, so a LiDAR gap also dropped every IMU sample in it.
-                updateLiDARInertial(pt_meas, imu_meas, 0, rcp_prop, cov_prop, cov_acc, cov_gyro, reassociated);
+            if (num_tot_eff > 0 || !imu_meas.empty()) {
+                // resbie: also without a matched point (IMU-only update).
+                // Upstream broke out then, so a LiDAR gap also dropped every
+                // IMU sample in it.
+                update(pt_meas, imu_meas, num_tot_eff, rcp_prop, cov_prop, cov_acc, cov_gyro);
             } else {
                 // resbie: re-association found nothing to measure. Keep the
                 // last iteration's estimate with its posterior covariance
@@ -188,7 +181,6 @@ class Estimator
     Eigen::Vector3d u0 = Eigen::Vector3d::UnitZ();
     Eigen::Matrix<double, 3, 2> B_grav = tangentBasis(Eigen::Vector3d::UnitZ());
     Eigen::Vector2d dg = Eigen::Vector2d::Zero();
-    Eigen::Matrix<double, XSIZE, XSIZE> KH;
     Eigen::Matrix<double, XSIZE, XSIZE> P_post_;
     Eigen::Matrix<double, Eigen::Dynamic, 24> H_24_buf_;
     Eigen::Matrix<double, 24, Eigen::Dynamic> HT_R_inv_24_buf_;
@@ -327,91 +319,22 @@ class Estimator
         dg = xupd.template segment<2>(GRAV_OFFSET);
     }        
 
-    bool updateLiDAR(Eigen::aligned_deque<PointData>& pt_meas, int num_valid, const Eigen::Matrix<double, XSIZE, 1>& x_prop, 
-        const Eigen::Matrix<double, XSIZE, XSIZE>& P_prop, bool reassociated = false)
-    {
-        size_t num_pt = pt_meas.size();
-        if (!reassociated) {
-            #pragma omp parallel for num_threads(NUM_OF_THREAD) schedule(dynamic)
-            for (size_t i = 0; i < num_pt; i++) {
-                PointData& pt_data = pt_meas[i];
-                prepLiDAR(pt_data);
-            }
-        }
-        if (num_valid <= 0) {
-            P_post_ = P_prop;
-            KH.setZero();
-            return false;
-        }
-        const Eigen::Matrix<double, 24, 24> cov = cov_rcp.template topLeftCorner<24, 24>();
-        ensureMeasBuffers(num_valid);
-        auto H_24 = H_24_buf_.topRows(num_valid);
-        auto innv = innv_buf_.head(num_valid);
-        auto R_inv = R_inv_buf_.head(num_valid);
-        auto HT_R_inv_24 = HT_R_inv_24_buf_.leftCols(num_valid);
-        auto K = K_buf_.leftCols(num_valid);
-        int idx_offset = 0;
-        points_gated = 0;
-        for(size_t i = 0; i < num_pt; i++) {
-            const PointData& pt_data = pt_meas[i];
-            if (pt_data.if_valid) {
-                // resbie: var_scale is the Huber weight of this linearization.
-                const double var_pt = pt_data.var_pt * pt_data.var_scale;
-                double lid_cov = (pt_data.H * cov * pt_data.H.transpose())(0, 0) + var_pt;
-                if (record_nis_) point_nis.push_back(pt_data.zp * pt_data.zp / lid_cov);
-                if (gateAccepts(pt_data.zp, lid_cov)) {
-                    innv(idx_offset) = - pt_data.zp;
-                    H_24.row(idx_offset) = pt_data.H;
-                } else {
-                    innv(idx_offset) = 0.0;
-                    H_24.row(idx_offset).setZero();
-                    ++points_gated;
-                }
-                R_inv(idx_offset) = 1.0 / var_pt;
-                idx_offset++;
-            }
-        }        
-        HT_R_inv_24.noalias() = (H_24.transpose().array().rowwise() * R_inv.transpose().array()).matrix();
-        Eigen::Matrix<double, XSIZE, XSIZE> HT_R_inv_H = Eigen::Matrix<double, XSIZE, XSIZE>::Zero();
-        HT_R_inv_H.template topLeftCorner<24, 24>().noalias() = HT_R_inv_24 * H_24;
-
-        Eigen::Matrix<double, XSIZE, XSIZE> S_inv;
-        solvePosteriorCovariance(P_prop, HT_R_inv_H, S_inv);
-
-        K.noalias() = S_inv.template leftCols<24>() * HT_R_inv_24;
-        KH.noalias() = S_inv * HT_R_inv_H;
-        P_post_ = S_inv;
-        Eigen::Matrix<double, XSIZE, 1> delta_cur = (getState() - x_prop);
-        Eigen::Matrix<double, XSIZE, 1> deltax = KH * delta_cur + K * innv - delta_cur;
-        Eigen::Matrix<double, XSIZE, 1> RCPs_post;
-        RCPs_post.noalias() = getState() + deltax;
-        updateState(RCPs_post);
-        return true;
-    }           
-
-    void updateLiDARInertial(Eigen::aligned_deque<PointData>& pt_meas, Eigen::aligned_deque<ImuData>& imu_meas, int num_valid, const Eigen::Matrix<double, XSIZE, 1>& x_prop, 
-        const Eigen::Matrix<double, XSIZE, XSIZE>& P_prop, const Eigen::Vector3d& cov_acc, const Eigen::Vector3d& cov_gyro,
-        bool reassociated = false)
+    // One iteration of the iEKF update on the matched points and the IMU
+    // samples, merged in time order; at least one of either.
+    void update(Eigen::aligned_deque<PointData>& pt_meas, Eigen::aligned_deque<ImuData>& imu_meas, int num_valid, const Eigen::Matrix<double, XSIZE, 1>& x_prop, 
+        const Eigen::Matrix<double, XSIZE, XSIZE>& P_prop, const Eigen::Vector3d& cov_acc, const Eigen::Vector3d& cov_gyro)
     {
         Eigen::Matrix<double, 6, 1> cov_imu_inv =  Eigen::Matrix<double, 6, 1>(1/cov_acc[0], 1/cov_acc[1], 1/cov_acc[2], 1/cov_gyro[0], 1/cov_gyro[1], 1/cov_gyro[2]);
-        if (!reassociated) {
-            #pragma omp parallel for num_threads(NUM_OF_THREAD) schedule(dynamic)
-            for (size_t i = 0; i < pt_meas.size(); i++) {
-                PointData& pt_data = pt_meas[i];
-                prepLiDAR(pt_data); 
-            }
+        #pragma omp parallel for num_threads(NUM_OF_THREAD) schedule(dynamic)
+        for (size_t i = 0; i < pt_meas.size(); i++) {
+            prepLiDAR(pt_meas[i]);
         }
         #pragma omp parallel for num_threads(NUM_OF_THREAD) 
         for (size_t i = 0; i < imu_meas.size(); i++) {
             prepIMU(imu_meas[i]);
         }                
         points_gated = 0;
-        int dim_meas = 6*imu_meas.size() + num_valid;
-        if (dim_meas <= 0) {
-            P_post_ = P_prop;
-            KH.setZero();
-            return;
-        }
+        const int dim_meas = 6*imu_meas.size() + num_valid;
         const Eigen::Matrix<double, 24, 24> cov = cov_rcp.template topLeftCorner<24, 24>();
         ensureMeasBuffers(dim_meas);
         auto H_24 = H_24_buf_.topRows(dim_meas);
@@ -508,6 +431,7 @@ class Estimator
             const Eigen::Matrix<double, 3, 2> W_Hg = R_inv.template segment<3>(row).asDiagonal() * imu_meas[m].H_grav;
             K.template middleCols<3>(row).noalias() += S_inv.template middleCols<2>(GRAV_OFFSET) * W_Hg.transpose();
         }
+        Eigen::Matrix<double, XSIZE, XSIZE> KH;
         KH.noalias() = S_inv * HT_R_inv_H;
         P_post_ = S_inv;
         Eigen::Matrix<double, XSIZE, 1> delta_cur = (getState() - x_prop);

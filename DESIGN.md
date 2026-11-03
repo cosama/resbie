@@ -53,7 +53,7 @@ Every push runs all processing the new data allows before returning.
    sampling needs: it places points with the spline (clamped to its span) to
    look up voxel scores. Selected points are time-sorted into the buffer.
 3. **Filter.** This is RESPLE's `collectMeasurements` and
-   `updateIEKFLiDARInertial`, unchanged except for the map.
+   `updateIEKFLiDARInertial`, on the map above and with the changes below.
 4. **Finalization.** Once the spline over a sweep has left the 4-knot active
    window (`end + 5 dt <= maxTime`), the sweep is final:
    - every point (the full range-filtered sweep, not just the sampled ones)
@@ -68,8 +68,8 @@ bit-identical across runs and OpenMP/TBB thread counts
 
 ## Beyond RESPLE (hard areas)
 
-RESPLE's noise model and filter are kept as they are. The only additions are
-for continuing through areas with little or no LiDAR:
+What resbie changes in RESPLE's filter, mostly to continue through areas
+with little or no LiDAR:
 
 - **Gap handling.** RESPLE skipped the update when no point matched, and
   jumped LiDAR gaps on its constant-velocity model, discarding the gap's IMU.
@@ -176,7 +176,7 @@ outputs:
   deviations become GTSAM's continuous densities at the measured IMU rate.
 - The first keyframe's prior fixes only yaw and position (the gauge); roll
   and pitch are left to gravity.
-- Loop closures (Scan Context + ICP) add relative poses as before. Scan
+- Loop closures (Scan Context + ICP, started from identity) add relative poses. Scan
   Context sees each keyframe cloud levelled on gravity (by the graph's
   corrected attitude, heading kept), not in the body frame, which may be
   tilted or mounted upside down.
@@ -208,13 +208,20 @@ some ambiguity at the start.
 Every edit in `vendor/` is marked `resbie:` at the site. Grep for it to
 enumerate the delta:
 
-- **RESPLE:** ROS removed; `Association` reads BIEVR's map; points arrive in
-  the body frame; Huber variance scale; bias getters.
+- **RESPLE:** ROS and the ikd-tree removed; `Association` reads BIEVR's map;
+  points arrive in the body frame; Huber variance scale; the IMU-only update
+  (one update routine for points, IMU or both); the Mahalanobis point gate;
+  bias random walk; the gravity direction state; the posterior covariance in
+  square-root information form, kept from the last iteration; bias, gravity
+  and covariance getters for the diagnostics.
 - **BIEVR:** the samplers return indices so per-point times survive; sort
-  tie-breaks; the config loader is reduced to its YAML helpers; the LM
-  registration is removed from `ls_optimizer.h`; the loop closer is
-  synchronous only (no worker threads, GPS or map bundle) and carries the
-  IMU (velocity and bias states, CombinedImuFactor, gravity-only prior).
+  tie-breaks; a bounds check on the bump-image write; smoothing and range
+  weighting always on; the config loader is reduced to its YAML helpers; the
+  LM registration is removed (its bump-image sampler is in `bievr_map.h`);
+  log++ is replaced by a one-sink logger (`bievr_lio/log.h`); the loop closer
+  is synchronous only and carries the IMU (velocity and bias states,
+  CombinedImuFactor, gravity-only prior), and Scan Context keeps only loop
+  detection.
 
 ## Point density
 
@@ -250,20 +257,18 @@ Front end, sections by function:
 | `imu` | `acc_noise_std`, `gyro_noise_std` (per sample); `acc_bias_init_std`, `gyro_bias_init_std`; `acc_bias_walk`, `gyro_bias_walk` (per sqrt(s)); `gravity_init_std_deg` (prior on gravity's direction about the start's mean force; 0 fixes it) |
 | `spline` | `knot_hz` (at most the IMU rate, rounded: each knot interval needs >= 1 IMU sample when the LiDAR is starved; init warns otherwise), `iterations`, `init_std`; `pos_noise`, `ort_noise` (motion-model noise of settled control points, m/s and rad/s); `new_pos_noise`, `new_ort_noise` (newest control point) |
 | `points` | `downsample_m`, `informed_voxels`, `noise_std_m`, `huber_delta_m`, `gate_sigma` |
-| `map` | `pixel_size_m`, `voxel_size_m`, `normal_tolerance_deg`, `smooth`, `weighted`, `max_size` (voxels; least recently used ones are evicted beyond it), `init_min_voxels` |
+| `map` | `pixel_size_m`, `voxel_size_m`, `normal_tolerance_deg`, `max_size` (voxels; least recently used ones are evicted beyond it), `init_min_voxels` |
 
 Back end, flat keys: `keyframe_meter_gap`,
 `keyframe_deg_gap`, `keyframe_filter_size`; Scan Context (`sc_*`); ICP
 (`icp_*`, `history_keyframe_search_num`, `loop_fitness_score_threshold`,
-`use_sc_yaw_guess`, `sc_yaw_guess_min_deg`, `loop_max_correction_z`); the
-graph's noises (`prior_noise_score`, `odom_noise_*`, `loop_noise_*`), iSAM2
-(`isam_relinearize_*`) and IMU (`acc_noise_std`, `gyro_noise_std`,
-`acc_bias_walk`, `gyro_bias_walk`, `acc_bias_init_std`, `gyro_bias_init_std`,
-isotropic).
+`loop_max_correction_z`); the graph's noises (`prior_noise_score`,
+`odom_noise_*`, `loop_noise_*`), iSAM2 (`isam_relinearize_*`) and IMU
+(`acc_noise_std`, `gyro_noise_std`, `acc_bias_walk`, `gyro_bias_walk`,
+`acc_bias_init_std`, `gyro_bias_init_std`).
 
-Noises and biases take one number (all axes) or three. RESPLE's parameters
-map one to one: `cov_*` variances become `*_std`, and `std_sys` times
-`sqrt(cov_RCP_*)` becomes `*_noise`.
+The IMU noise and initial-bias stds take one number (all axes) or three; the
+bias walks take one.
 
 ## Building
 

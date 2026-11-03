@@ -1,15 +1,59 @@
 #include "bievr_lio/bievr_map.h"
 
+#include <tbb/parallel_for.h>
+#include <tbb/parallel_sort.h>
+
 #include <Eigen/Eigenvalues>
 #include <algorithm>
 #include <cmath>
 #include <utility>
 #include <vector>
 
-#include "bievr_lio/log++.h"
-#include "bievr_lio/utils.h"
+#include "bievr_lio/log.h"
 
 namespace bievr {
+
+namespace {
+
+// Normalised (2 radius + 1)^2 Gaussian kernel.
+Eigen::MatrixXf buildGaussianKernel(int radius, float sigma) {
+  int size = 2 * radius + 1;
+  Eigen::MatrixXf kernel(size, size);
+  float sum = 0.0f;
+  for (int y = -radius; y <= radius; ++y) {
+    for (int x = -radius; x <= radius; ++x) {
+      float value = std::exp(-(x * x + y * y) / (2 * sigma * sigma));
+      kernel(y + radius, x + radius) = value;
+      sum += value;
+    }
+  }
+  kernel /= sum;
+  return kernel;
+}
+
+// OpenCV's sigma for a kernel of this radius.
+float computeSigmaFromRadius(int radius) {
+  int ksize = 2 * radius + 1;
+  return 0.3f * ((ksize - 1) * 0.5f - 1) + 0.8f;
+}
+
+// Offsets to the 7-connected neighbors of a voxel: the voxel itself plus +-voxel_size along each
+// axis. Order is {0}, +x, -x, +y, -y, +z, -z.
+std::vector<Point> getNeighborOffsets(double voxel_size) {
+  std::vector<Point> offsets;
+  offsets.reserve(7);
+  offsets.push_back(Point::Zero());
+  for (int axis = 0; axis < 3; ++axis) {
+    for (double sign : {1.0, -1.0}) {
+      Point offset = Point::Zero();
+      offset(axis) = sign * voxel_size;
+      offsets.push_back(offset);
+    }
+  }
+  return offsets;
+}
+
+}  // namespace
 
 BIEVRMap::BIEVRMap(Config config) : config_(config) {
   // Precompute the offsets to the 8 corners of a voxel for quick access when projecting the voxel
@@ -31,7 +75,7 @@ BIEVRMap::BIEVRMap(Config config) : config_(config) {
   neighbor_offsets_ = getNeighborOffsets(config_.voxel_size);
 
   // Precompute Gaussian kernel for smoothing
-  double radius = 1.0;
+  const int radius = 1;
   float sigma = computeSigmaFromRadius(radius);
   gauss_kernel_ = buildGaussianKernel(radius, sigma);
 
@@ -159,15 +203,8 @@ uint32_t BIEVRMap::findOrInsert(size_t key) {
   }
 }
 
-bool BIEVRMap::integratePoints(const Pointcloud& cloud, const std::vector<double>* ranges) {
-  if (cloud.empty()) {
-    LOG(I, "No points in cloud to map.");
-    return false;
-  }
-
-  LOG(D, "Integrating " << cloud.size() << " points to the map.");
-
-  // Each entry is {voxel hash, point (xyz, plus range/weight in w)}.
+void BIEVRMap::integratePoints(const Pointcloud& cloud, const std::vector<double>& ranges) {
+  // Each entry is {voxel hash, point (xyz, plus range in w)}.
   hashed_points_.resize(cloud.size());
 
   // Calculate Hash indices for each point
@@ -175,11 +212,7 @@ bool BIEVRMap::integratePoints(const Pointcloud& cloud, const std::vector<double
                     [&](const tbb::blocked_range<size_t>& r) {
                       for (size_t i = r.begin(); i != r.end(); ++i) {
                         hashed_points_[i].second.head(3) = cloud[i];
-                        if (ranges) {
-                          hashed_points_[i].second(3) = (*ranges)[i];  // weight by range
-                        } else {
-                          hashed_points_[i].second(3) = 1;
-                        }
+                        hashed_points_[i].second(3) = ranges[i];
                         hashed_points_[i].first = hashIndex(hashed_points_[i].second.head(3));
                       }
                     });
@@ -247,7 +280,7 @@ bool BIEVRMap::integratePoints(const Pointcloud& cloud, const std::vector<double
         }
       });
 
-  // Update LRU cache in exact same order as d94007a
+  // Touched voxels move to the LRU front in hash order.
   for (uint32_t idx : voxel_slots_) {
     lruMoveToFront(idx);
   }
@@ -260,9 +293,8 @@ bool BIEVRMap::integratePoints(const Pointcloud& cloud, const std::vector<double
   }
 
   if (removal_counter > 0) {
-    LOG(I, "BIEVRMap exceeded max_size. Removed " << removal_counter << " old voxels.");
+    LOG(D, "BIEVRMap exceeded max_size. Removed " << removal_counter << " old voxels.");
   }
-  return true;
 }
 
 bool BIEVRMap::updateNormal(Voxel& voxel) {
@@ -336,9 +368,6 @@ bool BIEVRMap::updateBumpImage(const std::vector<Eigen::Vector4d>& points, Voxel
 
   if (r1 < r0) {
     // No pixel was touched (all points fell out of bounds).
-    if (!config_.smooth) {
-      voxel.bump_smoothed_ = voxel.bump_img_;
-    }
     computeScore(voxel);
     return true;
   }
@@ -356,12 +385,8 @@ bool BIEVRMap::updateBumpImage(const std::vector<Eigen::Vector4d>& points, Voxel
   }
   const Eigen::MatrixXi& mask = normal_change ? changed : changed_dilated;
 
-  if (config_.smooth) {
-    maskedGaussianSmooth(voxel.bump_img_, voxel.bump_weights_, mask, voxel.bump_smoothed_, dr0, dr1,
-                         dc0, dc1);
-  } else {
-    voxel.bump_smoothed_ = voxel.bump_img_;
-  }
+  maskedGaussianSmooth(voxel.bump_img_, voxel.bump_weights_, mask, voxel.bump_smoothed_, dr0, dr1,
+                       dc0, dc1);
 
   computeScore(voxel);
 
@@ -450,7 +475,7 @@ void BIEVRMap::integratePoints(const std::vector<Eigen::Vector4d>& points, Voxel
     double mean_old = voxel.bump_img_(y, x);
     double weight = voxel.bump_weights_(y, x);
     // Limit weighting so points close to the sensor don't get too powerful
-    double weight_new = config_.weighted ? std::min(0.5, 1. / p(3)) : 1.;
+    double weight_new = std::min(0.5, 1. / p(3));
     voxel.bump_weights_(y, x) += weight_new;
     voxel.bump_img_(y, x) = (mean_old * weight + weight_new * p_O(2)) / voxel.bump_weights_(y, x);
     changed(y, x) = 1;
@@ -545,24 +570,11 @@ void BIEVRMap::computeScore(Voxel& voxel) {
   }
 }
 
-Eigen::Vector3i BIEVRMap::getVoxelIdx(const Eigen::Vector3d& point) const {
-  Eigen::Vector3i idx;
-  idx(0) = floor(point.x() * inv_voxel_size_);
-  idx(1) = floor(point.y() * inv_voxel_size_);
-  idx(2) = floor(point.z() * inv_voxel_size_);
-  return idx;
-}
-
 Eigen::Vector3d BIEVRMap::getVoxelOrigin(const Eigen::Vector3d& point) const {
   int hx = static_cast<int>(std::floor(point.x() * inv_voxel_size_));
   int hy = static_cast<int>(std::floor(point.y() * inv_voxel_size_));
   int hz = static_cast<int>(std::floor(point.z() * inv_voxel_size_));
   return Eigen::Vector3d(hx * config_.voxel_size, hy * config_.voxel_size, hz * config_.voxel_size);
-}
-
-bool BIEVRMap::nearestVoxel(const Eigen::Vector3d& point, size_t& result) const {
-  const Voxel* voxel = nearestNeighborVoxel(point, result);
-  return voxel != nullptr;
 }
 
 }  // namespace bievr

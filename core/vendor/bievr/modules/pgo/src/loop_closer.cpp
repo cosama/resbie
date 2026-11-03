@@ -10,12 +10,10 @@
 #include <gtsam/slam/PriorFactor.h>
 
 #include <cmath>
-#include <iostream>
-#include <limits>
 #include <sstream>
 #include <string>
 
-#include "bievr_lio/utils.h"
+#include "bievr_lio/log.h"
 
 namespace bievr {
 namespace {
@@ -107,7 +105,7 @@ bool LoopCloser::addFrame(uint64_t stamp, const Transform& T_W_I, const PointsVi
                   rotation_accumulated_ > keyframe_rad_gap_;
   }
   Eigen::Vector3d velocity = Eigen::Vector3d::Zero();
-  if (has_previous_frame_ && stamp > previous_stamp_) {
+  if (has_previous_frame_) {
     velocity = (T_W_I.translation() - previous_pose_.translation()) /
                (1e-9 * double(stamp - previous_stamp_));
   }
@@ -119,61 +117,56 @@ bool LoopCloser::addFrame(uint64_t stamp, const Transform& T_W_I, const PointsVi
   translation_accumulated_ = 0.0;
   rotation_accumulated_ = 0.0;
 
-  PendingFrame frame;
-  frame.stamp = stamp;
-  frame.pose = T_W_I;
-  frame.velocity = velocity;
-  frame.cloud = Cloud::Ptr(new Cloud());
-  frame.cloud->resize(cloud_body.rows());
+  Cloud::Ptr cloud(new Cloud());
+  cloud->resize(cloud_body.rows());
   for (Eigen::Index i = 0; i < cloud_body.rows(); ++i) {
-    frame.cloud->points[i] = PointT(static_cast<float>(cloud_body(i, 0)), static_cast<float>(cloud_body(i, 1)),
-                                    static_cast<float>(cloud_body(i, 2)));
+    cloud->points[i] = PointT(static_cast<float>(cloud_body(i, 0)), static_cast<float>(cloud_body(i, 1)),
+                              static_cast<float>(cloud_body(i, 2)));
   }
 
-  // BIEVR's keyframe, loop-detect, ICP and iSAM2 workers, one pass each, in
-  // that order, for this keyframe. detectLoop() queries the newest keyframe,
-  // so each keyframe is queried exactly once.
-  integrateKeyframe(std::move(frame));
+  // Keyframe, loop detection, ICP, iSAM2, in that order. detectLoop() queries
+  // the newest keyframe, so each keyframe is queried exactly once.
+  integrateKeyframe(stamp, T_W_I, velocity, cloud);
   const ScanContext::Match match = scan_context_.detectLoop();
   if (match.index >= 0) {
     const int current = static_cast<int>(scan_context_.size()) - 1;
-    const LoopCandidate candidate{match.index, current, match.yaw_diff_rad};
-    std::cout << "[resbie::pgo] Loop candidate found: from kf=" << candidate.from
-              << " to kf=" << candidate.to
-              << ", sc_dist=" << match.distance
-              << ", yaw_diff=" << (match.yaw_diff_rad * 180.0 / M_PI) << " deg" << std::endl;
+    const LoopCandidate candidate{match.index, current};
+    LOG(I, "[resbie::pgo] Loop candidate found: from kf=" << candidate.from << " to kf=" << candidate.to
+           << ", sc_dist=" << match.distance
+           << ", yaw_diff=" << (match.yaw_diff_rad * 180.0 / M_PI) << " deg");
     if (const auto constraint = computeLoopConstraint(candidate)) {
       graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(X(candidate.from), X(candidate.to),
                                                     *constraint, loop_noise_));
       ++num_loops_;
-      std::cout << "[resbie::pgo] >>> Loop ACCEPTED between kf=" << candidate.from
-                << " and kf=" << candidate.to << " (total accepted: " << num_loops_ << ")" << std::endl;
+      LOG(I, "[resbie::pgo] >>> Loop ACCEPTED between kf=" << candidate.from << " and kf="
+             << candidate.to << " (total accepted: " << num_loops_ << ")");
       // What the loop asserts (from^-1 to) next to what the graph held when it
       // came, so a log alone tells true loops from false ones afterwards.
       const gtsam::Pose3 held =
           keyframe_poses_.at(candidate.from).between(keyframe_poses_.at(candidate.to));
-      std::cout << "[resbie::pgo]     loop stamps " << keyframe_stamps_.at(candidate.from) << ' '
-                << keyframe_stamps_.at(candidate.to) << " constraint " << poseLog(*constraint)
-                << " graph " << poseLog(held) << std::endl;
+      LOG(I, "[resbie::pgo]     loop stamps " << keyframe_stamps_.at(candidate.from) << ' '
+             << keyframe_stamps_.at(candidate.to) << " constraint " << poseLog(*constraint)
+             << " graph " << poseLog(held));
     } else {
       ++num_rejected_;
-      std::cout << "[resbie::pgo] --- Loop REJECTED between kf=" << candidate.from
-                << " and kf=" << candidate.to << " (total rejected: " << num_rejected_ << ")" << std::endl;
+      LOG(I, "[resbie::pgo] --- Loop REJECTED between kf=" << candidate.from << " and kf="
+             << candidate.to << " (total rejected: " << num_rejected_ << ")");
     }
   }
   optimize();
   return true;
 }
 
-void LoopCloser::integrateKeyframe(PendingFrame frame) {
+void LoopCloser::integrateKeyframe(uint64_t stamp, const Transform& T_W_I,
+                                   const Eigen::Vector3d& odom_velocity, const Cloud::Ptr& cloud) {
   Cloud::Ptr downsampled(new Cloud());
   pcl::VoxelGrid<PointT> filter;
   filter.setLeafSize(config_.keyframe_filter_size, config_.keyframe_filter_size,
                      config_.keyframe_filter_size);
-  filter.setInputCloud(frame.cloud);
+  filter.setInputCloud(cloud);
   filter.filter(*downsampled);
 
-  const gtsam::Pose3 pose = toPose3(frame.pose);
+  const gtsam::Pose3 pose = toPose3(T_W_I);
 
   const int index = static_cast<int>(keyframe_clouds_.size());
   gtsam::Pose3 odom_delta;  // previous keyframe -> this one, by the odometry
@@ -185,11 +178,10 @@ void LoopCloser::integrateKeyframe(PendingFrame frame) {
   keyframe_clouds_.push_back(downsampled);
   keyframe_odom_poses_.push_back(pose);
   keyframe_poses_.push_back(initial);
-  keyframe_stamps_.push_back(frame.stamp);
+  keyframe_stamps_.push_back(stamp);
 
-  // Scan Context wants the cloud at the same resolution the original pipeline
-  // fed it, in the keyframe's level frame (resbie: not the body frame, which
-  // may be tilted or upside down). Level by the corrected estimate, whose roll
+  // Scan Context gets the downsampled keyframe cloud in the keyframe's level
+  // frame (resbie: not the body frame, which may be tilted or upside down). Level by the corrected estimate, whose roll
   // and pitch the graph's gravity factors keep honest, as the loop check does.
   const Eigen::Matrix3d R_level_body =
       levelFrame(initial).rotation().matrix().transpose() * initial.rotation().matrix();
@@ -202,7 +194,7 @@ void LoopCloser::integrateKeyframe(PendingFrame frame) {
 
   // Odometry velocity, rotated like the correction of the pose it belongs to.
   const Eigen::Vector3d velocity =
-      initial.rotation().matrix() * pose.rotation().matrix().transpose() * frame.velocity;
+      initial.rotation().matrix() * pose.rotation().matrix().transpose() * odom_velocity;
   if (!graph_initialized_) {
     // Gauge: fix yaw and position. Roll and pitch stay free for gravity, so the
     // prior's rotation covariance is loose about the world x and y axes (Pose3
@@ -222,19 +214,18 @@ void LoopCloser::integrateKeyframe(PendingFrame frame) {
         B(0), bias_, gtsam::noiseModel::Diagonal::Sigmas(bias_std)));
     graph_initialized_ = true;
   } else {
-    addMotionFactors(index, odom_delta, frame.stamp, velocity);
+    addMotionFactors(index, odom_delta, stamp, velocity);
   }
   initial_estimate_.insert(X(index), initial);
   initial_estimate_.insert(V(index), velocity);
   initial_estimate_.insert(B(index), bias_);
   // Samples up to this keyframe now belong to the factors ending at it.
-  while (!imu_.empty() && imu_.front().stamp <= frame.stamp) imu_.pop_front();
+  while (!imu_.empty() && imu_.front().stamp <= stamp) imu_.pop_front();
 }
 
 void LoopCloser::addImu(uint64_t stamp, const Eigen::Vector3d& acc, const Eigen::Vector3d& gyro) {
   // Samples at or before the newest keyframe belong to factors already built.
   if (!keyframe_stamps_.empty() && stamp <= keyframe_stamps_.back()) return;
-  if (!imu_.empty() && stamp <= imu_.back().stamp) return;
   imu_.push_back({stamp, acc, gyro});
 }
 
@@ -326,56 +317,17 @@ std::optional<gtsam::Pose3> LoopCloser::computeLoopConstraint(const LoopCandidat
   icp.setInputSource(source);
   icp.setInputTarget(target);
 
-  // Both clouds are in the world frame, so identity is the right start unless the
-  // revisit runs in the opposite direction. Then Scan Context's yaw (measured
-  // between the level frames L) is lifted to the world frame as
-  // L_loop * Rz(+-yaw) * L_curr^-1, a rotation about world z; the sign is not
-  // measured, so both are tried. That best-of-two also weakens the fitness
-  // rejection below, which is why it is off by default.
-  std::vector<Eigen::Matrix4f> guesses;
-  guesses.push_back(Eigen::Matrix4f::Identity());
-  const double yaw = candidate.yaw_diff_rad;
-  const gtsam::Pose3 level_curr = levelFrame(pose_curr);
-  const gtsam::Pose3 level_loop = levelFrame(pose_loop);
-  if (config_.use_sc_yaw_guess) {
-    if (std::abs(yaw) >= std::max(deg2rad(config_.sc_yaw_guess_min_deg), 1e-6)) {
-      for (const double sign : {-1.0, 1.0}) {
-        const gtsam::Pose3 rotation(gtsam::Rot3::Yaw(sign * yaw), gtsam::Point3(0, 0, 0));
-        guesses.push_back(toMatrix4f(level_loop * rotation * level_curr.inverse()));
-      }
-    } else {
-      guesses.push_back(toMatrix4f(level_loop * level_curr.inverse()));
-    }
-  }
-
-  bool converged = false;
-  double best_fitness = std::numeric_limits<double>::max();
-  Eigen::Matrix4f best_transformation = Eigen::Matrix4f::Identity();
+  // Both clouds are in the world frame, so identity is the start.
   Cloud aligned;
-  int guess_idx = 0;
-  for (const auto& guess : guesses) {
-    ++guess_idx;
-    icp.align(aligned, guess);
-    if (!icp.hasConverged()) {
-      std::cout << "[resbie::pgo]   ICP guess " << guess_idx << "/" << guesses.size()
-                << " did not converge." << std::endl;
-      continue;
-    }
-    const double fitness = icp.getFitnessScore();
-    std::cout << "[resbie::pgo]   ICP guess " << guess_idx << "/" << guesses.size()
-              << " converged: fitness=" << fitness
-              << " (threshold=" << config_.loop_fitness_score_threshold << ")" << std::endl;
-    if (fitness < best_fitness) {
-      converged = true;
-      best_fitness = fitness;
-      best_transformation = icp.getFinalTransformation();
-    }
-  }
-
-  if (!converged) {
-    std::cout << "[resbie::pgo]   Loop rejected: ICP did not converge for any guess." << std::endl;
+  icp.align(aligned);
+  if (!icp.hasConverged()) {
+    LOG(I, "[resbie::pgo]   Loop rejected: ICP did not converge.");
     return std::nullopt;
   }
+  const double best_fitness = icp.getFitnessScore();
+  LOG(D, "[resbie::pgo]   ICP converged: fitness=" << best_fitness
+         << " (threshold=" << config_.loop_fitness_score_threshold << ")");
+  const Eigen::Matrix4f best_transformation = icp.getFinalTransformation();
 
   // getFinalTransformation() includes the initial guess, and corrects the current
   // keyframe in the world frame: P_corrected = T_icp * P_curr. BetweenFactor
@@ -383,8 +335,8 @@ std::optional<gtsam::Pose3> LoopCloser::computeLoopConstraint(const LoopCandidat
   const gtsam::Pose3 correction(best_transformation.cast<double>());
   const gtsam::Pose3 asserted = pose_loop.between(correction * pose_curr);
   if (best_fitness > config_.loop_fitness_score_threshold) {
-    std::cout << "[resbie::pgo]   Loop rejected: best fitness " << best_fitness
-              << " > threshold " << config_.loop_fitness_score_threshold << std::endl;
+    LOG(I, "[resbie::pgo]   Loop rejected: fitness " << best_fitness << " > threshold "
+           << config_.loop_fitness_score_threshold);
     logRejected(candidate, asserted, best_fitness);
     return std::nullopt;
   }
@@ -392,8 +344,8 @@ std::optional<gtsam::Pose3> LoopCloser::computeLoopConstraint(const LoopCandidat
   // graph's estimate the loop contradicts. World z is gravity-aligned.
   const gtsam::Point3 shift = (correction * pose_curr).translation() - pose_curr.translation();
   if (std::abs(shift.z()) > config_.loop_max_correction_z) {
-    std::cout << "[resbie::pgo]   Loop rejected: vertical correction " << shift.z() << " m > "
-              << config_.loop_max_correction_z << " m" << std::endl;
+    LOG(I, "[resbie::pgo]   Loop rejected: vertical correction " << shift.z() << " m > "
+           << config_.loop_max_correction_z << " m");
     logRejected(candidate, asserted, best_fitness);
     return std::nullopt;
   }
@@ -404,9 +356,9 @@ void LoopCloser::logRejected(const LoopCandidate& candidate, const gtsam::Pose3&
                              double fitness) const {
   const gtsam::Pose3 held =
       keyframe_poses_.at(candidate.from).between(keyframe_poses_.at(candidate.to));
-  std::cout << "[resbie::pgo]     rejected stamps " << keyframe_stamps_.at(candidate.from) << ' '
-            << keyframe_stamps_.at(candidate.to) << " fitness " << fitness << " constraint "
-            << poseLog(asserted) << " graph " << poseLog(held) << std::endl;
+  LOG(I, "[resbie::pgo]     rejected stamps " << keyframe_stamps_.at(candidate.from) << ' '
+         << keyframe_stamps_.at(candidate.to) << " fitness " << fitness << " constraint "
+         << poseLog(asserted) << " graph " << poseLog(held));
 }
 
 void LoopCloser::optimize() {

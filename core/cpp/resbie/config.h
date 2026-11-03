@@ -77,8 +77,6 @@ struct Config {
     m.voxel_size = 0.5;
     m.norm_tol_deg = 3.0;
     m.max_size = 1500000;
-    m.smooth = true;
-    m.weighted = true;
     return m;
   }();
   size_t init_min_voxels = 100;  // distinct map voxels the seeding sweep must cover
@@ -95,8 +93,8 @@ inline constexpr const char* kKeys[] = {
     "spline.ort_noise", "spline.new_pos_noise", "spline.new_ort_noise",
     "points.downsample_m", "points.informed_voxels", "points.noise_std_m",
     "points.huber_delta_m", "points.gate_sigma",
-    "map.pixel_size_m", "map.voxel_size_m", "map.normal_tolerance_deg", "map.smooth",
-    "map.weighted", "map.max_size", "map.init_min_voxels",
+    "map.pixel_size_m", "map.voxel_size_m", "map.normal_tolerance_deg",
+    "map.max_size", "map.init_min_voxels",
 };
 
 // `documents`: YAML texts, later ones winning per key. False (logged) on an
@@ -147,8 +145,6 @@ inline bool loadConfig(const std::vector<std::string>& documents, Config& c) {
   ok &= ci::read(yaml, "map.pixel_size_m", c.map.px_size, Min::kPositive);
   ok &= ci::read(yaml, "map.voxel_size_m", c.map.voxel_size, Min::kPositive);
   ok &= ci::read(yaml, "map.normal_tolerance_deg", c.map.norm_tol_deg, Min::kPositive);
-  ok &= ci::read(yaml, "map.smooth", c.map.smooth);
-  ok &= ci::read(yaml, "map.weighted", c.map.weighted);
   ok &= ci::read(yaml, "map.max_size", c.map.max_size, Min::kPositive);
   ok &= ci::read(yaml, "map.init_min_voxels", c.init_min_voxels, Min::kPositive);
   return ok;

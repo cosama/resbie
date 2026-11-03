@@ -1,4 +1,9 @@
+#include <tbb/parallel_for.h>
+#include <tbb/parallel_sort.h>
+
 #include <algorithm>
+#include <limits>
+#include <tuple>
 
 #include "bievr_lio/preprocess.h"
 
@@ -146,14 +151,13 @@ void sampleInformed(const BIEVRMap& map, const Pointcloud& points_w, std::vector
     for (size_t i = 0; i < selected.size(); ++i) selected[i] = i;
     return;
   }
-  const Pointcloud& points_raw = points_w;
 
   // Lookup hash for each point based on its transformed position from the registration prior.
-  std::vector<VoxelHashIdx> voxel_entries(points_raw.size());
-  tbb::parallel_for(tbb::blocked_range<size_t>(0, points_raw.size()),
+  std::vector<VoxelHashIdx> voxel_entries(points_w.size());
+  tbb::parallel_for(tbb::blocked_range<size_t>(0, points_w.size()),
                     [&](const tbb::blocked_range<size_t>& r) {
                       for (size_t idx = r.begin(); idx != r.end(); ++idx) {
-                        voxel_entries[idx] = {map.hashIndex(points_raw[idx]), idx};
+                        voxel_entries[idx] = {map.hashIndex(points_w[idx]), idx};
                       }
                     });
 
@@ -206,7 +210,7 @@ void sampleInformed(const BIEVRMap& map, const Pointcloud& points_w, std::vector
   }
 
   // Keep all points in informed voxels, then one point per remaining voxel.
-  selected.reserve(points_raw.size());
+  selected.reserve(points_w.size());
   for (size_t u = 0; u < num_unique; ++u) {
     if (is_informed[u]) {
       const uint32_t start = run_start[u];

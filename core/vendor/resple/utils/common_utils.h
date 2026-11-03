@@ -117,14 +117,3 @@ struct PointData {
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 };
 
-struct Parameters {
-    Eigen::Vector3d cov_acc;
-    Eigen::Vector3d cov_gyro;
-    Eigen::Vector3d gravity;
-    double nn_thresh;
-    double coeff_cov;
-
-    Parameters() {}
-
-    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-};

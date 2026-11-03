@@ -8,7 +8,7 @@
 // front end, bievr_pgo/config_loader.h for the back end).
 
 #include <bievr_lio/common.h>
-#include <bievr_lio/log++.h>
+#include "bievr_lio/log.h"
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
@@ -105,9 +105,10 @@ inline bool extrinsicFromVectors(const std::vector<double>& t_vec, const std::ve
     return false;
   }
   const V3 t(t_vec[0], t_vec[1], t_vec[2]);
-  Rotation R;
-  R << R_vec[0], R_vec[1], R_vec[2], R_vec[3], R_vec[4], R_vec[5], R_vec[6], R_vec[7], R_vec[8];
-  out = Transform(R, t);
+  out = Transform();
+  out.linear() << R_vec[0], R_vec[1], R_vec[2], R_vec[3], R_vec[4], R_vec[5], R_vec[6], R_vec[7],
+      R_vec[8];
+  out.translation() = t;
   return true;
 }
 

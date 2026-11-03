@@ -2,17 +2,10 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdint>
-#include <cstring>
-#include <fstream>
-#include <iostream>
 #include <limits>
 
 namespace bievr {
 namespace {
-
-constexpr char kMagic[4] = {'B', 'S', 'C', 'D'};
-constexpr uint32_t kVersion = 1;
 
 // Azimuth in [0, 360). Equivalent to SC-A-LOAM's four-quadrant xy2theta, but
 // without its fallthrough and its 0/0 at the origin.
@@ -165,13 +158,10 @@ ScanContext::Match ScanContext::search(KeyTree& tree, const std::vector<float>& 
   return match;
 }
 
-void ScanContext::append(Eigen::MatrixXd desc) {
+void ScanContext::add(const ScanContextCloud& cloud_body) {
+  Eigen::MatrixXd desc = makeDescriptor(cloud_body);
   ring_keys_.push_back(toStdVec(ringKey(desc)));
   descriptors_.push_back(std::move(desc));
-}
-
-void ScanContext::add(const ScanContextCloud& cloud_body) {
-  append(makeDescriptor(cloud_body));
 }
 
 ScanContext::Match ScanContext::detectLoop() {
@@ -186,127 +176,6 @@ ScanContext::Match ScanContext::detectLoop() {
   ++tree_counter_;
 
   return search(*tree_, ring_keys_.back(), descriptors_.back(), num_searchable);
-}
-
-ScanContext::Match ScanContext::query(const ScanContextCloud& cloud_body) {
-  if (descriptors_.empty()) return Match{};
-
-  if (!batch_tree_ || batch_size_ != descriptors_.size()) {
-    batch_keys_ = ring_keys_;
-    batch_tree_ = std::make_unique<KeyTree>(config_.num_rings, batch_keys_, 10 /* max leaf */);
-    batch_size_ = descriptors_.size();
-  }
-
-  const Eigen::MatrixXd desc = makeDescriptor(cloud_body);
-  return search(*batch_tree_, toStdVec(ringKey(desc)), desc, descriptors_.size());
-}
-
-bool ScanContext::save(const std::string& path) const { return saveArchive(archive(), path); }
-
-bool ScanContext::saveArchive(const Archive& archive, const std::string& path) {
-  std::ofstream out(path, std::ios::binary);
-  if (!out) {
-    std::cerr << "ScanContext: cannot write " << path << std::endl;
-    return false;
-  }
-
-  const int32_t rings = archive.config.num_rings;
-  const int32_t sectors = archive.config.num_sectors;
-  const uint64_t count = archive.descriptors.size();
-
-  out.write(kMagic, sizeof(kMagic));
-  out.write(reinterpret_cast<const char*>(&kVersion), sizeof(kVersion));
-  out.write(reinterpret_cast<const char*>(&rings), sizeof(rings));
-  out.write(reinterpret_cast<const char*>(&sectors), sizeof(sectors));
-  out.write(reinterpret_cast<const char*>(&archive.config.max_radius), sizeof(double));
-  out.write(reinterpret_cast<const char*>(&archive.config.lidar_height), sizeof(double));
-  out.write(reinterpret_cast<const char*>(&count), sizeof(count));
-
-  // Ring keys are derived, so only the descriptors are stored.
-  for (const auto& desc : archive.descriptors) {
-    out.write(reinterpret_cast<const char*>(desc.data()), desc.size() * sizeof(double));
-  }
-  return out.good();
-}
-
-bool ScanContext::load(const std::string& path) {
-  std::ifstream in(path, std::ios::binary);
-  if (!in) {
-    std::cerr << "ScanContext: cannot read " << path << std::endl;
-    return false;
-  }
-
-  char magic[4];
-  uint32_t version = 0;
-  int32_t rings = 0;
-  int32_t sectors = 0;
-  double max_radius = 0.0;
-  double lidar_height = 0.0;
-  uint64_t count = 0;
-
-  in.read(magic, sizeof(magic));
-  in.read(reinterpret_cast<char*>(&version), sizeof(version));
-  in.read(reinterpret_cast<char*>(&rings), sizeof(rings));
-  in.read(reinterpret_cast<char*>(&sectors), sizeof(sectors));
-  in.read(reinterpret_cast<char*>(&max_radius), sizeof(max_radius));
-  in.read(reinterpret_cast<char*>(&lidar_height), sizeof(lidar_height));
-  in.read(reinterpret_cast<char*>(&count), sizeof(count));
-
-  if (!in || std::memcmp(magic, kMagic, sizeof(kMagic)) != 0) {
-    std::cerr << "ScanContext: " << path << " is not a descriptor database" << std::endl;
-    return false;
-  }
-  if (version != kVersion) {
-    std::cerr << "ScanContext: unsupported version " << version << " in " << path << std::endl;
-    return false;
-  }
-
-  // Descriptors are only comparable under the geometry they were built with, so
-  // the file's geometry wins over whatever was configured.
-  if (rings != config_.num_rings || sectors != config_.num_sectors ||
-      lidar_height != config_.lidar_height || max_radius != config_.max_radius) {
-    std::cerr << "ScanContext: adopting geometry from " << path << " (rings " << rings
-              << ", sectors " << sectors << ", max_radius " << max_radius << ", lidar_height "
-              << lidar_height << ")" << std::endl;
-  }
-  config_.num_rings = rings;
-  config_.num_sectors = sectors;
-  config_.max_radius = max_radius;
-  config_.lidar_height = lidar_height;
-
-  descriptors_.clear();
-  ring_keys_.clear();
-  descriptors_.reserve(count);
-  ring_keys_.reserve(count);
-
-  for (uint64_t i = 0; i < count; ++i) {
-    Eigen::MatrixXd desc(rings, sectors);
-    in.read(reinterpret_cast<char*>(desc.data()), desc.size() * sizeof(double));
-    if (!in) {
-      std::cerr << "ScanContext: " << path << " truncated at descriptor " << i << std::endl;
-      descriptors_.clear();
-      ring_keys_.clear();
-      return false;
-    }
-    append(std::move(desc));
-  }
-
-  tree_.reset();
-  tree_counter_ = 0;
-  batch_tree_.reset();
-  batch_size_ = 0;
-  return true;
-}
-
-void ScanContext::truncate(size_t count) {
-  if (count >= descriptors_.size()) return;
-  descriptors_.resize(count);
-  ring_keys_.resize(count);
-  // Both trees index the vectors that just shrank.
-  tree_.reset();
-  tree_counter_ = 0;
-  batch_tree_.reset();
-  batch_size_ = 0;
 }
 
 }  // namespace bievr

@@ -163,7 +163,6 @@ Row frontEndRow(const resbie::LioResult& s) {
       {"weak_y", g.weak_translation.y()},
       {"weak_z", g.weak_translation.z()},
       {"imu_samples", double(g.imu_samples)},      // IMU samples measured
-      {"acc_gated", double(g.acc_gated)},          // of their acceleration axes, dropped by the 10 m/s^2 residual gate
       {"vel_x", g.velocity.x()},                   // final spline velocity, mean over the sweep, world, m/s
       {"vel_y", g.velocity.y()},
       {"vel_z", g.velocity.z()},

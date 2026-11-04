@@ -64,7 +64,6 @@ struct SweepDiagnostics {
   Eigen::Vector3d weak_translation = Eigen::Vector3d::Zero();  // world direction of info_translation
   size_t matched_voxels = 0;     // distinct map voxels of the matched points, summed over updates
   size_t imu_samples = 0;        // IMU samples measured
-  size_t acc_gated = 0;          // of their acceleration axes, dropped by the 10 m/s^2 residual gate
   Eigen::Vector3d acc_bias = Eigen::Vector3d::Zero();  // at the last update, m/s^2
   Eigen::Vector3d velocity = Eigen::Vector3d::Zero();  // final spline, world, mean over the sweep, m/s
   Eigen::Vector3d gyro_bias = Eigen::Vector3d::Zero();  // at the last update, rad/s
@@ -288,7 +287,6 @@ class Odometry {
       ++d->nis_count;
     }
     d->imu_samples += estimator_.imu_samples;
-    d->acc_gated += estimator_.acc_gated;
     d->acc_bias = estimator_.biasAcc();
     d->gyro_bias = estimator_.biasGyro();
     d->gravity_up = estimator_.gravityUp();
@@ -533,7 +531,7 @@ class Odometry {
         << " weak_sigma " << (d.info_translation > 0.0 ? 1.0 / std::sqrt(d.info_translation) : INFINITY)
         << " pos_sigma " << d.pos_sigma
         << " nis " << (d.nis_count ? d.nis_sum / double(d.nis_count) : NAN)
-        << " voxels " << d.matched_voxels << " imu " << d.imu_samples << " acc_gated " << d.acc_gated
+        << " voxels " << d.matched_voxels << " imu " << d.imu_samples
         << " vel [" << d.velocity.transpose() << "] acc_bias [" << d.acc_bias.transpose() << "]"
         << " gyro_bias [" << d.gyro_bias.transpose() << "] up [" << d.gravity_up.transpose() << "] (sigma "
         << d.gravity_sigma * 180.0 / M_PI << " deg)"

@@ -529,9 +529,8 @@ def test_single_voxel_sweep_initializes(tmp_path):
     assert st["map_voxels"] == 1
 
 
-def test_gated_imu_spike_is_ignored(tmp_path):
-    # A gated axis sets w_imu(k) = 0 in R_inv, so a rejected spike does not count as a
-    # full-confidence bias measurement.
+def test_imu_spike_does_not_throw_the_trajectory(tmp_path):
+    # One 50 m/s^2 / 20 rad/s sample, measured like any other (there is no IMU gate).
     rng = np.random.default_rng(42)
     s_spike = _Run(_config(tmp_path))
     t0 = 1.0

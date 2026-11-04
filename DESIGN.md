@@ -80,6 +80,9 @@ with little or no LiDAR:
   (`points.huber_delta_m`) caps each point's pull. RESPLE gated `|zp|` by a
   fixed threshold unless the filter was certain; a Mahalanobis gate tried
   before fired on about one matched point in 10^5-10^6.
+- **No IMU gate.** Every IMU sample is measured. RESPLE dropped an axis
+  whose residual passed 10 m/s^2 / 5 rad/s, which threw away exactly the
+  IMU that pulls a drifted spline back.
 - **Fixed iteration count:** `spline.iterations` updates per knot, each
   re-associating and linearizing every point once. RESPLE's convergence test
   never fired, so it ran one update more than configured.
@@ -112,8 +115,7 @@ with little or no LiDAR:
   `cpp/bindings.cpp`):
   per sweep, matched points, IMU-only updates, the smallest eigenvalues of the
   LiDAR information (rotation, translation) and the weakest translation
-  direction, position sigma, point NIS, IMU samples and the
-  acceleration axes RESPLE's 10 m/s^2 residual gate dropped, the sweep's mean
+  direction, position sigma, point NIS, IMU samples, the sweep's mean
   velocity, the accelerometer and gyro biases, the estimated up direction
   and its std, and an a-posteriori IMU check (the final trajectory's velocity change per sweep
   minus the IMU's: each IMU sample is otherwise only checked once, before

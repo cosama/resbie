@@ -72,7 +72,6 @@ class Estimator
         Eigen::Matrix<double, XSIZE, 1> rcp_prop = getState();
         point_nis.clear();
         imu_samples = imu_meas.size();
-        acc_gated = 0;
         // resbie: n_iter updates, each re-associating at the current iterate.
         // Upstream's convergence test (step norm > 0.1 over the whole mixed-unit
         // state) never fired, so it always ran n_iter + 1 updates.
@@ -121,10 +120,8 @@ class Estimator
     // update pulls it in); ~1 on average if HPH' + R is honest.
     std::vector<double> point_nis;
     bool record_nis_ = false;
-    // resbie: IMU samples in the last update's first iteration, and how many
-    // of their acceleration axes the 10 m/s^2 residual gate dropped.
+    // resbie: IMU samples in the last update.
     size_t imu_samples = 0;
-    size_t acc_gated = 0;
 
     // resbie: filter covariance (control points, then biases).
     const Eigen::Matrix<double, XSIZE, XSIZE>& covariance() const { return cov_rcp; }
@@ -300,32 +297,16 @@ class Estimator
             } else if ((id_pt < pt_meas.size() && id_imu < imu_meas.size() && pt_meas[id_pt].time_ns >= imu_meas[id_imu].time_ns) ||
                         (id_pt >= pt_meas.size() && id_imu < imu_meas.size())) {
                     const ImuData& imu_data = imu_meas[id_imu];
-                    Eigen::Matrix<double, 6, 1> imu_itp = imu_data.imu_itp;
-                    Eigen::Matrix<double, 6, 24> Hi = imu_data.H;
-                    Eigen::Matrix<double, 6, 1> w_imu = cov_imu_inv;
-
+                    // resbie: no residual gate. RESPLE dropped an axis whose residual
+                    // passed 10 m/s^2 / 5 rad/s (int abs made it 11 / 6); that threw away
+                    // exactly the IMU that pulls a drifted spline back.
                     Eigen::Matrix<double, 6, 1> imu;
                     imu.head<3>() = imu_data.accel;
                     imu.tail<3>() = imu_data.gyro;
-                    for (int i = 0; i < 3; i++) {
-                        if (std::abs(imu(i) - imu_itp(i)) > 10.0) {
-                            if (record_nis_) ++acc_gated;
-                            imu(i) = 0;
-                            imu_itp(i) = 0;
-                            Hi.row(i).setZero();
-                            w_imu(i) = 0.0;
-                        } 
-                        if (std::abs(imu(i+3) - imu_itp(i+3)) > 5.0) {
-                            imu(i+3) = 0;
-                            imu_itp(i+3) = 0;
-                            Hi.row(i+3).setZero();
-                            w_imu(i+3) = 0.0;
-                        }                     
-                    }
                     imu_row_offsets_[id_imu] = idx_offset;
-                    innv.segment<6>(idx_offset) = imu - imu_itp;
-                    H_24.block<6, 24>(idx_offset, 0) = Hi;
-                    R_inv.segment<6>(idx_offset) = w_imu;  
+                    innv.segment<6>(idx_offset) = imu - imu_data.imu_itp;
+                    H_24.block<6, 24>(idx_offset, 0) = imu_data.H;
+                    R_inv.segment<6>(idx_offset) = cov_imu_inv;
                     idx_offset += 6;
                     id_imu++;
             }
@@ -334,7 +315,7 @@ class Estimator
         Eigen::Matrix<double, XSIZE, XSIZE> HT_R_inv_H = Eigen::Matrix<double, XSIZE, XSIZE>::Zero();
         HT_R_inv_H.template topLeftCorner<24, 24>().noalias() = HT_R_inv_24 * H_24;
         // Bias columns are identity blocks; the gravity columns are H_grav on
-        // the accelerometer rows (a gated axis has R_inv = 0).
+        // the accelerometer rows.
         for (size_t m = 0; m < imu_meas.size(); m++) {
             const int row = imu_row_offsets_[m];
             for (int k = 0; k < 6; k++) {

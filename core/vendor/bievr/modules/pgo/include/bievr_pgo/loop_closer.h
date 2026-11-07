@@ -55,30 +55,26 @@ class LoopCloser {
     double icp_euclidean_fitness_epsilon = 1e-6;
     int icp_ransac_iterations = 0;
     double loop_fitness_score_threshold = 0.3;  // reject loops scoring above this
-    // Reject a loop whose ICP result would move the current keyframe vertically by more than this [m].
-    // A match to the wrong floor or stairwell flight needs a floor height (>= 2-3 m); true loops need
-    // < 0.8 m on 99% of the handheld and drone sets. A constant on purpose: a bound that widened with
-    // distance would let a one-floor-up return through. Platforms whose odometry sinks further between
-    // loops (e.g. a vehicle) need a larger value.
-    double loop_max_correction_z = 1.5;
 
     double prior_noise_score = 1e-12;
-    double odom_noise_rotation = 1e-6;
-    double odom_noise_translation = 1e-4;
+    double odom_noise_rotation = 7.6e-5;
+    double odom_noise_translation = 0.0004;
     double loop_noise_score = 0.5;
     double loop_noise_cauchy_c = 1.0;
+    double loop_noise_rotation = 0.001225;
+    double loop_noise_translation = 0.0225;
 
     double isam_relinearize_threshold = 0.01;
     int isam_relinearize_skip = 1;
 
     // IMU: per-sample noise, bias random walk per sqrt(s), initial bias
-    // uncertainty (defaults: the front end's).
-    Eigen::Vector3d acc_noise_std = Eigen::Vector3d::Constant(1.0);
-    Eigen::Vector3d gyro_noise_std = Eigen::Vector3d::Constant(std::sqrt(0.1));
-    double acc_bias_walk = 0.001;
-    double gyro_bias_walk = 0.0001;
-    Eigen::Vector3d acc_bias_init_std = Eigen::Vector3d::Constant(std::sqrt(0.2));
-    Eigen::Vector3d gyro_bias_init_std = Eigen::Vector3d::Constant(std::sqrt(0.2));
+    // uncertainty.
+    Eigen::Vector3d acc_noise_std = Eigen::Vector3d::Constant(2.7);
+    Eigen::Vector3d gyro_noise_std = Eigen::Vector3d::Constant(0.07);
+    double acc_bias_walk = 2.8e-3;
+    double gyro_bias_walk = 1.3e-4;
+    Eigen::Vector3d acc_bias_init_std = Eigen::Vector3d::Constant(0.15);
+    Eigen::Vector3d gyro_bias_init_std = Eigen::Vector3d::Constant(0.01);
   };
 
   struct Stats {
@@ -116,13 +112,19 @@ class LoopCloser {
     int to;    // newer keyframe
   };
 
+  struct LoopEdge {
+    int from;
+    int to;
+    gtsam::Pose3 constraint;
+  };
+
   // Stores keyframe `cloud` (body frame) and adds its graph factors; `velocity`
   // is the odometry's, in the world frame.
   void integrateKeyframe(uint64_t stamp, const Transform& pose, const Eigen::Vector3d& velocity,
                          const Cloud::Ptr& cloud);
   // World-frame submap of keyframes within +-span of `key`, each at its own pose.
   Cloud::Ptr buildSubmap(int key, int span) const;
-  // Relative constraint from ICP, or nullopt if the fitness or vertical-correction test rejects it.
+  // Relative constraint from ICP, or nullopt if the fitness test rejects it.
   std::optional<gtsam::Pose3> computeLoopConstraint(const LoopCandidate& candidate);
   // Logs what a rejected (converged) ICP result asserted next to what the graph held.
   void logRejected(const LoopCandidate& candidate, const gtsam::Pose3& asserted, double fitness) const;
@@ -153,12 +155,16 @@ class LoopCloser {
   ScanContext scan_context_;
 
   gtsam::NonlinearFactorGraph graph_;
+  gtsam::NonlinearFactorGraph base_graph_;
   gtsam::Values initial_estimate_;
+  gtsam::Values base_initial_estimate_;
+  std::vector<LoopEdge> loop_edges_;
   std::unique_ptr<gtsam::ISAM2> isam_;
   bool graph_initialized_ = false;
 
   gtsam::SharedNoiseModel odom_noise_;
   gtsam::SharedNoiseModel loop_noise_;
+  gtsam::SharedNoiseModel loop_noise_gnc_;
 
   std::deque<ImuSample> imu_;  // samples after the newest keyframe
   boost::shared_ptr<gtsam::PreintegrationCombinedParams> imu_params_;  // set at the 2nd keyframe

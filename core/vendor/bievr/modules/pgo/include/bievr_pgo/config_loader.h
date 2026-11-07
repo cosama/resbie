@@ -37,12 +37,13 @@ inline constexpr const char* kLoopClosureKeys[] = {
     "icp_euclidean_fitness_epsilon",
     "icp_ransac_iterations",
     "loop_fitness_score_threshold",
-    "loop_max_correction_z",
     "prior_noise_score",
     "odom_noise_rotation",
     "odom_noise_translation",
     "loop_noise_score",
     "loop_noise_cauchy_c",
+    "loop_noise_rotation",
+    "loop_noise_translation",
     "isam_relinearize_threshold",
     "isam_relinearize_skip",
     "acc_noise_std",
@@ -88,13 +89,14 @@ inline bool loadLoopClosureConfig(const std::vector<std::string>& documents,
   ok &= ci::read(yaml, "icp_euclidean_fitness_epsilon", c.icp_euclidean_fitness_epsilon, Min::kZero);
   ok &= ci::read(yaml, "icp_ransac_iterations", c.icp_ransac_iterations, Min::kZero);
   ok &= ci::read(yaml, "loop_fitness_score_threshold", c.loop_fitness_score_threshold, Min::kPositive);
-  ok &= ci::read(yaml, "loop_max_correction_z", c.loop_max_correction_z, Min::kPositive);
 
   ok &= ci::read(yaml, "prior_noise_score", c.prior_noise_score, Min::kPositive);
   ok &= ci::read(yaml, "odom_noise_rotation", c.odom_noise_rotation, Min::kPositive);
   ok &= ci::read(yaml, "odom_noise_translation", c.odom_noise_translation, Min::kPositive);
   ok &= ci::read(yaml, "loop_noise_score", c.loop_noise_score, Min::kPositive);
   ok &= ci::read(yaml, "loop_noise_cauchy_c", c.loop_noise_cauchy_c, Min::kPositive);
+  ok &= ci::read(yaml, "loop_noise_rotation", c.loop_noise_rotation, Min::kPositive);
+  ok &= ci::read(yaml, "loop_noise_translation", c.loop_noise_translation, Min::kPositive);
 
   ok &= ci::read(yaml, "isam_relinearize_threshold", c.isam_relinearize_threshold, Min::kZero);
   ok &= ci::read(yaml, "isam_relinearize_skip", c.isam_relinearize_skip, Min::kPositive);

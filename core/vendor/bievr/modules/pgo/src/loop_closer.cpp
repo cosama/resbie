@@ -5,6 +5,9 @@
 #include <pcl/registration/icp.h>
 
 #include <gtsam/inference/Symbol.h>
+#include <gtsam/nonlinear/GaussNewtonOptimizer.h>
+#include <gtsam/nonlinear/GncOptimizer.h>
+#include <gtsam/nonlinear/GncParams.h>
 #include <gtsam/nonlinear/LevenbergMarquardtOptimizer.h>
 #include <gtsam/slam/BetweenFactor.h>
 #include <gtsam/slam/PriorFactor.h>
@@ -91,9 +94,17 @@ void LoopCloser::initNoiseModels() {
   loop_noise_ = gtsam::noiseModel::Robust::Create(
       gtsam::noiseModel::mEstimator::Cauchy::Create(config_.loop_noise_cauchy_c),
       gtsam::noiseModel::Diagonal::Variances(loop_variance));
+
+  gtsam::Vector6 gnc_loop_variance;
+  gnc_loop_variance << config_.loop_noise_rotation, config_.loop_noise_rotation,
+      config_.loop_noise_rotation, config_.loop_noise_translation,
+      config_.loop_noise_translation, config_.loop_noise_translation;
+  loop_noise_gnc_ = gtsam::noiseModel::Diagonal::Variances(gnc_loop_variance);
 }
 
 bool LoopCloser::addFrame(uint64_t stamp, const Transform& T_W_I, const PointsView& cloud_body) {
+  if (cloud_body.rows() == 0) return false;
+
   // Gate first: it is a pose delta only, and it saves copying the clouds of
   // frames that will not become keyframes.
   bool is_keyframe = !has_previous_frame_;
@@ -137,6 +148,7 @@ bool LoopCloser::addFrame(uint64_t stamp, const Transform& T_W_I, const PointsVi
     if (const auto constraint = computeLoopConstraint(candidate)) {
       graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(X(candidate.from), X(candidate.to),
                                                     *constraint, loop_noise_));
+      loop_edges_.push_back({candidate.from, candidate.to, *constraint});
       ++num_loops_;
       LOG(I, "[resbie::pgo] >>> Loop ACCEPTED between kf=" << candidate.from << " and kf="
              << candidate.to << " (total accepted: " << num_loops_ << ")");
@@ -204,21 +216,31 @@ void LoopCloser::integrateKeyframe(uint64_t stamp, const Transform& T_W_I,
     gtsam::Matrix6 cov = gtsam::Matrix6::Zero();
     cov.topLeftCorner<3, 3>() = R.transpose() * Eigen::Vector3d(relaxed, relaxed, tight).asDiagonal() * R;
     cov.bottomRightCorner<3, 3>() = tight * Eigen::Matrix3d::Identity();
-    graph_.add(gtsam::PriorFactor<gtsam::Pose3>(X(0), pose,
-                                                gtsam::noiseModel::Gaussian::Covariance(cov)));
-    graph_.add(gtsam::PriorFactor<gtsam::Vector3>(
-        V(0), velocity, gtsam::noiseModel::Isotropic::Sigma(3, kLooseVelocitySigma)));
+    const auto prior_x =
+        gtsam::PriorFactor<gtsam::Pose3>(X(0), pose, gtsam::noiseModel::Gaussian::Covariance(cov));
+    const auto prior_v = gtsam::PriorFactor<gtsam::Vector3>(
+        V(0), velocity, gtsam::noiseModel::Isotropic::Sigma(3, kLooseVelocitySigma));
     gtsam::Vector6 bias_std;
     bias_std << config_.acc_bias_init_std, config_.gyro_bias_init_std;
-    graph_.add(gtsam::PriorFactor<gtsam::imuBias::ConstantBias>(
-        B(0), bias_, gtsam::noiseModel::Diagonal::Sigmas(bias_std)));
+    const auto prior_b = gtsam::PriorFactor<gtsam::imuBias::ConstantBias>(
+        B(0), bias_, gtsam::noiseModel::Diagonal::Sigmas(bias_std));
+    graph_.add(prior_x);
+    graph_.add(prior_v);
+    graph_.add(prior_b);
+    base_graph_.add(prior_x);
+    base_graph_.add(prior_v);
+    base_graph_.add(prior_b);
     graph_initialized_ = true;
   } else {
     addMotionFactors(index, odom_delta, stamp, velocity);
   }
+
   initial_estimate_.insert(X(index), initial);
   initial_estimate_.insert(V(index), velocity);
   initial_estimate_.insert(B(index), bias_);
+  base_initial_estimate_.insert(X(index), pose);
+  base_initial_estimate_.insert(V(index), odom_velocity);
+  base_initial_estimate_.insert(B(index), gtsam::imuBias::ConstantBias());
   // Samples up to this keyframe now belong to the factors ending at it.
   while (!imu_.empty() && imu_.front().stamp <= stamp) imu_.pop_front();
 }
@@ -247,7 +269,10 @@ boost::shared_ptr<gtsam::PreintegrationCombinedParams> LoopCloser::makeImuParams
 
 void LoopCloser::addMotionFactors(int index, const gtsam::Pose3& odom_delta, uint64_t stamp,
                                   const Eigen::Vector3d& velocity) {
-  graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(X(index - 1), X(index), odom_delta, odom_noise_));
+  const auto odom_factor =
+      gtsam::BetweenFactor<gtsam::Pose3>(X(index - 1), X(index), odom_delta, odom_noise_);
+  graph_.add(odom_factor);
+  base_graph_.add(odom_factor);
 
   // The noise densities need the IMU rate, so two samples.
   if (!imu_params_ && imu_.size() >= 2) {
@@ -271,8 +296,11 @@ void LoopCloser::addMotionFactors(int index, const gtsam::Pose3& odom_delta, uin
       t = s.stamp;
     }
     if (t < stamp) pim.integrateMeasurement(last->acc, last->gyro, 1e-9 * double(stamp - t));
-    graph_.add(gtsam::CombinedImuFactor(X(index - 1), V(index - 1), X(index), V(index), B(index - 1),
-                                        B(index), pim));
+    const auto imu_factor =
+        gtsam::CombinedImuFactor(X(index - 1), V(index - 1), X(index), V(index), B(index - 1),
+                                 B(index), pim);
+    graph_.add(imu_factor);
+    base_graph_.add(imu_factor);
   } else {
     // No IMU between them (a gap in the IMU stream, or no rate yet): the bias
     // still drifts by its random walk over the interval, and the velocity is
@@ -281,11 +309,15 @@ void LoopCloser::addMotionFactors(int index, const gtsam::Pose3& odom_delta, uin
     gtsam::Vector6 walk;
     walk << gtsam::Vector3::Constant(config_.acc_bias_walk * sqrt_dt),
         gtsam::Vector3::Constant(config_.gyro_bias_walk * sqrt_dt);
-    graph_.add(gtsam::BetweenFactor<gtsam::imuBias::ConstantBias>(
+    const auto bias_factor = gtsam::BetweenFactor<gtsam::imuBias::ConstantBias>(
         B(index - 1), B(index), gtsam::imuBias::ConstantBias(),
-        gtsam::noiseModel::Diagonal::Sigmas(walk.cwiseMax(1e-9))));  // walk 0: near-rigid, not singular
-    graph_.add(gtsam::PriorFactor<gtsam::Vector3>(
-        V(index), velocity, gtsam::noiseModel::Isotropic::Sigma(3, kLooseVelocitySigma)));
+        gtsam::noiseModel::Diagonal::Sigmas(walk.cwiseMax(1e-9)));  // walk 0: near-rigid, not singular
+    const auto vel_factor = gtsam::PriorFactor<gtsam::Vector3>(
+        V(index), velocity, gtsam::noiseModel::Isotropic::Sigma(3, kLooseVelocitySigma));
+    graph_.add(bias_factor);
+    graph_.add(vel_factor);
+    base_graph_.add(bias_factor);
+    base_graph_.add(vel_factor);
   }
 }
 
@@ -351,15 +383,6 @@ std::optional<gtsam::Pose3> LoopCloser::computeLoopConstraint(const LoopCandidat
     logRejected(candidate, asserted, best_fitness);
     return std::nullopt;
   }
-  // Where the loop would move the current keyframe, with the loop keyframe held: the part of the
-  // graph's estimate the loop contradicts. World z is gravity-aligned.
-  const gtsam::Point3 shift = (correction * pose_curr).translation() - pose_curr.translation();
-  if (std::abs(shift.z()) > config_.loop_max_correction_z) {
-    LOG(I, "[resbie::pgo]   Loop rejected: vertical correction " << shift.z() << " m > "
-           << config_.loop_max_correction_z << " m");
-    logRejected(candidate, asserted, best_fitness);
-    return std::nullopt;
-  }
   return asserted;
 }
 
@@ -384,9 +407,61 @@ void LoopCloser::optimize() {
 void LoopCloser::finish() {
   if (!graph_initialized_) return;
   optimize();
-  readEstimate(gtsam::LevenbergMarquardtOptimizer(isam_->getFactorsUnsafe(),
-                                                  isam_->calculateEstimate())
-                   .optimize());
+  if (loop_edges_.empty()) {
+    readEstimate(
+        gtsam::LevenbergMarquardtOptimizer(base_graph_, isam_->calculateEstimate()).optimize());
+    return;
+  }
+
+  gtsam::GaussNewtonParams base_gn_params;
+  base_gn_params.maxIterations = 3;
+  const gtsam::Values inlier_init =
+      gtsam::GaussNewtonOptimizer(base_graph_, base_initial_estimate_, base_gn_params).optimize();
+
+  gtsam::NonlinearFactorGraph gnc_graph = base_graph_;
+  using IndexVector = gtsam::GncParams<gtsam::GaussNewtonParams>::IndexVector;
+  IndexVector known_inliers(base_graph_.size());
+  for (size_t i = 0; i < base_graph_.size(); ++i) known_inliers[i] = i;
+
+  for (const LoopEdge& edge : loop_edges_) {
+    gnc_graph.add(
+        gtsam::BetweenFactor<gtsam::Pose3>(X(edge.from), X(edge.to), edge.constraint, loop_noise_gnc_));
+  }
+
+  gtsam::GaussNewtonParams gn_params;
+  gn_params.maxIterations = 10;
+  gtsam::GncParams<gtsam::GaussNewtonParams> gnc_params(gn_params);
+  gnc_params.setKnownInliers(known_inliers);
+  gnc_params.setRelativeCostTol(-1.0);
+  gtsam::GncOptimizer<gtsam::GncParams<gtsam::GaussNewtonParams>> gnc(gnc_graph, inlier_init,
+                                                                      gnc_params);
+  gnc.setInlierCostThresholdsAtProbability(0.99);
+  gtsam::Vector barc_sq = gnc.getInlierCostThresholds();
+  // GTSAM 4.2's GncOptimizer::initializeMu() loops over all factors in nfg_
+  // (ignoring knownInliers), so base-graph thresholds must be set high to
+  // prevent IMU/odometry residuals from inflating mu.
+  for (size_t i = 0; i < base_graph_.size(); ++i) barc_sq[i] = 1e30;
+  gnc.setInlierCostThresholds(barc_sq);
+  const gtsam::Values gnc_result = gnc.optimize();
+  const gtsam::Vector weights = gnc.getWeights();
+  gtsam::NonlinearFactorGraph final_graph = base_graph_;
+  size_t gnc_kept = 0, gnc_dropped = 0;
+  for (size_t k = 0; k < loop_edges_.size(); ++k) {
+    if (weights[base_graph_.size() + k] > 0.5) {
+      ++gnc_kept;
+      const LoopEdge& edge = loop_edges_[k];
+      final_graph.add(gtsam::BetweenFactor<gtsam::Pose3>(X(edge.from), X(edge.to), edge.constraint,
+                                                         loop_noise_gnc_));
+    } else {
+      ++gnc_dropped;
+    }
+  }
+  num_loops_ = gnc_kept;
+  num_rejected_ += gnc_dropped;
+  LOG(I, "[resbie::pgo] GNC finish: kept=" << gnc_kept << " dropped=" << gnc_dropped
+         << " total_loops=" << loop_edges_.size());
+  const gtsam::Values& lm_init = (gnc_kept > 0) ? gnc_result : inlier_init;
+  readEstimate(gtsam::LevenbergMarquardtOptimizer(final_graph, lm_init).optimize());
 }
 
 void LoopCloser::readEstimate(const gtsam::Values& estimate) {

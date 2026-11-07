@@ -272,7 +272,7 @@ def test_front_end_rejects_unknown_keys(tmp_path, extra):
 @pytest.mark.parametrize(
     "config",
     [{"enable": False}, {"loop_closure": {"keyframe_meter_gap": 2.0}}, {"knot_hz": 100},
-     {"max_speed_mps": 30.0}, {"use_sc_yaw_guess": False}],
+     {"max_speed_mps": 30.0}, {"use_sc_yaw_guess": False}, {"loop_max_correction_z": 1.5}],
 )
 def test_back_end_rejects_unknown_keys(config):
     with pytest.raises(ValueError):
@@ -558,11 +558,22 @@ def test_one_update_per_knot_and_imu_counted_once(tmp_path):
     np.testing.assert_array_equal(diag[2:, col["imu_samples"]], SWEEP_IMU)
 
 
-def test_back_end_imu_model_defaults_to_the_front_ends():
-    front, back = resbie.FrontEnd.DEFAULT_CONFIG["imu"], resbie.BackEnd.DEFAULT_CONFIG
-    for key in ("acc_noise_std", "gyro_noise_std", "acc_bias_init_std", "gyro_bias_init_std",
-                "acc_bias_walk", "gyro_bias_walk"):
-        assert back[key] == front[key], key
+def test_back_end_noise_defaults():
+    back = resbie.BackEnd.DEFAULT_CONFIG
+    expected = {
+        "acc_noise_std": [2.7, 2.7, 2.7],
+        "gyro_noise_std": [0.07, 0.07, 0.07],
+        "acc_bias_init_std": [0.15, 0.15, 0.15],
+        "gyro_bias_init_std": [0.01, 0.01, 0.01],
+        "acc_bias_walk": 2.8e-3,
+        "gyro_bias_walk": 1.3e-4,
+        "odom_noise_rotation": 7.6e-5,
+        "odom_noise_translation": 0.0004,
+        "loop_noise_rotation": 0.001225,
+        "loop_noise_translation": 0.0225,
+    }
+    for key, val in expected.items():
+        assert back[key] == val, key
 
 
 def test_back_end_one_imu_sample_between_keyframes():

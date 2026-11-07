@@ -383,6 +383,15 @@ std::optional<gtsam::Pose3> LoopCloser::computeLoopConstraint(const LoopCandidat
     logRejected(candidate, asserted, best_fitness);
     return std::nullopt;
   }
+  // Where the loop would move the current keyframe, with the loop keyframe held: the part of the
+  // graph's estimate the loop contradicts. World z is gravity-aligned.
+  const gtsam::Point3 shift = (correction * pose_curr).translation() - pose_curr.translation();
+  if (std::abs(shift.z()) > config_.loop_max_correction_z) {
+    LOG(I, "[resbie::pgo]   Loop rejected: vertical correction " << shift.z() << " m > "
+           << config_.loop_max_correction_z << " m");
+    logRejected(candidate, asserted, best_fitness);
+    return std::nullopt;
+  }
   return asserted;
 }
 

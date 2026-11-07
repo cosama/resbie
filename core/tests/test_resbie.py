@@ -272,7 +272,7 @@ def test_front_end_rejects_unknown_keys(tmp_path, extra):
 @pytest.mark.parametrize(
     "config",
     [{"enable": False}, {"loop_closure": {"keyframe_meter_gap": 2.0}}, {"knot_hz": 100},
-     {"max_speed_mps": 30.0}, {"use_sc_yaw_guess": False}, {"loop_max_correction_z": 1.5}],
+     {"max_speed_mps": 30.0}, {"use_sc_yaw_guess": False}],
 )
 def test_back_end_rejects_unknown_keys(config):
     with pytest.raises(ValueError):
@@ -561,6 +561,7 @@ def test_one_update_per_knot_and_imu_counted_once(tmp_path):
 def test_back_end_noise_defaults():
     back = resbie.BackEnd.DEFAULT_CONFIG
     expected = {
+        "loop_max_correction_z": 1.5,
         "acc_noise_std": [2.7, 2.7, 2.7],
         "gyro_noise_std": [0.07, 0.07, 0.07],
         "acc_bias_init_std": [0.15, 0.15, 0.15],

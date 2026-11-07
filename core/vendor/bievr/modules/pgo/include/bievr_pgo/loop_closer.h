@@ -55,6 +55,12 @@ class LoopCloser {
     double icp_euclidean_fitness_epsilon = 1e-6;
     int icp_ransac_iterations = 0;
     double loop_fitness_score_threshold = 0.3;  // reject loops scoring above this
+    // Reject a loop whose ICP result would move the current keyframe vertically by more than this [m].
+    // A match to the wrong floor or stairwell flight needs a floor height (>= 2-3 m); true loops need
+    // < 0.8 m on 99% of the handheld and drone sets. A constant on purpose: a bound that widened with
+    // distance would let a one-floor-up return through. Platforms whose odometry sinks further between
+    // loops (e.g. a vehicle) need a larger value.
+    double loop_max_correction_z = 1.5;
 
     double prior_noise_score = 1e-12;
     double odom_noise_rotation = 7.6e-5;
@@ -124,7 +130,7 @@ class LoopCloser {
                          const Cloud::Ptr& cloud);
   // World-frame submap of keyframes within +-span of `key`, each at its own pose.
   Cloud::Ptr buildSubmap(int key, int span) const;
-  // Relative constraint from ICP, or nullopt if the fitness test rejects it.
+  // Relative constraint from ICP, or nullopt if the fitness or vertical-correction test rejects it.
   std::optional<gtsam::Pose3> computeLoopConstraint(const LoopCandidate& candidate);
   // Logs what a rejected (converged) ICP result asserted next to what the graph held.
   void logRejected(const LoopCandidate& candidate, const gtsam::Pose3& asserted, double fitness) const;

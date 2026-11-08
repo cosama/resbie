@@ -48,12 +48,6 @@ class LoopCloser {
 
     ScanContext::Config scan_context;
 
-    int history_keyframe_search_num = 25;  // [-N, N] keyframes stacked into the target submap
-    double icp_max_correspondence_distance = 150.0;
-    int icp_max_iterations = 100;
-    double icp_transformation_epsilon = 1e-6;
-    double icp_euclidean_fitness_epsilon = 1e-6;
-    int icp_ransac_iterations = 0;
     double loop_fitness_score_threshold = 0.3;  // reject loops scoring above this
     // Reject a loop whose ICP result would move the current keyframe vertically by more than this [m].
     // A match to the wrong floor or stairwell flight needs a floor height (>= 2-3 m); true loops need
@@ -124,13 +118,17 @@ class LoopCloser {
     gtsam::Pose3 constraint;
   };
 
+  struct PreparedSubmap;
+
   // Stores keyframe `cloud` (body frame) and adds its graph factors; `velocity`
   // is the odometry's, in the world frame.
   void integrateKeyframe(uint64_t stamp, const Transform& pose, const Eigen::Vector3d& velocity,
                          const Cloud::Ptr& cloud);
-  // World-frame submap of keyframes within +-span of `key`, each at its own pose.
-  Cloud::Ptr buildSubmap(int key, int span) const;
-  // Relative constraint from ICP, or nullopt if the fitness or vertical-correction test rejects it.
+  // Local submap (coarse + fine voxel grids, KD-trees, normals, and covariances)
+  // around `anchor_key` in its own body frame using local odometry poses.
+  std::shared_ptr<PreparedSubmap> getOrPrepareSubmap(int anchor_key) const;
+  // Relative constraint from GICP, or nullopt if the fitness, overlap, degeneracy, or
+  // vertical-correction test rejects it.
   std::optional<gtsam::Pose3> computeLoopConstraint(const LoopCandidate& candidate);
   // Logs what a rejected (converged) ICP result asserted next to what the graph held.
   void logRejected(const LoopCandidate& candidate, const gtsam::Pose3& asserted, double fitness) const;
@@ -157,6 +155,7 @@ class LoopCloser {
   std::vector<gtsam::Pose3> keyframe_odom_poses_;
   std::vector<gtsam::Pose3> keyframe_poses_;  // optimized
   std::vector<uint64_t> keyframe_stamps_;
+  mutable std::vector<std::shared_ptr<PreparedSubmap>> prepared_submaps_;
 
   ScanContext scan_context_;
 

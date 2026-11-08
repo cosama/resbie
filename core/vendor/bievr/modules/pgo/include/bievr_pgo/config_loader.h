@@ -30,12 +30,6 @@ inline constexpr const char* kLoopClosureKeys[] = {
     "sc_search_ratio",
     "sc_dist_threshold",
     "sc_tree_making_period",
-    "history_keyframe_search_num",
-    "icp_max_correspondence_distance",
-    "icp_max_iterations",
-    "icp_transformation_epsilon",
-    "icp_euclidean_fitness_epsilon",
-    "icp_ransac_iterations",
     "loop_fitness_score_threshold",
     "loop_max_correction_z",
     "prior_noise_score",
@@ -83,12 +77,6 @@ inline bool loadLoopClosureConfig(const std::vector<std::string>& documents,
   ok &= ci::read(yaml, "sc_dist_threshold", sc.dist_threshold, Min::kPositive);
   ok &= ci::read(yaml, "sc_tree_making_period", sc.tree_making_period, Min::kPositive);
 
-  ok &= ci::read(yaml, "history_keyframe_search_num", c.history_keyframe_search_num, Min::kZero);
-  ok &= ci::read(yaml, "icp_max_correspondence_distance", c.icp_max_correspondence_distance, Min::kPositive);
-  ok &= ci::read(yaml, "icp_max_iterations", c.icp_max_iterations, Min::kPositive);
-  ok &= ci::read(yaml, "icp_transformation_epsilon", c.icp_transformation_epsilon, Min::kZero);
-  ok &= ci::read(yaml, "icp_euclidean_fitness_epsilon", c.icp_euclidean_fitness_epsilon, Min::kZero);
-  ok &= ci::read(yaml, "icp_ransac_iterations", c.icp_ransac_iterations, Min::kZero);
   ok &= ci::read(yaml, "loop_fitness_score_threshold", c.loop_fitness_score_threshold, Min::kPositive);
   ok &= ci::read(yaml, "loop_max_correction_z", c.loop_max_correction_z, Min::kPositive);
 

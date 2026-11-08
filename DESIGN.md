@@ -182,12 +182,14 @@ outputs:
   deviations become GTSAM's continuous densities at the measured IMU rate.
 - The first keyframe's prior fixes only yaw and position (the gauge); roll
   and pitch are left to gravity.
-- Loop closures (Scan Context + ICP, started from identity) add relative poses. Scan
-  Context sees each keyframe cloud levelled on gravity (by the graph's
-  corrected attitude, heading kept), not in the body frame, which may be
-  tilted or mounted upside down.
+- Loop closures (Scan Context + GICP over local odometry submaps, seeded from
+  the graph's relative pose) add relative poses. Scan Context sees each
+  keyframe cloud levelled on gravity (by the graph's corrected attitude,
+  heading kept), not in the body frame, which may be tilted or mounted upside
+  down.
 - iSAM2 updates incrementally per keyframe (loop search uses the corrected
-  map); `finish()` runs one batch optimization of the whole graph.
+  map); `finish()` runs Graduated Non-Convexity (GNC) over the loop candidates
+  followed by one batch Levenberg-Marquardt optimization of the whole graph.
 
 `keyframes()` returns the optimized keyframes; carrying their
 correction to every pose (blend by distance and angle between keyframes)
@@ -210,6 +212,7 @@ some ambiguity at the start.
 - `vendor/bievr`: edited copies of the BIEVR map, preprocess, and the pgo
   and scancontext modules, from upstream `b458505`
   (`BIEVR-LIO-SLAM`, with the loop closer made synchronous).
+- `vendor/small_gicp`: unmodified GICP headers from upstream `57c1106` (`v1.0.1`).
 
 Every edit in `vendor/` is marked `resbie:` at the site. Grep for it to
 enumerate the delta:
@@ -225,8 +228,9 @@ enumerate the delta:
   weighting always on; the config loader is reduced to its YAML helpers; the
   LM registration is removed (its bump-image sampler is in `bievr_map.h`);
   log++ is replaced by a one-sink logger (`bievr_lio/log.h`); the loop closer
-  is synchronous only and carries the IMU (velocity and bias states,
-  CombinedImuFactor, gravity-only prior), and Scan Context keeps only loop
+  is synchronous only, carries the IMU (velocity and bias states,
+  CombinedImuFactor, gravity-only prior), verifies loops with GICP over local
+  odometry submaps and GNC at `finish()`, and Scan Context keeps only loop
   detection.
 
 ## Point density
@@ -267,7 +271,7 @@ Front end, sections by function:
 
 Back end, flat keys: `keyframe_meter_gap`,
 `keyframe_deg_gap`, `keyframe_filter_size`; Scan Context (`sc_*`); ICP
-(`icp_*`, `history_keyframe_search_num`, `loop_fitness_score_threshold`,
+(`icp_filter_size`, `loop_fitness_score_threshold`,
 `loop_max_correction_z`); the graph's noises (`prior_noise_score`,
 `odom_noise_*`, `loop_noise_*`), iSAM2 (`isam_relinearize_*`) and IMU
 (`acc_noise_std`, `gyro_noise_std`, `acc_bias_walk`, `gyro_bias_walk`,

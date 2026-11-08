@@ -1,9 +1,8 @@
 #include "bievr_pgo/loop_closer.h"
 
-#include <pcl/common/transforms.h>
 #include <pcl/filters/voxel_grid.h>
-#include <pcl/registration/icp.h>
 
+#include <Eigen/Eigenvalues>
 #include <gtsam/inference/Symbol.h>
 #include <gtsam/nonlinear/GaussNewtonOptimizer.h>
 #include <gtsam/nonlinear/GncOptimizer.h>
@@ -12,13 +11,32 @@
 #include <gtsam/slam/BetweenFactor.h>
 #include <gtsam/slam/PriorFactor.h>
 
+#include <small_gicp/ann/kdtree.hpp>
+#include <small_gicp/factors/gicp_factor.hpp>
+#include <small_gicp/points/point_cloud.hpp>
+#include <small_gicp/registration/reduction.hpp>
+#include <small_gicp/registration/registration.hpp>
+#include <small_gicp/util/downsampling.hpp>
+#include <small_gicp/util/normal_estimation.hpp>
+
+#include <algorithm>
 #include <cmath>
+#include <limits>
 #include <sstream>
 #include <string>
 
 #include "bievr_lio/log.h"
 
 namespace bievr {
+
+// resbie: local odometry submap window and GICP loop verification.
+struct LoopCloser::PreparedSubmap {
+  small_gicp::PointCloud::Ptr coarse;
+  small_gicp::KdTree<small_gicp::PointCloud>::Ptr coarse_tree;
+  small_gicp::PointCloud::Ptr fine;
+  small_gicp::KdTree<small_gicp::PointCloud>::Ptr fine_tree;
+};
+
 namespace {
 
 using gtsam::symbol_shorthand::B;  // IMU bias
@@ -33,6 +51,18 @@ constexpr double kFreeRotationVariance = 1.0;  // rad^2
 constexpr double kIntegrationVariance = 1e-8;
 constexpr double kGravity = 9.81;  // m/s^2, the front end's
 
+// Local odometry submap window and GICP loop verification constants.
+constexpr int kSubmapKfRadius = 5;            // [-5, +5] keyframes around anchor keyframe
+constexpr double kSubmapMaxDistM = 20.0;      // max relative odometry distance [m]
+constexpr int kGicpNeighbors = 20;            // k-NN for covariance/normal estimation
+constexpr int kGicpCoarseIterations = 30;     // GICP max iterations for coarse stage
+constexpr int kGicpMaxIterations = 50;        // GICP max iterations for fine stage
+constexpr double kGicpRotEps = 1e-3;          // fine stage rotation convergence [rad]
+constexpr double kGicpTransEps = 1e-3;        // fine stage translation convergence [m]
+constexpr double kMinLoopOverlap = 0.60;      // minimum fine-submap inlier fraction
+constexpr double kMinHessian3dEig = 500.0;    // minimum smallest translational eigenvalue
+constexpr double kMinHessianPlaneEig = 800.0; // minimum middle translational eigenvalue
+
 gtsam::Pose3 toPose3(const Transform& t) {
   return gtsam::Pose3(gtsam::Rot3(t.linear()), gtsam::Point3(t.translation()));
 }
@@ -43,8 +73,6 @@ Transform toTransform(const gtsam::Pose3& p) {
   iso.translation() = p.translation();
   return Transform(iso);
 }
-
-Eigen::Matrix4f toMatrix4f(const gtsam::Pose3& p) { return p.matrix().cast<float>(); }
 
 double deg2rad(double deg) { return deg * M_PI / 180.0; }
 
@@ -65,6 +93,69 @@ std::string poseLog(const gtsam::Pose3& p) {
   s.precision(9);
   s << p.x() << ' ' << p.y() << ' ' << p.z() << ' ' << r.x() << ' ' << r.y() << ' ' << r.z();
   return s.str();
+}
+
+struct FitMetrics {
+  double fitness = std::numeric_limits<double>::infinity();
+  double overlap = 0.0;
+};
+
+FitMetrics evaluateFit(const small_gicp::PointCloud& target_fine,
+                       const small_gicp::PointCloud& source_fine,
+                       const small_gicp::KdTree<small_gicp::PointCloud>& target_fine_tree,
+                       const Eigen::Isometry3d& T_target_source,
+                       double max_radius) {
+  FitMetrics m;
+  if (source_fine.empty() || target_fine.empty()) return m;
+  const double max_sq = max_radius * max_radius;
+  size_t inliers = 0;
+  double sum_sq = 0.0;
+  for (size_t i = 0; i < source_fine.size(); ++i) {
+    const Eigen::Vector4d p_trans = T_target_source * source_fine.point(i);
+    size_t idx = 0;
+    double sq_dist = 0.0;
+    if (target_fine_tree.nearest_neighbor_search(p_trans, &idx, &sq_dist) > 0 &&
+        sq_dist <= max_sq) {
+      ++inliers;
+      const Eigen::Vector3d diff = (p_trans - target_fine.point(idx)).head<3>();
+      const Eigen::Vector3d n_tgt = target_fine.normal(idx).head<3>();
+      const double d_plane = (n_tgt.squaredNorm() > 0.5) ? n_tgt.dot(diff) : diff.norm();
+      sum_sq += d_plane * d_plane;
+    }
+  }
+  m.overlap = static_cast<double>(inliers) / static_cast<double>(source_fine.size());
+  if (inliers > 0) {
+    m.fitness = sum_sq / static_cast<double>(inliers);
+  }
+  return m;
+}
+
+small_gicp::PointCloud buildLocalSubmap(const std::vector<LoopCloser::Cloud::Ptr>& keyframe_clouds,
+                                        const std::vector<gtsam::Pose3>& keyframe_odom_poses,
+                                        int anchor_key, int span) {
+  // Build submap in anchor_key's body frame using local relative odometry so
+  // old loop closures never distort the local submap geometry.
+  std::vector<Eigen::Vector3d> pts;
+  const int count = static_cast<int>(keyframe_clouds.size());
+  if (anchor_key < 0 || anchor_key >= count) return small_gicp::PointCloud();
+  const gtsam::Pose3& anchor_odom = keyframe_odom_poses[anchor_key];
+  const double max_dist_sq = kSubmapMaxDistM * kSubmapMaxDistM;
+  for (int i = -span; i <= span; ++i) {
+    const int near = anchor_key + i;
+    if (near < 0 || near >= count) continue;
+    const gtsam::Pose3 rel_odom =
+        (near == anchor_key) ? gtsam::Pose3::Identity()
+                             : anchor_odom.between(keyframe_odom_poses[near]);
+    if (rel_odom.translation().squaredNorm() > max_dist_sq) continue;
+    const Eigen::Matrix3d R = rel_odom.rotation().matrix();
+    const Eigen::Vector3d t = rel_odom.translation();
+    const auto& cloud = *keyframe_clouds[near];
+    pts.reserve(pts.size() + cloud.size());
+    for (const auto& pt : cloud.points) {
+      pts.push_back(R * Eigen::Vector3d(pt.x, pt.y, pt.z) + t);
+    }
+  }
+  return small_gicp::PointCloud(pts);
 }
 
 }  // namespace
@@ -191,6 +282,7 @@ void LoopCloser::integrateKeyframe(uint64_t stamp, const Transform& T_W_I,
   keyframe_odom_poses_.push_back(pose);
   keyframe_poses_.push_back(initial);
   keyframe_stamps_.push_back(stamp);
+  prepared_submaps_.push_back(nullptr);
 
   // Scan Context gets the downsampled keyframe cloud in the keyframe's level
   // frame (resbie: not the body frame, which may be tilted or upside down). Level by the corrected estimate, whose roll
@@ -321,75 +413,116 @@ void LoopCloser::addMotionFactors(int index, const gtsam::Pose3& odom_delta, uin
   }
 }
 
-LoopCloser::Cloud::Ptr LoopCloser::buildSubmap(int key, int span) const {
-  // Each cloud goes at its own pose, so the submap is geometrically coherent and
-  // ICP's output is a world-frame correction rather than a relative transform.
-  Cloud::Ptr submap(new Cloud());
+std::shared_ptr<LoopCloser::PreparedSubmap> LoopCloser::getOrPrepareSubmap(
+    int anchor_key) const {
   const int count = static_cast<int>(keyframe_clouds_.size());
-  for (int i = -span; i <= span; ++i) {
-    const int near = key + i;
-    if (near < 0 || near >= count) continue;
-    Cloud transformed;
-    pcl::transformPointCloud(*keyframe_clouds_[near], transformed, toMatrix4f(keyframe_poses_[near]));
-    *submap += transformed;
+  if (anchor_key < 0 || anchor_key >= count) return nullptr;
+  const bool complete = (anchor_key + kSubmapKfRadius < count);
+  if (complete && prepared_submaps_[anchor_key]) {
+    return prepared_submaps_[anchor_key];
   }
-  if (submap->empty()) return submap;
-
-  Cloud::Ptr downsampled(new Cloud());
-  pcl::VoxelGrid<PointT> filter;
-  filter.setLeafSize(config_.icp_filter_size, config_.icp_filter_size, config_.icp_filter_size);
-  filter.setInputCloud(submap);
-  filter.filter(*downsampled);
-  return downsampled;
+  const double v = std::max(0.05, config_.icp_filter_size);
+  const small_gicp::PointCloud raw =
+      buildLocalSubmap(keyframe_clouds_, keyframe_odom_poses_, anchor_key, kSubmapKfRadius);
+  auto prep = std::make_shared<PreparedSubmap>();
+  prep->coarse = small_gicp::voxelgrid_sampling(raw, 2.0 * v);
+  prep->fine = small_gicp::voxelgrid_sampling(raw, v);
+  if (!prep->coarse->empty()) {
+    prep->coarse_tree =
+        std::make_shared<small_gicp::KdTree<small_gicp::PointCloud>>(prep->coarse);
+    small_gicp::estimate_covariances(*prep->coarse, *prep->coarse_tree, kGicpNeighbors);
+  }
+  if (!prep->fine->empty()) {
+    prep->fine_tree =
+        std::make_shared<small_gicp::KdTree<small_gicp::PointCloud>>(prep->fine);
+    small_gicp::estimate_normals_covariances(*prep->fine, *prep->fine_tree, kGicpNeighbors);
+  }
+  if (complete) {
+    prepared_submaps_[anchor_key] = prep;
+  }
+  return prep;
 }
 
 std::optional<gtsam::Pose3> LoopCloser::computeLoopConstraint(const LoopCandidate& candidate) {
-  Cloud::Ptr source = buildSubmap(candidate.to, 0);
-  Cloud::Ptr target = buildSubmap(candidate.from, config_.history_keyframe_search_num);
-  if (source->empty() || target->empty()) return std::nullopt;
+  const auto source_submap = getOrPrepareSubmap(candidate.to);
+  const auto target_submap = getOrPrepareSubmap(candidate.from);
+  if (!source_submap || !target_submap || !source_submap->coarse || !source_submap->fine ||
+      !target_submap->coarse || !target_submap->fine ||
+      source_submap->coarse->size() <= 10 || source_submap->fine->size() <= 10 ||
+      target_submap->coarse->size() <= 10 || target_submap->fine->size() <= 10) {
+    return std::nullopt;
+  }
 
-  const gtsam::Pose3 pose_curr = keyframe_poses_.at(candidate.to);
-  const gtsam::Pose3 pose_loop = keyframe_poses_.at(candidate.from);
+  const gtsam::Pose3& pose_loop = keyframe_poses_.at(candidate.from);
+  const gtsam::Pose3& pose_curr = keyframe_poses_.at(candidate.to);
+  const Eigen::Isometry3d T_init(pose_loop.between(pose_curr).matrix());
 
-  pcl::IterativeClosestPoint<PointT, PointT> icp;
-  icp.setMaxCorrespondenceDistance(config_.icp_max_correspondence_distance);
-  icp.setMaximumIterations(config_.icp_max_iterations);
-  icp.setTransformationEpsilon(config_.icp_transformation_epsilon);
-  icp.setEuclideanFitnessEpsilon(config_.icp_euclidean_fitness_epsilon);
-  icp.setRANSACIterations(config_.icp_ransac_iterations);
-  icp.setInputSource(source);
-  icp.setInputTarget(target);
+  const double v = std::max(0.05, config_.icp_filter_size);
+  const double coarse_max_corr = 6.0 * v;
+  const double fine_max_corr = 3.0 * v;
 
-  // Both clouds are in the world frame, so identity is the start.
-  Cloud aligned;
-  icp.align(aligned);
-  if (!icp.hasConverged()) {
+  small_gicp::Registration<small_gicp::GICPFactor, small_gicp::SerialReduction> reg_coarse;
+  reg_coarse.rejector.max_dist_sq = coarse_max_corr * coarse_max_corr;
+  reg_coarse.optimizer.max_iterations = kGicpCoarseIterations;
+  const small_gicp::RegistrationResult res_coarse = reg_coarse.align(
+      *target_submap->coarse, *source_submap->coarse, *target_submap->coarse_tree, T_init);
+
+  const Eigen::Isometry3d fine_init =
+      res_coarse.converged ? res_coarse.T_target_source : T_init;
+
+  small_gicp::Registration<small_gicp::GICPFactor, small_gicp::SerialReduction> reg_fine;
+  reg_fine.rejector.max_dist_sq = fine_max_corr * fine_max_corr;
+  reg_fine.optimizer.max_iterations = kGicpMaxIterations;
+  reg_fine.criteria.rotation_eps = kGicpRotEps;
+  reg_fine.criteria.translation_eps = kGicpTransEps;
+  const small_gicp::RegistrationResult res_fine = reg_fine.align(
+      *target_submap->fine, *source_submap->fine, *target_submap->fine_tree, fine_init);
+
+  if (!res_fine.converged) {
     LOG(I, "[resbie::pgo]   Loop rejected: ICP did not converge.");
     return std::nullopt;
   }
-  const double best_fitness = icp.getFitnessScore();
-  LOG(D, "[resbie::pgo]   ICP converged: fitness=" << best_fitness
-         << " (threshold=" << config_.loop_fitness_score_threshold << ")");
-  const Eigen::Matrix4f best_transformation = icp.getFinalTransformation();
 
-  // getFinalTransformation() includes the initial guess, and corrects the current
-  // keyframe in the world frame: P_corrected = T_icp * P_curr. BetweenFactor
-  // wants P_loop^-1 * P_corrected.
-  const gtsam::Pose3 correction(best_transformation.cast<double>());
-  const gtsam::Pose3 asserted = pose_loop.between(correction * pose_curr);
-  if (best_fitness > config_.loop_fitness_score_threshold) {
-    LOG(I, "[resbie::pgo]   Loop rejected: fitness " << best_fitness << " > threshold "
-           << config_.loop_fitness_score_threshold);
-    logRejected(candidate, asserted, best_fitness);
+  const Eigen::Isometry3d& T_final = res_fine.T_target_source;
+  const FitMetrics fit =
+      evaluateFit(*target_submap->fine, *source_submap->fine, *target_submap->fine_tree,
+                  T_final, 2.0 * v);
+
+  const gtsam::Pose3 asserted(T_final.matrix());
+  if (fit.overlap < kMinLoopOverlap) {
+    LOG(I, "[resbie::pgo]   Loop rejected: overlap " << fit.overlap << " < " << kMinLoopOverlap);
+    logRejected(candidate, asserted, fit.fitness);
     return std::nullopt;
   }
+  if (!std::isfinite(fit.fitness) || fit.fitness > config_.loop_fitness_score_threshold) {
+    LOG(I, "[resbie::pgo]   Loop rejected: fitness " << fit.fitness << " > threshold "
+           << config_.loop_fitness_score_threshold);
+    logRejected(candidate, asserted, fit.fitness);
+    return std::nullopt;
+  }
+
+  const Eigen::Matrix3d H_tt = 0.5 * (res_fine.H.bottomRightCorner<3, 3>() +
+                                      res_fine.H.bottomRightCorner<3, 3>().transpose());
+  const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es_tt(H_tt, Eigen::EigenvaluesOnly);
+  const Eigen::Vector3d ev_tt = es_tt.eigenvalues();
+  const bool is_degenerate =
+      !(ev_tt(2) > 0.0) ||
+      (ev_tt(0) < kMinHessian3dEig) ||
+      (ev_tt(1) < kMinHessianPlaneEig);
+  if (is_degenerate) {
+    LOG(I, "[resbie::pgo]   Loop rejected: degenerate Hessian eigenvalues [" << ev_tt(0) << ", "
+           << ev_tt(1) << ", " << ev_tt(2) << "]");
+    logRejected(candidate, asserted, fit.fitness);
+    return std::nullopt;
+  }
+
   // Where the loop would move the current keyframe, with the loop keyframe held: the part of the
   // graph's estimate the loop contradicts. World z is gravity-aligned.
-  const gtsam::Point3 shift = (correction * pose_curr).translation() - pose_curr.translation();
+  const gtsam::Point3 shift = (pose_loop * asserted).translation() - pose_curr.translation();
   if (std::abs(shift.z()) > config_.loop_max_correction_z) {
     LOG(I, "[resbie::pgo]   Loop rejected: vertical correction " << shift.z() << " m > "
            << config_.loop_max_correction_z << " m");
-    logRejected(candidate, asserted, best_fitness);
+    logRejected(candidate, asserted, fit.fitness);
     return std::nullopt;
   }
   return asserted;
@@ -422,6 +555,8 @@ void LoopCloser::finish() {
     return;
   }
 
+  // resbie: Graduated Non-Convexity (GNC) over loop candidates with base
+  // graph (priors, odometry, CombinedImuFactor) marked as known inliers.
   gtsam::GaussNewtonParams base_gn_params;
   base_gn_params.maxIterations = 3;
   const gtsam::Values inlier_init =

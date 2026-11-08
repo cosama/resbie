@@ -272,7 +272,7 @@ def test_front_end_rejects_unknown_keys(tmp_path, extra):
 @pytest.mark.parametrize(
     "config",
     [{"enable": False}, {"loop_closure": {"keyframe_meter_gap": 2.0}}, {"knot_hz": 100},
-     {"max_speed_mps": 30.0}, {"use_sc_yaw_guess": False}],
+     {"max_speed_mps": 30.0}, {"use_sc_yaw_guess": False}, {"icp_max_correspondence_distance": 5.0}],
 )
 def test_back_end_rejects_unknown_keys(config):
     with pytest.raises(ValueError):
@@ -309,7 +309,7 @@ def test_front_end_rejects_bad_ranges(tmp_path, lidar):
 
 @pytest.mark.parametrize(
     "config",
-    [{"acc_noise_std": -1.0}, {"sc_num_rings": 0}, {"icp_max_iterations": -5},
+    [{"acc_noise_std": -1.0}, {"sc_num_rings": 0}, {"icp_filter_size": -0.1},
      {"keyframe_filter_size": 0.0}, {"loop_noise_cauchy_c": 0.0}, {"gyro_noise_std": [0.1, 0.1]}],
 )
 def test_back_end_rejects_bad_values(config):

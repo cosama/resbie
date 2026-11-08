@@ -12,7 +12,7 @@ find_package(TBB REQUIRED)
 find_package(OpenMP REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(GTSAM CONFIG REQUIRED)
-find_package(PCL REQUIRED COMPONENTS common filters registration)
+find_package(PCL REQUIRED COMPONENTS common filters)
 set(PYBIND11_FINDPYTHON ON)
 find_package(pybind11 CONFIG REQUIRED)
 
@@ -34,6 +34,7 @@ target_include_directories(_core PRIVATE
   "${BIEVR}/include"
   "${BIEVR}/modules/scancontext/include"
   "${BIEVR}/modules/pgo/include"
+  "${CMAKE_CURRENT_SOURCE_DIR}/vendor/small_gicp/include"
   "${GTSAM_INCLUDE_DIR}"
   ${PCL_INCLUDE_DIRS}
 )

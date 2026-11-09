@@ -28,6 +28,8 @@
 #include "bievr_lio/common.h"
 #include "bievr_scancontext/scan_context.h"
 
+class STDescManager;
+
 namespace bievr {
 
 class LoopCloser {
@@ -57,33 +59,42 @@ class LoopCloser {
     double loop_max_correction_z = 1.5;
 
     double prior_noise_score = 1e-12;
-    double odom_noise_rotation = 7.6e-5;
-    double odom_noise_translation = 0.0004;
-    double loop_noise_score = 0.5;
+    double odom_noise_rotation = 2.5e-5;
+    double odom_noise_translation = 2.5e-4;
+    double loop_noise_score = 0.2;
     double loop_noise_cauchy_c = 1.0;
-    double loop_noise_rotation = 0.001225;
-    double loop_noise_translation = 0.0225;
+    double loop_noise_rotation = 0.000402961;
+    double loop_noise_translation = 0.0140625;
 
     double isam_relinearize_threshold = 0.01;
     int isam_relinearize_skip = 1;
 
     // IMU: per-sample noise, bias random walk per sqrt(s), initial bias
     // uncertainty.
-    Eigen::Vector3d acc_noise_std = Eigen::Vector3d::Constant(2.7);
-    Eigen::Vector3d gyro_noise_std = Eigen::Vector3d::Constant(0.07);
-    double acc_bias_walk = 2.8e-3;
-    double gyro_bias_walk = 1.3e-4;
-    Eigen::Vector3d acc_bias_init_std = Eigen::Vector3d::Constant(0.15);
-    Eigen::Vector3d gyro_bias_init_std = Eigen::Vector3d::Constant(0.01);
+    Eigen::Vector3d acc_noise_std = Eigen::Vector3d::Constant(12.0);
+    Eigen::Vector3d gyro_noise_std = Eigen::Vector3d::Constant(0.7);
+    double acc_bias_walk = 1.0e-3;
+    double gyro_bias_walk = 1.0e-4;
+    Eigen::Vector3d acc_bias_init_std = Eigen::Vector3d::Constant(0.2);
+    Eigen::Vector3d gyro_bias_init_std = Eigen::Vector3d::Constant(0.1);
   };
 
   struct Stats {
     size_t num_keyframes = 0;
+    size_t num_candidates = 0;
     size_t num_loops = 0;      // loop factors accepted
-    size_t num_rejected = 0;   // candidates that failed the fitness test
+    size_t num_rejected = 0;   // candidates that failed verification or GNC
+    size_t num_rejected_submap = 0;
+    size_t num_rejected_icp = 0;
+    size_t num_rejected_overlap = 0;
+    size_t num_rejected_fitness = 0;
+    size_t num_rejected_hessian = 0;
+    size_t num_rejected_z = 0;
+    size_t num_rejected_gnc = 0;
   };
 
   explicit LoopCloser(Config config);
+  ~LoopCloser();
 
   LoopCloser(const LoopCloser&) = delete;
   LoopCloser& operator=(const LoopCloser&) = delete;
@@ -129,7 +140,8 @@ class LoopCloser {
   std::shared_ptr<PreparedSubmap> getOrPrepareSubmap(int anchor_key) const;
   // Relative constraint from GICP, or nullopt if the fitness, overlap, degeneracy, or
   // vertical-correction test rejects it.
-  std::optional<gtsam::Pose3> computeLoopConstraint(const LoopCandidate& candidate);
+  std::optional<gtsam::Pose3> computeLoopConstraint(const LoopCandidate& candidate,
+                                                    const Eigen::Isometry3d& btc_seed);
   // Logs what a rejected (converged) ICP result asserted next to what the graph held.
   void logRejected(const LoopCandidate& candidate, const gtsam::Pose3& asserted, double fitness) const;
   void optimize();
@@ -152,12 +164,15 @@ class LoopCloser {
   double rotation_accumulated_ = 0.0;
 
   std::vector<Cloud::Ptr> keyframe_clouds_;
+  std::vector<Cloud::Ptr> btc_keyframe_clouds_;
   std::vector<gtsam::Pose3> keyframe_odom_poses_;
   std::vector<gtsam::Pose3> keyframe_poses_;  // optimized
   std::vector<uint64_t> keyframe_stamps_;
+  std::vector<Eigen::Matrix3d> keyframe_level_rotations_;
+  std::vector<double> keyframe_travel_dist_;
   mutable std::vector<std::shared_ptr<PreparedSubmap>> prepared_submaps_;
 
-  ScanContext scan_context_;
+  std::unique_ptr<STDescManager> std_manager_;
 
   gtsam::NonlinearFactorGraph graph_;
   gtsam::NonlinearFactorGraph base_graph_;
@@ -175,8 +190,16 @@ class LoopCloser {
   boost::shared_ptr<gtsam::PreintegrationCombinedParams> imu_params_;  // set at the 2nd keyframe
   gtsam::imuBias::ConstantBias bias_;  // newest keyframe's bias estimate
 
+  size_t num_candidates_ = 0;
   size_t num_loops_ = 0;
   size_t num_rejected_ = 0;
+  size_t num_rejected_submap_ = 0;
+  size_t num_rejected_icp_ = 0;
+  size_t num_rejected_overlap_ = 0;
+  size_t num_rejected_fitness_ = 0;
+  size_t num_rejected_hessian_ = 0;
+  size_t num_rejected_z_ = 0;
+  size_t num_rejected_gnc_ = 0;
 };
 
 }  // namespace bievr

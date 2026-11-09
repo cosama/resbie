@@ -182,11 +182,11 @@ outputs:
   deviations become GTSAM's continuous densities at the measured IMU rate.
 - The first keyframe's prior fixes only yaw and position (the gauge); roll
   and pitch are left to gravity.
-- Loop closures (Scan Context + GICP over local odometry submaps, seeded from
-  the graph's relative pose) add relative poses. Scan Context sees each
-  keyframe cloud levelled on gravity (by the graph's corrected attitude,
-  heading kept), not in the body frame, which may be tilted or mounted upside
-  down.
+- Loop closures (Binary Triangle Combined descriptors `BTC` + `small_gicp` over
+  local odometry submaps, seeded from BTC's 6-DoF triangle solver) add relative
+  poses. BTC sees each local submap cloud levelled on gravity (by the graph's
+  corrected attitude, heading kept), not in the body frame, which may be tilted
+  or mounted upside down.
 - iSAM2 updates incrementally per keyframe (loop search uses the corrected
   map); `finish()` runs Graduated Non-Convexity (GNC) over the loop candidates
   followed by one batch Levenberg-Marquardt optimization of the whole graph.
@@ -212,6 +212,9 @@ some ambiguity at the start.
 - `vendor/bievr`: edited copies of the BIEVR map, preprocess, and the pgo
   and scancontext modules, from upstream `b458505`
   (`BIEVR-LIO-SLAM`, with the loop closer made synchronous).
+- `vendor/btc`: Binary Triangle Combined (BTC) descriptor and 6-DoF loop
+  detector (`BTC.h`, `BTC.cpp`) with per-query vote deduplication, density
+  normalization, and temporal NMS.
 - `vendor/small_gicp`: unmodified GICP headers from upstream `57c1106` (`v1.0.1`).
 
 Every edit in `vendor/` is marked `resbie:` at the site. Grep for it to

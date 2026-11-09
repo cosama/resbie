@@ -436,8 +436,16 @@ class BackEnd {
     d["lio_accepted"] = lio_accepted_;
     d["lio_rejected"] = lio_rejected_;
     d["keyframes"] = ls.num_keyframes;
+    d["candidates"] = ls.num_candidates;
     d["loops"] = ls.num_loops;
     d["rejected"] = ls.num_rejected;
+    d["rejected_submap"] = ls.num_rejected_submap;
+    d["rejected_icp"] = ls.num_rejected_icp;
+    d["rejected_overlap"] = ls.num_rejected_overlap;
+    d["rejected_fitness"] = ls.num_rejected_fitness;
+    d["rejected_hessian"] = ls.num_rejected_hessian;
+    d["rejected_z"] = ls.num_rejected_z;
+    d["rejected_gnc"] = ls.num_rejected_gnc;
     return d;
   }
 

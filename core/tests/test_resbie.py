@@ -562,16 +562,17 @@ def test_back_end_noise_defaults():
     back = resbie.BackEnd.DEFAULT_CONFIG
     expected = {
         "loop_max_correction_z": 1.5,
-        "acc_noise_std": [2.7, 2.7, 2.7],
-        "gyro_noise_std": [0.07, 0.07, 0.07],
-        "acc_bias_init_std": [0.15, 0.15, 0.15],
-        "gyro_bias_init_std": [0.01, 0.01, 0.01],
-        "acc_bias_walk": 2.8e-3,
-        "gyro_bias_walk": 1.3e-4,
-        "odom_noise_rotation": 7.6e-5,
-        "odom_noise_translation": 0.0004,
-        "loop_noise_rotation": 0.001225,
-        "loop_noise_translation": 0.0225,
+        "acc_noise_std": [12.0, 12.0, 12.0],
+        "gyro_noise_std": [0.7, 0.7, 0.7],
+        "acc_bias_init_std": [0.2, 0.2, 0.2],
+        "gyro_bias_init_std": [0.1, 0.1, 0.1],
+        "acc_bias_walk": 1.0e-3,
+        "gyro_bias_walk": 1.0e-4,
+        "odom_noise_rotation": 2.5e-5,
+        "odom_noise_translation": 0.00025,
+        "loop_noise_score": 0.2,
+        "loop_noise_rotation": 0.000402961,
+        "loop_noise_translation": 0.0140625,
     }
     for key, val in expected.items():
         assert back[key] == val, key
@@ -622,3 +623,136 @@ def test_diagnostics_are_a_switch(tmp_path):
     assert front.drain_diagnostics().shape == (0, len(resbie.FrontEnd.DIAGNOSTIC_COLUMNS))
     back.push_lio(1.0, [0, 0, 0, 0, 0, 0, 1], np.ones((10, 3)))
     assert back.drain_diagnostics().shape == (0, len(resbie.BackEnd.DIAGNOSTIC_COLUMNS))
+
+
+def _btc_room(rng: np.random.Generator) -> np.ndarray:
+    """Synthetic structured room with floor, walls, and asymmetric vertical pillars for BTC."""
+    parts = []
+    # Dense floor at z = -2.0 on a 0.12 m grid so every 1 m^2 voxel has ~70 points (> voxel_init_num=10)
+    gx, gy = np.meshgrid(np.arange(-12.0, 12.0, 0.14), np.arange(-12.0, 12.0, 0.14))
+    parts.append(np.column_stack([gx.ravel(), gy.ravel(), np.full(gx.size, -2.0)]))
+    # 4 outer walls for full 6-DoF GICP observability (low height so they don't trigger binary corners)
+    for sign in (-1.0, 1.0):
+        wy, wz = np.meshgrid(np.arange(-12.0, 12.0, 0.25), np.arange(-2.0, -1.5, 0.12))
+        parts.append(np.column_stack([np.full(wy.size, sign * 12.0), wy.ravel(), wz.ravel()]))
+        wx, wz = np.meshgrid(np.arange(-12.0, 12.0, 0.25), np.arange(-2.0, -1.5, 0.12))
+        parts.append(np.column_stack([wx.ravel(), np.full(wx.size, sign * 12.0), wz.ravel()]))
+    # 18 asymmetric vertical pillars spaced > 3.2 m apart with distinct vertical bin counts
+    pillar_xy = [
+        (-9.2, -8.8), (-4.6, -9.1), (0.3, -8.7), (5.1, -9.3), (9.4, -8.5),
+        (-8.9, -3.8), (-3.7, -4.2), (1.4, -3.6), (6.2, -4.1),
+        (-9.1, 1.3), (-4.1, 1.7), (1.1, 1.2), (5.8, 1.6), (9.3, 1.1),
+        (-8.7, 6.4), (-3.5, 6.8), (1.8, 6.3), (6.9, 6.7),
+    ]
+    for idx, (px, py) in enumerate(pillar_xy):
+        n_bins = 12 + idx * 2  # 12..46 bins of 0.10 m, each strictly unique
+        zs = -1.95 + 0.10 * np.arange(n_bins)
+        p = np.column_stack([
+            np.full(n_bins, px),
+            np.full(n_bins, py),
+            zs,
+        ])
+        parts.append(p)
+    return np.vstack(parts)
+
+
+def test_back_end_loop_rejection_counters_and_conservation():
+    reason_keys = (
+        "rejected_submap",
+        "rejected_icp",
+        "rejected_overlap",
+        "rejected_fitness",
+        "rejected_hessian",
+        "rejected_z",
+        "rejected_gnc",
+    )
+    rng = np.random.default_rng(7)
+    world_room = _btc_room(rng)
+    # 7 keyframes (> kSubmapKfRadius=5) spaced 25 m apart (> 20 m submap radius)
+    # so kf=0 and kf=6 have completely disjoint local submaps.
+    positions = [
+        np.array([0.0, 0.0, 0.0]),
+        np.array([25.0, 0.0, 0.0]),
+        np.array([50.0, 0.0, 0.0]),
+        np.array([75.0, 0.0, 0.0]),
+        np.array([50.0, 25.0, 0.0]),
+        np.array([25.0, 25.0, 0.0]),
+        np.array([0.0, 0.0, 0.0]),
+    ]
+
+    # 1. Loop-closing synthetic run
+    back_acc = resbie.BackEnd({"sc_num_exclude_recent": 5})
+    t = 1.0
+    for pos in positions:
+        pose = np.array([pos[0], pos[1], pos[2], 0.0, 0.0, 0.0, 1.0])
+        back_acc.push_lio(t, pose, world_room)
+        t += 1.0
+    back_acc.finish()
+    back_acc.finish()  # idempotent counter conservation check
+    st_acc = back_acc.status()
+    for k in ("candidates", "loops", "rejected", *reason_keys):
+        assert k in st_acc, k
+    assert st_acc["candidates"] == 1, st_acc
+    assert st_acc["loops"] == 1, st_acc
+    assert st_acc["rejected"] == 0, st_acc
+    assert st_acc["candidates"] == st_acc["loops"] + st_acc["rejected"]
+    assert st_acc["rejected"] == sum(st_acc[k] for k in reason_keys)
+
+    # 2. Rejected-loop synthetic run (0.6 m vertical drift rejected by 0.3 m z gate)
+    back_rej = resbie.BackEnd({"sc_num_exclude_recent": 5, "loop_max_correction_z": 0.3})
+    t = 1.0
+    for idx, pos in enumerate(positions):
+        z_offset = 0.6 if idx == len(positions) - 1 else 0.0
+        pose = np.array([pos[0], pos[1], pos[2] + z_offset, 0.0, 0.0, 0.0, 1.0])
+        back_rej.push_lio(t, pose, world_room)
+        t += 1.0
+    back_rej.finish()
+    st_rej = back_rej.status()
+    for k in ("candidates", "loops", "rejected", *reason_keys):
+        assert k in st_rej, k
+    assert st_rej["candidates"] == 1, st_rej
+    assert st_rej["loops"] == 0, st_rej
+    assert st_rej["rejected"] == 1, st_rej
+    assert st_rej["rejected_z"] == 1, st_rej
+    assert st_rej["candidates"] == st_rej["loops"] + st_rej["rejected"]
+    assert st_rej["rejected"] == sum(st_rej[k] for k in reason_keys)
+
+
+def test_back_end_btc_recovers_5m_and_20deg_yaw_offset():
+    """Verify BTC recovers a 6-DoF loop seed when the revisit keyframe has 5 m translation
+    drift and 20 deg yaw rotation relative to the initial keyframe."""
+    rng = np.random.default_rng(11)
+    world_room = _btc_room(rng)
+
+    # True rotation at revisit is +20 deg yaw (so points in body frame are rotated by -20 deg),
+    # while odometry pose has drifted to (5.0, 0.0, 0.0) with 0 deg yaw.
+    yaw_rad = np.radians(20.0)
+    c, s = np.cos(yaw_rad), np.sin(yaw_rad)
+    R_body_from_world = np.array([[c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]])
+    rotated_room = world_room @ R_body_from_world.T
+
+    positions = [
+        (np.array([0.0, 0.0, 0.0]), world_room),
+        (np.array([30.0, 0.0, 0.0]), world_room),
+        (np.array([60.0, 0.0, 0.0]), world_room),
+        (np.array([90.0, 0.0, 0.0]), world_room),
+        (np.array([60.0, 30.0, 0.0]), world_room),
+        (np.array([30.0, 30.0, 0.0]), world_room),
+        (np.array([5.0, 0.0, 0.0]), rotated_room),
+    ]
+
+    back = resbie.BackEnd({"sc_num_exclude_recent": 5, "odom_noise_translation": 0.1, "odom_noise_rotation": 0.05})
+    t = 1.0
+    for pos, scan in positions:
+        pose = np.array([pos[0], pos[1], pos[2], 0.0, 0.0, 0.0, 1.0])
+        assert back.push_lio(t, pose, scan)
+        t += 1.0
+    back.finish()
+    st = back.status()
+    assert st["candidates"] == 1, st
+    assert st["loops"] == 1, st
+    assert st["rejected"] == 0, st
+    kf = back.keyframes()
+    # The final keyframe started at x=5.0 m in odometry and must be pulled close to x=0.0 m by the loop factor.
+    assert np.linalg.norm(kf[-1, 1:4] - kf[0, 1:4]) < 0.5, (kf[0, 1:4], kf[-1, 1:4])
+

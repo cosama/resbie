@@ -12,13 +12,14 @@ find_package(TBB REQUIRED)
 find_package(OpenMP REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(GTSAM CONFIG REQUIRED)
-find_package(PCL REQUIRED COMPONENTS common filters)
+find_package(PCL REQUIRED COMPONENTS common filters kdtree)
 set(PYBIND11_FINDPYTHON ON)
 find_package(pybind11 CONFIG REQUIRED)
 
 # vendor/ holds edited copies of the two upstreams (see DESIGN.md).
 set(BIEVR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/bievr")
 set(RESPLE "${CMAKE_CURRENT_SOURCE_DIR}/vendor/resple")
+set(BTC "${CMAKE_CURRENT_SOURCE_DIR}/vendor/btc")
 
 pybind11_add_module(_core NO_EXTRAS
   cpp/bindings.cpp
@@ -26,6 +27,7 @@ pybind11_add_module(_core NO_EXTRAS
   "${BIEVR}/src/preprocess.cpp"
   "${BIEVR}/modules/scancontext/src/scan_context.cpp"
   "${BIEVR}/modules/pgo/src/loop_closer.cpp"
+  "${BTC}/BTC.cpp"
 )
 
 target_include_directories(_core PRIVATE
@@ -34,6 +36,7 @@ target_include_directories(_core PRIVATE
   "${BIEVR}/include"
   "${BIEVR}/modules/scancontext/include"
   "${BIEVR}/modules/pgo/include"
+  "${BTC}"
   "${CMAKE_CURRENT_SOURCE_DIR}/vendor/small_gicp/include"
   "${GTSAM_INCLUDE_DIR}"
   ${PCL_INCLUDE_DIRS}

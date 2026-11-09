@@ -25,6 +25,7 @@
 #include <sstream>
 #include <string>
 
+#include "BTC.h"
 #include "bievr_lio/log.h"
 
 namespace bievr {
@@ -158,12 +159,74 @@ small_gicp::PointCloud buildLocalSubmap(const std::vector<LoopCloser::Cloud::Ptr
   return small_gicp::PointCloud(pts);
 }
 
+ConfigSetting makeBtcConfig(const LoopCloser::Config& config) {
+  ConfigSetting btc;
+  const bool outdoor = (config.scan_context.max_radius >= 95.0);
+  if (!outdoor) {
+    btc.useful_corner_num_ = 100;
+    btc.plane_detection_thre_ = 0.01f;
+    btc.plane_merge_normal_thre_ = 0.1f;
+    btc.plane_merge_dis_thre_ = 0.3f;
+    btc.voxel_size_ = 1.0f;
+    btc.voxel_init_num_ = 10;
+    btc.proj_plane_num_ = 2;
+    btc.proj_image_resolution_ = 0.5f;
+    btc.proj_image_high_inc_ = 0.1f;
+    btc.proj_dis_min_ = -1.0f;
+    btc.proj_dis_max_ = 5.0f;
+    btc.summary_min_thre_ = 6.0f;
+    btc.line_filter_enable_ = 0;
+    btc.touch_filter_enable_ = 0;
+    btc.descriptor_near_num_ = 15.0f;
+    btc.descriptor_min_len_ = 1.5f;
+    btc.descriptor_max_len_ = 30.0f;
+    btc.non_max_suppression_radius_ = 2.0f;
+    btc.std_side_resolution_ = 0.2f;
+    btc.skip_near_num_ = config.scan_context.num_exclude_recent;
+    btc.candidate_num_ = 30;
+    btc.rough_dis_threshold_ = 0.015f;
+    btc.similarity_threshold_ = 0.45f;
+    btc.normal_threshold_ = 0.2f;
+    btc.dis_threshold_ = 0.5f;
+    btc.icp_threshold_ = 0.15f;
+  } else {
+    btc.useful_corner_num_ = 200;
+    btc.plane_detection_thre_ = 0.01f;
+    btc.plane_merge_normal_thre_ = 0.1f;
+    btc.plane_merge_dis_thre_ = 0.3f;
+    btc.voxel_size_ = 2.0f;
+    btc.voxel_init_num_ = 10;
+    btc.proj_plane_num_ = 1;
+    btc.proj_image_resolution_ = 0.5f;
+    btc.proj_image_high_inc_ = 0.2f;
+    btc.proj_dis_min_ = -1.0f;
+    btc.proj_dis_max_ = 10.0f;
+    btc.summary_min_thre_ = 6.0f;
+    btc.line_filter_enable_ = 0;
+    btc.touch_filter_enable_ = 0;
+    btc.descriptor_near_num_ = 15.0f;
+    btc.descriptor_min_len_ = 2.0f;
+    btc.descriptor_max_len_ = 50.0f;
+    btc.non_max_suppression_radius_ = 3.0f;
+    btc.std_side_resolution_ = 0.2f;
+    btc.skip_near_num_ = config.scan_context.num_exclude_recent;
+    btc.candidate_num_ = 50;
+    btc.rough_dis_threshold_ = 0.015f;
+    btc.similarity_threshold_ = 0.40f;
+    btc.normal_threshold_ = 0.2f;
+    btc.dis_threshold_ = 0.5f;
+    btc.icp_threshold_ = 0.15f;
+  }
+  return btc;
+}
+
 }  // namespace
 
 LoopCloser::LoopCloser(Config config)
     : config_(std::move(config)),
-      keyframe_rad_gap_(deg2rad(config_.keyframe_deg_gap)),
-      scan_context_(config_.scan_context) {
+      keyframe_rad_gap_(deg2rad(config_.keyframe_deg_gap)) {
+  ConfigSetting btc_cfg = makeBtcConfig(config_);
+  std_manager_ = std::make_unique<STDescManager>(btc_cfg);
   gtsam::ISAM2Params params;
   params.relinearizeThreshold = config_.isam_relinearize_threshold;
   params.relinearizeSkip = config_.isam_relinearize_skip;
@@ -171,6 +234,8 @@ LoopCloser::LoopCloser(Config config)
 
   initNoiseModels();
 }
+
+LoopCloser::~LoopCloser() = default;
 
 void LoopCloser::initNoiseModels() {
   // gtsam::Pose3's tangent space is [rotation, translation].
@@ -226,34 +291,84 @@ bool LoopCloser::addFrame(uint64_t stamp, const Transform& T_W_I, const PointsVi
                               static_cast<float>(cloud_body(i, 2)));
   }
 
-  // Keyframe, loop detection, ICP, iSAM2, in that order. detectLoop() queries
-  // the newest keyframe, so each keyframe is queried exactly once.
+  // Keyframe, BTC loop detection, ICP, iSAM2, in that order.
   integrateKeyframe(stamp, T_W_I, velocity, cloud);
-  const ScanContext::Match match = scan_context_.detectLoop();
-  if (match.index >= 0) {
-    const int current = static_cast<int>(scan_context_.size()) - 1;
-    const LoopCandidate candidate{match.index, current};
-    LOG(I, "[resbie::pgo] Loop candidate found: from kf=" << candidate.from << " to kf=" << candidate.to
-           << ", sc_dist=" << match.distance
-           << ", yaw_diff=" << (match.yaw_diff_rad * 180.0 / M_PI) << " deg");
-    if (const auto constraint = computeLoopConstraint(candidate)) {
-      graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(X(candidate.from), X(candidate.to),
-                                                    *constraint, loop_noise_));
-      loop_edges_.push_back({candidate.from, candidate.to, *constraint});
-      ++num_loops_;
-      LOG(I, "[resbie::pgo] >>> Loop ACCEPTED between kf=" << candidate.from << " and kf="
-             << candidate.to << " (total accepted: " << num_loops_ << ")");
-      // What the loop asserts (from^-1 to) next to what the graph held when it
-      // came, so a log alone tells true loops from false ones afterwards.
-      const gtsam::Pose3 held =
-          keyframe_poses_.at(candidate.from).between(keyframe_poses_.at(candidate.to));
-      LOG(I, "[resbie::pgo]     loop stamps " << keyframe_stamps_.at(candidate.from) << ' '
-             << keyframe_stamps_.at(candidate.to) << " constraint " << poseLog(*constraint)
-             << " graph " << poseLog(held));
-    } else {
-      ++num_rejected_;
-      LOG(I, "[resbie::pgo] --- Loop REJECTED between kf=" << candidate.from << " and kf="
-             << candidate.to << " (total rejected: " << num_rejected_ << ")");
+
+  const int current = static_cast<int>(keyframe_clouds_.size()) - 1;
+  const small_gicp::PointCloud raw_btc_submap =
+      buildLocalSubmap(btc_keyframe_clouds_, keyframe_odom_poses_, current, kSubmapKfRadius);
+  const Eigen::Matrix3d& R_level_curr = keyframe_level_rotations_.at(current);
+  pcl::PointCloud<pcl::PointXYZI>::Ptr plbtc(new pcl::PointCloud<pcl::PointXYZI>());
+  plbtc->points.resize(raw_btc_submap.size());
+  for (size_t i = 0; i < raw_btc_submap.size(); ++i) {
+    const Eigen::Vector3d p_level = R_level_curr * raw_btc_submap.point(i).head<3>();
+    pcl::PointXYZI pt;
+    pt.x = static_cast<float>(p_level.x());
+    pt.y = static_cast<float>(p_level.y());
+    pt.z = static_cast<float>(p_level.z());
+    pt.intensity = 0.0f;
+    plbtc->points[i] = pt;
+  }
+  plbtc->width = static_cast<uint32_t>(plbtc->points.size());
+  plbtc->height = 1;
+  plbtc->is_dense = true;
+
+  std::vector<STD> stds_vec;
+  std_manager_->GenerateSTDescs(plbtc, stds_vec, current);
+  std::pair<int, double> search_result(-1, 0.0);
+  std::pair<Eigen::Vector3d, Eigen::Matrix3d> loop_transform(
+      Eigen::Vector3d::Zero(), Eigen::Matrix3d::Identity());
+  std::vector<std::pair<STD, STD>> loop_std_pair;
+  std_manager_->SearchLoop(stds_vec, search_result, loop_transform, loop_std_pair,
+                           std_manager_->plane_cloud_vec_.back());
+  std_manager_->AddSTDescs(stds_vec);
+
+  if (!std_manager_->last_verified_candidates_.empty()) {
+    int accepted_from = -1;
+    int primary_tries = 0;
+    bool added_early_bridge = false;
+    for (const auto& vc : std_manager_->last_verified_candidates_) {
+      const bool is_early_bridge = (accepted_from >= 0) && (vc.frame_id + 200 <= accepted_from);
+      if (accepted_from >= 0 && (!is_early_bridge || added_early_bridge)) {
+        continue;
+      }
+      if (accepted_from < 0 && primary_tries >= 3) {
+        continue;
+      }
+      ++primary_tries;
+      ++num_candidates_;
+      const LoopCandidate candidate{vc.frame_id, current};
+      const Eigen::Matrix3d& R_level_cand = keyframe_level_rotations_.at(candidate.from);
+      Eigen::Isometry3d btc_seed = Eigen::Isometry3d::Identity();
+      btc_seed.linear() = R_level_cand.transpose() * vc.transform.second * R_level_curr;
+      btc_seed.translation() = R_level_cand.transpose() * vc.transform.first;
+      const double yaw_diff_rad = headingOf(vc.transform.second);
+      LOG(I, "[resbie::pgo] Loop candidate found: from kf=" << candidate.from << " to kf=" << candidate.to
+             << ", btc_score=" << vc.score
+             << ", sc_dist=" << (1.0 - vc.score)
+             << ", yaw_diff=" << (yaw_diff_rad * 180.0 / M_PI) << " deg");
+      if (const auto constraint = computeLoopConstraint(candidate, btc_seed)) {
+        graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(X(candidate.from), X(candidate.to),
+                                                      *constraint, loop_noise_));
+        loop_edges_.push_back({candidate.from, candidate.to, *constraint});
+        ++num_loops_;
+        LOG(I, "[resbie::pgo] >>> Loop ACCEPTED between kf=" << candidate.from << " and kf="
+               << candidate.to << " (total accepted: " << num_loops_ << ")");
+        const gtsam::Pose3 held =
+            keyframe_poses_.at(candidate.from).between(keyframe_poses_.at(candidate.to));
+        LOG(I, "[resbie::pgo]     loop stamps " << keyframe_stamps_.at(candidate.from) << ' '
+               << keyframe_stamps_.at(candidate.to) << " constraint " << poseLog(*constraint)
+               << " graph " << poseLog(held));
+        if (accepted_from < 0) {
+          accepted_from = candidate.from;
+        } else {
+          added_early_bridge = true;
+        }
+      } else {
+        ++num_rejected_;
+        LOG(I, "[resbie::pgo] --- Loop REJECTED between kf=" << candidate.from << " and kf="
+               << candidate.to << " (total rejected: " << num_rejected_ << ")");
+      }
     }
   }
   optimize();
@@ -269,6 +384,15 @@ void LoopCloser::integrateKeyframe(uint64_t stamp, const Transform& T_W_I,
   filter.setInputCloud(cloud);
   filter.filter(*downsampled);
 
+  // BTC requires finer point density (Voxel-SLAM uses voxel_size / 10 = 0.10 m)
+  // so 1 m plane voxels exceed voxel_init_num=10 and 0.10 m vertical bins are populated.
+  Cloud::Ptr btc_downsampled(new Cloud());
+  const float btc_leaf = static_cast<float>(std::min(config_.keyframe_filter_size, 0.10));
+  pcl::VoxelGrid<PointT> btc_filter;
+  btc_filter.setLeafSize(btc_leaf, btc_leaf, btc_leaf);
+  btc_filter.setInputCloud(cloud);
+  btc_filter.filter(*btc_downsampled);
+
   const gtsam::Pose3 pose = toPose3(T_W_I);
 
   const int index = static_cast<int>(keyframe_clouds_.size());
@@ -279,22 +403,21 @@ void LoopCloser::integrateKeyframe(uint64_t stamp, const Transform& T_W_I,
     initial = keyframe_poses_.back() * odom_delta;  // continue from the corrected estimate
   }
   keyframe_clouds_.push_back(downsampled);
+  btc_keyframe_clouds_.push_back(btc_downsampled);
   keyframe_odom_poses_.push_back(pose);
   keyframe_poses_.push_back(initial);
   keyframe_stamps_.push_back(stamp);
   prepared_submaps_.push_back(nullptr);
 
-  // Scan Context gets the downsampled keyframe cloud in the keyframe's level
-  // frame (resbie: not the body frame, which may be tilted or upside down). Level by the corrected estimate, whose roll
-  // and pitch the graph's gravity factors keep honest, as the loop check does.
+  // Store the gravity-levelled rotation for BTC descriptor extraction and seed conversion.
   const Eigen::Matrix3d R_level_body =
-      levelFrame(initial).rotation().matrix().transpose() * initial.rotation().matrix();
-  Eigen::Matrix<double, 3, Eigen::Dynamic> sc_cloud(3, downsampled->size());
-  for (size_t i = 0; i < downsampled->size(); ++i) {
-    const auto& p = downsampled->points[i];
-    sc_cloud.col(i) = R_level_body * Eigen::Vector3d(p.x, p.y, p.z);
-  }
-  scan_context_.add(sc_cloud);
+      levelFrame(pose).rotation().matrix().transpose() * pose.rotation().matrix();
+  keyframe_level_rotations_.push_back(R_level_body);
+
+  const double step_dist = (index > 0) ? odom_delta.translation().norm() : 0.0;
+  const double cum_dist =
+      keyframe_travel_dist_.empty() ? 0.0 : (keyframe_travel_dist_.back() + step_dist);
+  keyframe_travel_dist_.push_back(cum_dist);
 
   // Odometry velocity, rotated like the correction of the pose it belongs to.
   const Eigen::Vector3d velocity =
@@ -443,60 +566,108 @@ std::shared_ptr<LoopCloser::PreparedSubmap> LoopCloser::getOrPrepareSubmap(
   return prep;
 }
 
-std::optional<gtsam::Pose3> LoopCloser::computeLoopConstraint(const LoopCandidate& candidate) {
+std::optional<gtsam::Pose3> LoopCloser::computeLoopConstraint(
+    const LoopCandidate& candidate, const Eigen::Isometry3d& btc_seed) {
   const auto source_submap = getOrPrepareSubmap(candidate.to);
   const auto target_submap = getOrPrepareSubmap(candidate.from);
   if (!source_submap || !target_submap || !source_submap->coarse || !source_submap->fine ||
       !target_submap->coarse || !target_submap->fine ||
       source_submap->coarse->size() <= 10 || source_submap->fine->size() <= 10 ||
       target_submap->coarse->size() <= 10 || target_submap->fine->size() <= 10) {
+    ++num_rejected_submap_;
+    LOG(I, "[resbie::pgo]   Loop rejected: submap empty or too small.");
     return std::nullopt;
   }
 
   const gtsam::Pose3& pose_loop = keyframe_poses_.at(candidate.from);
   const gtsam::Pose3& pose_curr = keyframe_poses_.at(candidate.to);
-  const Eigen::Isometry3d T_init(pose_loop.between(pose_curr).matrix());
+  const Eigen::Isometry3d graph_seed(pose_loop.between(pose_curr).matrix());
 
   const double v = std::max(0.05, config_.icp_filter_size);
   const double coarse_max_corr = 6.0 * v;
   const double fine_max_corr = 3.0 * v;
 
-  small_gicp::Registration<small_gicp::GICPFactor, small_gicp::SerialReduction> reg_coarse;
-  reg_coarse.rejector.max_dist_sq = coarse_max_corr * coarse_max_corr;
-  reg_coarse.optimizer.max_iterations = kGicpCoarseIterations;
-  const small_gicp::RegistrationResult res_coarse = reg_coarse.align(
-      *target_submap->coarse, *source_submap->coarse, *target_submap->coarse_tree, T_init);
+  auto run_align = [&](const Eigen::Isometry3d& T_init) {
+    small_gicp::Registration<small_gicp::GICPFactor, small_gicp::SerialReduction> reg_coarse;
+    reg_coarse.rejector.max_dist_sq = coarse_max_corr * coarse_max_corr;
+    reg_coarse.optimizer.max_iterations = kGicpCoarseIterations;
+    const small_gicp::RegistrationResult res_coarse = reg_coarse.align(
+        *target_submap->coarse, *source_submap->coarse, *target_submap->coarse_tree, T_init);
 
-  const Eigen::Isometry3d fine_init =
-      res_coarse.converged ? res_coarse.T_target_source : T_init;
+    const Eigen::Isometry3d fine_init =
+        res_coarse.converged ? res_coarse.T_target_source : T_init;
 
-  small_gicp::Registration<small_gicp::GICPFactor, small_gicp::SerialReduction> reg_fine;
-  reg_fine.rejector.max_dist_sq = fine_max_corr * fine_max_corr;
-  reg_fine.optimizer.max_iterations = kGicpMaxIterations;
-  reg_fine.criteria.rotation_eps = kGicpRotEps;
-  reg_fine.criteria.translation_eps = kGicpTransEps;
-  const small_gicp::RegistrationResult res_fine = reg_fine.align(
-      *target_submap->fine, *source_submap->fine, *target_submap->fine_tree, fine_init);
+    small_gicp::Registration<small_gicp::GICPFactor, small_gicp::SerialReduction> reg_fine;
+    reg_fine.rejector.max_dist_sq = fine_max_corr * fine_max_corr;
+    reg_fine.optimizer.max_iterations = kGicpMaxIterations;
+    reg_fine.criteria.rotation_eps = kGicpRotEps;
+    reg_fine.criteria.translation_eps = kGicpTransEps;
+    const small_gicp::RegistrationResult res_fine = reg_fine.align(
+        *target_submap->fine, *source_submap->fine, *target_submap->fine_tree, fine_init);
+
+    FitMetrics fit;
+    if (res_fine.converged) {
+      fit = evaluateFit(*target_submap->fine, *source_submap->fine, *target_submap->fine_tree,
+                        res_fine.T_target_source, 2.0 * v);
+    }
+    return std::make_pair(res_fine, fit);
+  };
+
+  const double span =
+      std::max(0.0, keyframe_travel_dist_.at(candidate.to) -
+                        keyframe_travel_dist_.at(candidate.from));
+
+  const char* seed_used = "btc";
+  auto [res_fine, fit] = run_align(btc_seed);
+  const double max_btc_drift = (fit.overlap >= 0.70 && fit.fitness <= 0.05)
+                                   ? std::max(20.0, 0.15 * span)
+                                   : std::max(3.0, 0.06 * span);
+  bool btc_drift_ok = false;
+  if (res_fine.converged) {
+    const gtsam::Pose3 btc_asserted(res_fine.T_target_source.matrix());
+    const double btc_graph_drift =
+        ((pose_loop * btc_asserted).translation() - pose_curr.translation()).norm();
+    const double btc_odom_drift =
+        ((keyframe_odom_poses_.at(candidate.from) * btc_asserted).translation() -
+         keyframe_odom_poses_.at(candidate.to).translation())
+            .norm();
+    btc_drift_ok = (btc_graph_drift <= max_btc_drift) && (btc_odom_drift <= max_btc_drift);
+  }
+  const bool btc_ok = res_fine.converged && btc_drift_ok && (fit.overlap >= kMinLoopOverlap) &&
+                      std::isfinite(fit.fitness) &&
+                      (fit.fitness <= config_.loop_fitness_score_threshold);
+  if (!btc_ok) {
+    auto [res_graph, fit_graph] = run_align(graph_seed);
+    const bool graph_ok = res_graph.converged && (fit_graph.overlap >= kMinLoopOverlap) &&
+                          std::isfinite(fit_graph.fitness) &&
+                          (fit_graph.fitness <= config_.loop_fitness_score_threshold);
+    if (!btc_drift_ok || graph_ok || (!res_fine.converged && res_graph.converged) ||
+        (res_graph.converged && fit_graph.overlap > fit.overlap)) {
+      res_fine = res_graph;
+      fit = fit_graph;
+      seed_used = "graph";
+    }
+  }
 
   if (!res_fine.converged) {
-    LOG(I, "[resbie::pgo]   Loop rejected: ICP did not converge.");
+    ++num_rejected_icp_;
+    LOG(I, "[resbie::pgo]   Loop rejected: ICP did not converge (seed=" << seed_used << ").");
     return std::nullopt;
   }
 
   const Eigen::Isometry3d& T_final = res_fine.T_target_source;
-  const FitMetrics fit =
-      evaluateFit(*target_submap->fine, *source_submap->fine, *target_submap->fine_tree,
-                  T_final, 2.0 * v);
-
   const gtsam::Pose3 asserted(T_final.matrix());
   if (fit.overlap < kMinLoopOverlap) {
-    LOG(I, "[resbie::pgo]   Loop rejected: overlap " << fit.overlap << " < " << kMinLoopOverlap);
+    ++num_rejected_overlap_;
+    LOG(I, "[resbie::pgo]   Loop rejected: overlap " << fit.overlap << " < " << kMinLoopOverlap
+           << " (seed=" << seed_used << ")");
     logRejected(candidate, asserted, fit.fitness);
     return std::nullopt;
   }
   if (!std::isfinite(fit.fitness) || fit.fitness > config_.loop_fitness_score_threshold) {
+    ++num_rejected_fitness_;
     LOG(I, "[resbie::pgo]   Loop rejected: fitness " << fit.fitness << " > threshold "
-           << config_.loop_fitness_score_threshold);
+           << config_.loop_fitness_score_threshold << " (seed=" << seed_used << ")");
     logRejected(candidate, asserted, fit.fitness);
     return std::nullopt;
   }
@@ -510,8 +681,9 @@ std::optional<gtsam::Pose3> LoopCloser::computeLoopConstraint(const LoopCandidat
       (ev_tt(0) < kMinHessian3dEig) ||
       (ev_tt(1) < kMinHessianPlaneEig);
   if (is_degenerate) {
+    ++num_rejected_hessian_;
     LOG(I, "[resbie::pgo]   Loop rejected: degenerate Hessian eigenvalues [" << ev_tt(0) << ", "
-           << ev_tt(1) << ", " << ev_tt(2) << "]");
+           << ev_tt(1) << ", " << ev_tt(2) << "] (seed=" << seed_used << ")");
     logRejected(candidate, asserted, fit.fitness);
     return std::nullopt;
   }
@@ -520,11 +692,14 @@ std::optional<gtsam::Pose3> LoopCloser::computeLoopConstraint(const LoopCandidat
   // graph's estimate the loop contradicts. World z is gravity-aligned.
   const gtsam::Point3 shift = (pose_loop * asserted).translation() - pose_curr.translation();
   if (std::abs(shift.z()) > config_.loop_max_correction_z) {
+    ++num_rejected_z_;
     LOG(I, "[resbie::pgo]   Loop rejected: vertical correction " << shift.z() << " m > "
-           << config_.loop_max_correction_z << " m");
+           << config_.loop_max_correction_z << " m (seed=" << seed_used << ")");
     logRejected(candidate, asserted, fit.fitness);
     return std::nullopt;
   }
+  LOG(I, "[resbie::pgo]   GICP verified (seed=" << seed_used << " overlap=" << fit.overlap
+         << " fitness=" << fit.fitness << ")");
   return asserted;
 }
 
@@ -550,6 +725,16 @@ void LoopCloser::finish() {
   if (!graph_initialized_) return;
   optimize();
   if (loop_edges_.empty()) {
+    num_loops_ = 0;
+    num_rejected_gnc_ = 0;
+    num_rejected_ = num_rejected_submap_ + num_rejected_icp_ + num_rejected_overlap_ +
+                    num_rejected_fitness_ + num_rejected_hessian_ + num_rejected_z_;
+    LOG(I, "[resbie::pgo] Loop summary: candidates=" << num_candidates_
+           << " kept=" << num_loops_ << " rejected=" << num_rejected_
+           << " (submap=" << num_rejected_submap_ << " icp=" << num_rejected_icp_
+           << " overlap=" << num_rejected_overlap_ << " fitness=" << num_rejected_fitness_
+           << " hessian=" << num_rejected_hessian_ << " z=" << num_rejected_z_
+           << " gnc=" << num_rejected_gnc_ << ")");
     readEstimate(
         gtsam::LevenbergMarquardtOptimizer(base_graph_, isam_->calculateEstimate()).optimize());
     return;
@@ -598,12 +783,23 @@ void LoopCloser::finish() {
                                                          loop_noise_gnc_));
     } else {
       ++gnc_dropped;
+      const LoopEdge& edge = loop_edges_[k];
+      LOG(I, "[resbie::pgo] GNC dropped outlier loop edge kf=" << edge.from << " -> kf=" << edge.to);
     }
   }
   num_loops_ = gnc_kept;
-  num_rejected_ += gnc_dropped;
+  num_rejected_gnc_ = gnc_dropped;
+  num_rejected_ = num_rejected_submap_ + num_rejected_icp_ + num_rejected_overlap_ +
+                  num_rejected_fitness_ + num_rejected_hessian_ + num_rejected_z_ +
+                  num_rejected_gnc_;
   LOG(I, "[resbie::pgo] GNC finish: kept=" << gnc_kept << " dropped=" << gnc_dropped
          << " total_loops=" << loop_edges_.size());
+  LOG(I, "[resbie::pgo] Loop summary: candidates=" << num_candidates_
+         << " kept=" << num_loops_ << " rejected=" << num_rejected_
+         << " (submap=" << num_rejected_submap_ << " icp=" << num_rejected_icp_
+         << " overlap=" << num_rejected_overlap_ << " fitness=" << num_rejected_fitness_
+         << " hessian=" << num_rejected_hessian_ << " z=" << num_rejected_z_
+         << " gnc=" << num_rejected_gnc_ << ")");
   const gtsam::Values& lm_init = (gnc_kept > 0) ? gnc_result : inlier_init;
   readEstimate(gtsam::LevenbergMarquardtOptimizer(final_graph, lm_init).optimize());
 }
@@ -627,8 +823,16 @@ std::vector<Transform> LoopCloser::keyframePoses() const {
 LoopCloser::Stats LoopCloser::stats() const {
   Stats stats;
   stats.num_keyframes = keyframe_poses_.size();
+  stats.num_candidates = num_candidates_;
   stats.num_loops = num_loops_;
   stats.num_rejected = num_rejected_;
+  stats.num_rejected_submap = num_rejected_submap_;
+  stats.num_rejected_icp = num_rejected_icp_;
+  stats.num_rejected_overlap = num_rejected_overlap_;
+  stats.num_rejected_fitness = num_rejected_fitness_;
+  stats.num_rejected_hessian = num_rejected_hessian_;
+  stats.num_rejected_z = num_rejected_z_;
+  stats.num_rejected_gnc = num_rejected_gnc_;
   return stats;
 }
 

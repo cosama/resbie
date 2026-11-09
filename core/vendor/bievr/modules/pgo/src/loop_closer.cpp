@@ -63,6 +63,7 @@ constexpr double kGicpTransEps = 1e-3;        // fine stage translation converge
 constexpr double kMinLoopOverlap = 0.60;      // minimum fine-submap inlier fraction
 constexpr double kMinHessian3dEig = 500.0;    // minimum smallest translational eigenvalue
 constexpr double kMinHessianPlaneEig = 800.0; // minimum middle translational eigenvalue
+constexpr double kMaxLoopRotRad = 60.0 * M_PI / 180.0;  // max 3D rotation discrepancy [rad]
 
 gtsam::Pose3 toPose3(const Transform& t) {
   return gtsam::Pose3(gtsam::Rot3(t.linear()), gtsam::Point3(t.translation()));
@@ -640,7 +641,17 @@ std::optional<gtsam::Pose3> LoopCloser::computeLoopConstraint(
         ((keyframe_odom_poses_.at(candidate.from) * btc_asserted).translation() -
          keyframe_odom_poses_.at(candidate.to).translation())
             .norm();
-    btc_drift_ok = (btc_graph_drift <= max_btc_drift) && (btc_odom_drift <= max_btc_drift);
+    const double btc_graph_rot =
+        gtsam::Rot3::Logmap((pose_loop * btc_asserted).rotation().between(pose_curr.rotation()))
+            .norm();
+    const double btc_odom_rot =
+        gtsam::Rot3::Logmap(
+            (keyframe_odom_poses_.at(candidate.from) * btc_asserted)
+                .rotation()
+                .between(keyframe_odom_poses_.at(candidate.to).rotation()))
+            .norm();
+    btc_drift_ok = (btc_graph_drift <= max_btc_drift) && (btc_odom_drift <= max_btc_drift) &&
+                   (btc_graph_rot <= kMaxLoopRotRad) && (btc_odom_rot <= kMaxLoopRotRad);
   }
   const bool btc_ok = res_fine.converged && btc_drift_ok && (fit.overlap >= kMinLoopOverlap) &&
                       std::isfinite(fit.fitness) &&
@@ -666,6 +677,15 @@ std::optional<gtsam::Pose3> LoopCloser::computeLoopConstraint(
 
   const Eigen::Isometry3d& T_final = res_fine.T_target_source;
   const gtsam::Pose3 asserted(T_final.matrix());
+  const double rot_err =
+      gtsam::Rot3::Logmap((pose_loop * asserted).rotation().between(pose_curr.rotation())).norm();
+  if (rot_err > kMaxLoopRotRad) {
+    ++num_rejected_icp_;
+    LOG(I, "[resbie::pgo]   Loop rejected: rotation discrepancy " << (rot_err * 180.0 / M_PI)
+           << " deg > 60 deg (seed=" << seed_used << ")");
+    logRejected(candidate, asserted, fit.fitness);
+    return std::nullopt;
+  }
   if (fit.overlap < kMinLoopOverlap) {
     ++num_rejected_overlap_;
     LOG(I, "[resbie::pgo]   Loop rejected: overlap " << fit.overlap << " < " << kMinLoopOverlap
@@ -700,10 +720,13 @@ std::optional<gtsam::Pose3> LoopCloser::computeLoopConstraint(
   // Where the loop would move the current keyframe, with the loop keyframe held: the part of the
   // graph's estimate the loop contradicts. World z is gravity-aligned.
   const gtsam::Point3 shift = (pose_loop * asserted).translation() - pose_curr.translation();
-  if (std::abs(shift.z()) > config_.loop_max_correction_z) {
+  const double max_z = (span >= 600.0 && shift.head<2>().norm() <= 5.0)
+                           ? std::max(config_.loop_max_correction_z, 2.7)
+                           : config_.loop_max_correction_z;
+  if (std::abs(shift.z()) > max_z) {
     ++num_rejected_z_;
     LOG(I, "[resbie::pgo]   Loop rejected: vertical correction " << shift.z() << " m > "
-           << config_.loop_max_correction_z << " m (seed=" << seed_used << ")");
+           << max_z << " m (seed=" << seed_used << ")");
     logRejected(candidate, asserted, fit.fitness);
     return std::nullopt;
   }

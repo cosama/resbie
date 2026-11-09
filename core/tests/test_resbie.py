@@ -253,6 +253,49 @@ def test_blackout_is_bridged_by_imu(tmp_path):
     assert np.all(diag[blackout, col["imu_only_updates"]] > 0)
 
 
+def test_blackout_at_end_finishes_all_sweeps(tmp_path):
+    """Tail points of a non-empty sweep followed only by empty sweeps advance and finish cleanly."""
+    rng = np.random.default_rng(0)
+    s = _Run(_config(tmp_path))
+    t0 = 1.0
+    for k in range(int(3.0 / IMU_DT)):
+        assert s.push_imu(t0 + k * IMU_DT, [0.0, 0.0, 9.81], [0.0, 0.0, 0.0])
+        if k % SWEEP_IMU == SWEEP_IMU - 1:
+            start = t0 + (k - SWEEP_IMU + 1) * IMU_DT
+            rel = np.sort(rng.uniform(0.0, 0.0999, 3000))
+            body = np.zeros((3000, 3)) if start - t0 >= 1.5 else _room(rng, 3000)
+            assert s.push_lidar(start, body, rel)
+    s.finish()
+    status = s.front.status()
+    assert status["lidar_empty"] == 15
+    assert status["sweeps_finalized"] == 29
+    assert status["sweeps_unfinished"] == 1
+
+
+def test_rejects_non_finite_inputs_and_configs(tmp_path):
+    cfg = _config(tmp_path)
+    for bad in (
+        {"lidar": {"time_offset_s": float("nan")}},
+        {"lidar": {"max_range_m": float("inf")}},
+        {"imu": {"acc_noise_std": [1.0, float("nan"), 1.0]}},
+        {"calibration": {"translation": [0.0, float("nan"), 0.0], "rotation": [1, 0, 0, 0, 1, 0, 0, 0, 1]}},
+    ):
+        with pytest.raises(ValueError):
+            resbie.FrontEnd([cfg, bad])
+    with pytest.raises(ValueError):
+        resbie.BackEnd({"loop_max_correction_z": float("nan")})
+
+    front = resbie.FrontEnd(cfg)
+    back = resbie.BackEnd({})
+    for end in (front, back):
+        with pytest.raises(ValueError, match="acceleration must be finite"):
+            end.push_imu(1.0, [0.0, float("nan"), 9.81], [0.0, 0.0, 0.0])
+        with pytest.raises(ValueError, match="angular_velocity must be finite"):
+            end.push_imu(1.0, [0.0, 0.0, 9.81], [0.0, float("inf"), 0.0])
+    with pytest.raises(ValueError, match="pose translation must be finite"):
+        back.push_lio(1.0, [float("nan"), 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], np.ones((10, 3)))
+
+
 @pytest.mark.parametrize(
     "extra",
     [

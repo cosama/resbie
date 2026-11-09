@@ -106,12 +106,15 @@ order. Honest point timestamps only.
   notice kept in [`core/vendor/bievr/LICENSE`](core/vendor/bievr/LICENSE).
 - **The fun uncle:** Iheb Soula, whose
   [BIEVR-LIO-SLAM](https://github.com/S0UL4/BIEVR-LIO-SLAM) fork brought the
-  loop closer and Scan Context to the party. He forked dad one commit before
+  pose-graph loop closer to the party. He forked dad one commit before
   dad put his license on, so the uncle showed up without one. We're
   assuming he meant dad's BSD-3, like any good uncle would.
-- **Distant relatives:** Giseop Kim and Ayoung Kim, whose Scan Context
-  (IROS 2018) the uncle reimplemented; nanoflann (BSD) and helpers from
-  basalt-headers (BSD-3), each with its license in its header.
+- **Distant relatives:** [BTC](https://github.com/hku-mars/BTC_descriptor) by
+  Chongjian Yuan, Jiarong Lin, Zuhao Zou, Xiaoping Hong and Fu Zhang ("BTC: A
+  Binary and Triangle Combined Descriptor for 3-D Place Recognition", T-RO
+  2024); [small_gicp](https://github.com/koide3/small_gicp) by Kenji Koide
+  (MIT, [`core/vendor/small_gicp/LICENSE`](core/vendor/small_gicp/LICENSE));
+  and helpers from basalt-headers (BSD-3), each with its license in its header.
 
 ## Credits
 

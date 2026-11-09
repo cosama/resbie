@@ -184,9 +184,9 @@ outputs:
   and pitch are left to gravity.
 - Loop closures (Binary Triangle Combined descriptors `BTC` + `small_gicp` over
   local odometry submaps, seeded from BTC's 6-DoF triangle solver) add relative
-  poses. BTC sees each local submap cloud levelled on gravity (by the graph's
-  corrected attitude, heading kept), not in the body frame, which may be tilted
-  or mounted upside down.
+  poses. BTC sees each local submap cloud levelled on gravity (using the
+  front-end odometry pose's roll and pitch `R_level_body(pose)`, heading kept),
+  not in the body frame, which may be tilted or mounted upside down.
 - iSAM2 updates incrementally per keyframe (loop search uses the corrected
   map); `finish()` runs Graduated Non-Convexity (GNC) over the loop candidates
   followed by one batch Levenberg-Marquardt optimization of the whole graph.

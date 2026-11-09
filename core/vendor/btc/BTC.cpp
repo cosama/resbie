@@ -57,14 +57,13 @@ void BTCOctoTree::init_plane() {
 
 void STDescManager::GenerateSTDescs(
     pcl::PointCloud<pcl::PointXYZI>::Ptr &input_cloud,
-    std::vector<STD> &stds_vec, int id) {
+    std::vector<STD> &stds_vec) {
   // Step 1: voxelization and plane detection
   std::unordered_map<BTCVOXEL_LOC, BTCOctoTree *> voxel_map;
   init_voxel_map(input_cloud, voxel_map);
   pcl::PointCloud<pcl::PointXYZINormal>::Ptr plane_cloud(
       new pcl::PointCloud<pcl::PointXYZINormal>);
   get_plane(voxel_map, plane_cloud);
-  plane_cloud->header.seq = id;
   plane_cloud_vec_.push_back(plane_cloud);
 
   // Step 2: project plane extraction and binary descriptors
@@ -105,13 +104,9 @@ void STDescManager::GenerateSTDescs(
   }
 }
 
-void STDescManager::SearchLoop(
-    std::vector<STD> &stds_vec, std::pair<int, double> &loop_result,
-    std::pair<Eigen::Vector3d, Eigen::Matrix3d> &loop_transform,
-    pcl::PointCloud<pcl::PointXYZINormal>::Ptr pl_cur) {
+void STDescManager::SearchLoop(std::vector<STD> &stds_vec) {
   last_verified_candidates_.clear();
-  if (stds_vec.empty()) {
-    loop_result = std::pair<int, double>(-1, 0.0);
+  if (stds_vec.empty() || plane_cloud_vec_.empty()) {
     return;
   }
   // Step 1: select rough candidates by descriptor voting
@@ -119,9 +114,7 @@ void STDescManager::SearchLoop(
   candidate_selector(stds_vec, candidate_matcher_vec);
 
   // Step 2: verify candidates via 6-DoF triangle solver + plane geometry check
-  double best_score = 0.0;
-  int best_candidate_id = -1;
-  std::pair<Eigen::Vector3d, Eigen::Matrix3d> best_transform;
+  const auto &pl_cur = plane_cloud_vec_.back();
   for (size_t i = 0; i < candidate_matcher_vec.size(); i++) {
     double verify_score = -1.0;
     std::pair<Eigen::Vector3d, Eigen::Matrix3d> relative_pose;
@@ -130,23 +123,11 @@ void STDescManager::SearchLoop(
       last_verified_candidates_.push_back(
           {candidate_matcher_vec[i].match_id_.second, verify_score, relative_pose});
     }
-    if (verify_score > best_score) {
-      best_score = verify_score;
-      best_candidate_id = candidate_matcher_vec[i].match_id_.second;
-      best_transform = relative_pose;
-    }
   }
   std::sort(last_verified_candidates_.begin(), last_verified_candidates_.end(),
             [](const VerifiedCandidate &a, const VerifiedCandidate &b) {
               return a.score > b.score;
             });
-
-  if (best_score > config_setting_.icp_threshold_) {
-    loop_result = std::pair<int, double>(best_candidate_id, best_score);
-    loop_transform = best_transform;
-  } else {
-    loop_result = std::pair<int, double>(-1, 0.0);
-  }
 }
 
 void STDescManager::AddSTDescs(const std::vector<STD> &stds_vec) {
@@ -217,107 +198,23 @@ void STDescManager::get_project_plane(
       origin_list.push_back(kv.second->plane_ptr_);
     }
   }
-  for (size_t i = 0; i < origin_list.size(); i++) {
-    origin_list[i]->id_ = 0;
-  }
-  if (origin_list.empty()) return;
-  int current_id = 1;
-  for (auto iter = origin_list.end() - 1; iter != origin_list.begin(); iter--) {
-    for (auto iter2 = origin_list.begin(); iter2 != iter; iter2++) {
-      Eigen::Vector3d normal_diff = (*iter)->normal_ - (*iter2)->normal_;
-      Eigen::Vector3d normal_add = (*iter)->normal_ + (*iter2)->normal_;
-      double dis1 =
-          std::fabs((*iter)->normal_(0) * (*iter2)->center_(0) +
-                    (*iter)->normal_(1) * (*iter2)->center_(1) +
-                    (*iter)->normal_(2) * (*iter2)->center_(2) + (*iter)->d_);
-      double dis2 =
-          std::fabs((*iter2)->normal_(0) * (*iter)->center_(0) +
-                    (*iter2)->normal_(1) * (*iter)->center_(1) +
-                    (*iter2)->normal_(2) * (*iter)->center_(2) + (*iter2)->d_);
-      if (normal_diff.norm() < config_setting_.plane_merge_normal_thre_ ||
-          normal_add.norm() < config_setting_.plane_merge_normal_thre_) {
-        if (dis1 < config_setting_.plane_merge_dis_thre_ &&
-            dis2 < config_setting_.plane_merge_dis_thre_) {
-          if ((*iter)->id_ == 0 && (*iter2)->id_ == 0) {
-            (*iter)->id_ = current_id;
-            (*iter2)->id_ = current_id;
-            current_id++;
-          } else if ((*iter)->id_ == 0 && (*iter2)->id_ != 0) {
-            (*iter)->id_ = (*iter2)->id_;
-          } else if ((*iter)->id_ != 0 && (*iter2)->id_ == 0) {
-            (*iter2)->id_ = (*iter)->id_;
-          }
-        }
-      }
-    }
-  }
-  std::vector<BTCPlane *> merge_list;
-  std::vector<int> merge_flag;
-
-  for (size_t i = 0; i < origin_list.size(); i++) {
-    auto it =
-        std::find(merge_flag.begin(), merge_flag.end(), origin_list[i]->id_);
-    if (it != merge_flag.end()) continue;
-    if (origin_list[i]->id_ == 0) continue;
-    BTCPlane *merge_plane = new BTCPlane;
-    (*merge_plane) = (*origin_list[i]);
-    bool is_merge = false;
-    for (size_t j = 0; j < origin_list.size(); j++) {
-      if (i == j) continue;
-      if (origin_list[j]->id_ == origin_list[i]->id_) {
-        is_merge = true;
-        Eigen::Matrix3d P_PT1 =
-            (merge_plane->covariance_ +
-             merge_plane->center_ * merge_plane->center_.transpose()) *
-            merge_plane->points_size_;
-        Eigen::Matrix3d P_PT2 =
-            (origin_list[j]->covariance_ +
-             origin_list[j]->center_ * origin_list[j]->center_.transpose()) *
-            origin_list[j]->points_size_;
-        Eigen::Vector3d merge_center =
-            (merge_plane->center_ * merge_plane->points_size_ +
-             origin_list[j]->center_ * origin_list[j]->points_size_) /
-            (merge_plane->points_size_ + origin_list[j]->points_size_);
-        Eigen::Matrix3d merge_covariance =
-            (P_PT1 + P_PT2) /
-                (merge_plane->points_size_ + origin_list[j]->points_size_) -
-            merge_center * merge_center.transpose();
-        merge_plane->covariance_ = merge_covariance;
-        merge_plane->center_ = merge_center;
-        merge_plane->points_size_ =
-            merge_plane->points_size_ + origin_list[j]->points_size_;
-        Eigen::EigenSolver<Eigen::Matrix3d> es(merge_plane->covariance_);
-        Eigen::Matrix3cd evecs = es.eigenvectors();
-        Eigen::Vector3d evalsReal = es.eigenvalues().real();
-        Eigen::Matrix3f::Index evalsMin;
-        evalsReal.rowwise().sum().minCoeff(&evalsMin);
-        merge_plane->normal_ << evecs.real()(0, evalsMin),
-            evecs.real()(1, evalsMin), evecs.real()(2, evalsMin);
-        merge_plane->d_ = -(merge_plane->normal_(0) * merge_plane->center_(0) +
-                            merge_plane->normal_(1) * merge_plane->center_(1) +
-                            merge_plane->normal_(2) * merge_plane->center_(2));
-      }
-    }
-    if (is_merge) {
-      merge_flag.push_back(merge_plane->id_);
-      merge_list.push_back(merge_plane);
-    } else {
-      delete merge_plane;
-    }
-  }
-  project_plane_list = merge_list;
+  merge_plane_clusters(origin_list, project_plane_list, /*keep_unmerged=*/false);
 }
 
 void STDescManager::merge_plane(std::vector<BTCPlane *> &origin_list,
                                 std::vector<BTCPlane *> &merge_plane_list) {
-  if (origin_list.size() == 1) {
-    merge_plane_list = origin_list;
-    return;
-  }
+  merge_plane_clusters(origin_list, merge_plane_list, /*keep_unmerged=*/true);
+}
+
+void STDescManager::merge_plane_clusters(
+    std::vector<BTCPlane *> &origin_list,
+    std::vector<BTCPlane *> &merge_plane_list,
+    bool keep_unmerged) {
+  merge_plane_list.clear();
+  if (origin_list.empty()) return;
   for (size_t i = 0; i < origin_list.size(); i++) {
     origin_list[i]->id_ = 0;
   }
-  if (origin_list.empty()) return;
   int current_id = 1;
   for (auto iter = origin_list.end() - 1; iter != origin_list.begin(); iter--) {
     for (auto iter2 = origin_list.begin(); iter2 != iter; iter2++) {
@@ -355,16 +252,16 @@ void STDescManager::merge_plane(std::vector<BTCPlane *> &origin_list,
         std::find(merge_flag.begin(), merge_flag.end(), origin_list[i]->id_);
     if (it != merge_flag.end()) continue;
     if (origin_list[i]->id_ == 0) {
-      merge_plane_list.push_back(origin_list[i]);
+      if (keep_unmerged) {
+        merge_plane_list.push_back(origin_list[i]);
+      }
       continue;
     }
     BTCPlane *merge_plane = new BTCPlane;
     (*merge_plane) = (*origin_list[i]);
-    bool is_merge = false;
     for (size_t j = 0; j < origin_list.size(); j++) {
       if (i == j) continue;
       if (origin_list[j]->id_ == origin_list[i]->id_) {
-        is_merge = true;
         Eigen::Matrix3d P_PT1 =
             (merge_plane->covariance_ +
              merge_plane->center_ * merge_plane->center_.transpose()) *
@@ -388,7 +285,7 @@ void STDescManager::merge_plane(std::vector<BTCPlane *> &origin_list,
         Eigen::EigenSolver<Eigen::Matrix3d> es(merge_plane->covariance_);
         Eigen::Matrix3cd evecs = es.eigenvectors();
         Eigen::Vector3d evalsReal = es.eigenvalues().real();
-        Eigen::Matrix3f::Index evalsMin;
+        Eigen::Matrix3d::Index evalsMin;
         evalsReal.rowwise().sum().minCoeff(&evalsMin);
         merge_plane->normal_ << evecs.real()(0, evalsMin),
             evecs.real()(1, evalsMin), evecs.real()(2, evalsMin);
@@ -397,12 +294,8 @@ void STDescManager::merge_plane(std::vector<BTCPlane *> &origin_list,
                             merge_plane->normal_(2) * merge_plane->center_(2));
       }
     }
-    if (is_merge) {
-      merge_flag.push_back(merge_plane->id_);
-      merge_plane_list.push_back(merge_plane);
-    } else {
-      delete merge_plane;
-    }
+    merge_flag.push_back(merge_plane->id_);
+    merge_plane_list.push_back(merge_plane);
   }
 }
 
@@ -921,7 +814,6 @@ void STDescManager::candidate_selector(
         match_array[k] = 0;
       }
       STDMatchList match_triangle_list;
-      match_triangle_list.match_id_.first = current_frame_id_;
       match_triangle_list.match_id_.second = max_vote_index;
       const auto &matches = frame_matches[max_vote_index];
       match_triangle_list.match_list_.reserve(matches.size());

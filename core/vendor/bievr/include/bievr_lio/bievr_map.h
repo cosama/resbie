@@ -34,7 +34,7 @@ struct Voxel {
 class BIEVRMap {
  public:
   struct Config {
-    size_t max_size{10000000};  // maximum number of voxels to store
+    size_t max_size{1500000};   // maximum number of voxels to store
     double voxel_size{0.5};     // voxel side length
     double px_size{0.05};       // size of bump image pixels
     double norm_tol_deg{3.0};   // if normal changes more than this, reproject bump image

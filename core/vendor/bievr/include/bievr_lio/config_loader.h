@@ -12,6 +12,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
+#include <cmath>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -105,10 +106,15 @@ inline bool extrinsicFromVectors(const std::vector<double>& t_vec, const std::ve
     return false;
   }
   const V3 t(t_vec[0], t_vec[1], t_vec[2]);
-  out = Transform();
-  out.linear() << R_vec[0], R_vec[1], R_vec[2], R_vec[3], R_vec[4], R_vec[5], R_vec[6], R_vec[7],
-      R_vec[8];
-  out.translation() = t;
+  Transform candidate;
+  candidate.linear() << R_vec[0], R_vec[1], R_vec[2], R_vec[3], R_vec[4], R_vec[5], R_vec[6],
+      R_vec[7], R_vec[8];
+  candidate.translation() = t;
+  if (!candidate.matrix().allFinite()) {
+    LOG(E, "Config error: " << label << " must be finite.");
+    return false;
+  }
+  out = candidate;
   return true;
 }
 
@@ -126,6 +132,7 @@ bool read(const MergedYaml& yaml, const std::string& key, T& value, Min min = Mi
   constexpr bool kUnsigned = std::is_unsigned_v<T> && !std::is_same_v<T, bool>;
   if (kUnsigned && min == Min::kNone) min = Min::kZero;
   const auto inRange = [min](double v) {
+    if (!std::isfinite(v)) return false;
     return min == Min::kNone || (min == Min::kZero ? v >= 0.0 : v > 0.0);
   };
   T v = value;
@@ -155,7 +162,8 @@ bool read(const MergedYaml& yaml, const std::string& key, T& value, Min min = Mi
     return false;
   }
   if (!in_range) {
-    LOG(E, "Config error: '" << key << "' must be " << (min == Min::kZero ? ">= 0." : "> 0."));
+    LOG(E, "Config error: '" << key << "' must be finite"
+                             << (min == Min::kNone ? "." : (min == Min::kZero ? " and >= 0." : " and > 0.")));
     return false;
   }
   value = v;

@@ -59,7 +59,9 @@ double nsToS(int64_t ns) { return static_cast<double>(ns) * 1e-9; }
 Eigen::Vector3d toV3(const Array& a, const char* name) {
   if (a.size() != 3) throw std::invalid_argument(std::string(name) + " must have 3 elements");
   const double* p = a.data();
-  return Eigen::Vector3d(p[0], p[1], p[2]);
+  const Eigen::Vector3d v(p[0], p[1], p[2]);
+  if (!v.allFinite()) throw std::invalid_argument(std::string(name) + " must be finite");
+  return v;
 }
 
 std::vector<double> vec(const Eigen::Vector3d& v) { return {v.x(), v.y(), v.z()}; }
@@ -376,7 +378,9 @@ class BackEnd {
     const double* v = pose.data();
     const Eigen::Quaterniond q(v[6], v[3], v[4], v[5]);
     if (!(std::abs(q.norm() - 1.0) < 1e-6)) throw std::invalid_argument("pose quaternion must be unit");
-    const bievr::Transform T_W_I(q, Eigen::Vector3d(v[0], v[1], v[2]));
+    const Eigen::Vector3d pos(v[0], v[1], v[2]);
+    if (!pos.allFinite()) throw std::invalid_argument("pose translation must be finite");
+    const bievr::Transform T_W_I(q, pos);
     const bievr::LoopCloser::PointsView cloud(
         Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>(
             points.data(), points.shape(0), points.shape(1)));

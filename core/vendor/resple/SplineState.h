@@ -249,11 +249,11 @@ class SplineState
     static const Eigen::Matrix4d base_coefficients;
     static const Eigen::Matrix4d cumulative_blending_matrix;
 
-    int64_t dt_ns;
-    double inv_dt;
-    std::array<double, 4> pow_inv_dt;
-    int64_t num_knot;
-    int64_t start_t_ns;
+    int64_t dt_ns{0};
+    double inv_dt{0.0};
+    std::array<double, 4> pow_inv_dt{{0.0, 0.0, 0.0, 0.0}};
+    int64_t num_knot{0};
+    int64_t start_t_ns{0};
 
     std::array<Eigen::Vector3d, 3> t_idle;
     std::array<Eigen::Vector3d, 3> ort_delta_idle;
@@ -377,6 +377,6 @@ class SplineState
     }
 };
 
-const Eigen::Matrix4d SplineState::base_coefficients = SplineState::computeBaseCoefficients();
-const Eigen::Matrix4d SplineState::blending_matrix = SplineState::computeBlendingMatrix();
-const Eigen::Matrix4d SplineState::cumulative_blending_matrix = SplineState::computeBlendingMatrix<true>();
+inline const Eigen::Matrix4d SplineState::base_coefficients = SplineState::computeBaseCoefficients();
+inline const Eigen::Matrix4d SplineState::blending_matrix = SplineState::computeBlendingMatrix();
+inline const Eigen::Matrix4d SplineState::cumulative_blending_matrix = SplineState::computeBlendingMatrix<true>();

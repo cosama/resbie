@@ -314,7 +314,7 @@ bool BIEVRMap::updateNormal(Voxel& voxel) {
   if (voxel.observed_) {
     // The previous normal is the Z axis of the old frame
     const Eigen::Vector3d& prev_normal = voxel.T_O_W_.linear().row(2);
-    double angle = std::acos(std::abs(prev_normal.dot(normal)));
+    double angle = std::acos(std::min(1.0, std::abs(prev_normal.dot(normal))));
     if (angle > norm_tol_rad_) {
       update_normal = true;
     }
@@ -561,13 +561,14 @@ void BIEVRMap::computeScore(Voxel& voxel) {
     }
   }
 
-  voxel.mean_img_dist_ = sum_img_dist / total_count;
-
   // Discourage voxels with few observed pixels as they have lower probability of giving successful
   // correspondences
   if (total_count < 5) {
-    voxel.mean_img_dist_ = 0;
+    voxel.mean_img_dist_ = 0.0;
+    return;
   }
+
+  voxel.mean_img_dist_ = sum_img_dist / total_count;
 }
 
 Eigen::Vector3d BIEVRMap::getVoxelOrigin(const Eigen::Vector3d& point) const {

@@ -10,7 +10,6 @@
 // whatever the odometry drifted to; the first keyframe's prior fixes only
 // yaw and position.
 
-#include <cmath>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -51,11 +50,11 @@ class LoopCloser {
     int sc_num_exclude_recent = 30;     // recent keyframes excluded from loop search
 
     double loop_fitness_score_threshold = 0.3;  // reject loops scoring above this
-    // Reject a loop whose ICP result would move the current keyframe vertically by more than this [m].
-    // A match to the wrong floor or stairwell flight needs a floor height (>= 2-3 m); true loops need
-    // < 0.8 m on 99% of the handheld and drone sets. A constant on purpose: a bound that widened with
-    // distance would let a one-floor-up return through. Platforms whose odometry sinks further between
-    // loops (e.g. a vehicle) need a larger value.
+    // Reject a loop whose ICP result would move the current keyframe vertically by more than this [m]
+    // (raised to at least 2.7 m when keyframe travel distance span >= 600 m and horizontal shift <= 5 m).
+    // A match to the wrong floor or stairwell flight needs a floor height (>= 2-3 m); true short/medium
+    // loops need < 0.8 m on 99% of the handheld and drone sets, while long-span loops whose horizontal
+    // closure already agrees within 5 m can accumulate up to ~2.5 m of vertical odometry drift.
     double loop_max_correction_z = 1.5;
 
     double prior_noise_score = 1e-12;
@@ -171,6 +170,9 @@ class LoopCloser {
   std::vector<Eigen::Matrix3d> keyframe_level_rotations_;
   std::vector<double> keyframe_travel_dist_;
   mutable std::vector<std::shared_ptr<PreparedSubmap>> prepared_submaps_;
+  mutable int incomplete_submap_key_ = -1;
+  mutable int incomplete_submap_count_ = -1;
+  mutable std::shared_ptr<PreparedSubmap> incomplete_submap_;
 
   std::unique_ptr<STDescManager> std_manager_;
 

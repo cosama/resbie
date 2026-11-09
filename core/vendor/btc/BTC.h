@@ -127,6 +127,9 @@ class BTCOctoTree {
   explicit BTCOctoTree(const ConfigSetting &config_setting)
       : config_setting_(config_setting), plane_ptr_(new BTCPlane) {}
 
+  BTCOctoTree(const BTCOctoTree &) = delete;
+  BTCOctoTree &operator=(const BTCOctoTree &) = delete;
+
   void init_plane();
   void init_octo_tree();
 
@@ -166,13 +169,10 @@ class STDescManager {
 
   // generate STDescs from a point cloud
   void GenerateSTDescs(pcl::PointCloud<pcl::PointXYZI>::Ptr &input_cloud,
-                       std::vector<STD> &stds_vec, int id);
+                       std::vector<STD> &stds_vec);
 
-  // search result <candidate_id, plane icp score>. -1 for no loop
-  void SearchLoop(std::vector<STD> &stds_vec,
-                  std::pair<int, double> &loop_result,
-                  std::pair<Eigen::Vector3d, Eigen::Matrix3d> &loop_transform,
-                  pcl::PointCloud<pcl::PointXYZINormal>::Ptr pl_cur);
+  // search loop candidates and populate last_verified_candidates_
+  void SearchLoop(std::vector<STD> &stds_vec);
 
   // add descriptors to database
   void AddSTDescs(const std::vector<STD> &stds_vec);
@@ -191,6 +191,10 @@ class STDescManager {
 
   void merge_plane(std::vector<BTCPlane *> &origin_list,
                    std::vector<BTCPlane *> &merge_plane_list);
+
+  void merge_plane_clusters(std::vector<BTCPlane *> &origin_list,
+                            std::vector<BTCPlane *> &merge_plane_list,
+                            bool keep_unmerged);
 
   // extract corner points from pre-built voxel map and clouds
   void binary_extractor(const std::vector<BTCPlane *> &proj_plane_list,

@@ -326,12 +326,8 @@ bool LoopCloser::addFrame(uint64_t stamp, const Transform& T_W_I, const PointsVi
   plbtc->is_dense = true;
 
   std::vector<STD> stds_vec;
-  std_manager_->GenerateSTDescs(plbtc, stds_vec, current);
-  std::pair<int, double> search_result(-1, 0.0);
-  std::pair<Eigen::Vector3d, Eigen::Matrix3d> loop_transform(
-      Eigen::Vector3d::Zero(), Eigen::Matrix3d::Identity());
-  std_manager_->SearchLoop(stds_vec, search_result, loop_transform,
-                           std_manager_->plane_cloud_vec_.back());
+  std_manager_->GenerateSTDescs(plbtc, stds_vec);
+  std_manager_->SearchLoop(stds_vec);
   std_manager_->AddSTDescs(stds_vec);
 
   if (!std_manager_->last_verified_candidates_.empty()) {
@@ -551,8 +547,11 @@ std::shared_ptr<LoopCloser::PreparedSubmap> LoopCloser::getOrPrepareSubmap(
   const int count = static_cast<int>(keyframe_clouds_.size());
   if (anchor_key < 0 || anchor_key >= count) return nullptr;
   const bool complete = (anchor_key + kSubmapKfRadius < count);
-  if (complete && prepared_submaps_[anchor_key]) {
-    return prepared_submaps_[anchor_key];
+  if (complete) {
+    if (prepared_submaps_[anchor_key]) return prepared_submaps_[anchor_key];
+  } else if (incomplete_submap_ && incomplete_submap_key_ == anchor_key &&
+             incomplete_submap_count_ == count) {
+    return incomplete_submap_;
   }
   const double v = std::max(0.05, config_.icp_filter_size);
   const small_gicp::PointCloud raw =
@@ -572,6 +571,10 @@ std::shared_ptr<LoopCloser::PreparedSubmap> LoopCloser::getOrPrepareSubmap(
   }
   if (complete) {
     prepared_submaps_[anchor_key] = prep;
+  } else {
+    incomplete_submap_key_ = anchor_key;
+    incomplete_submap_count_ = count;
+    incomplete_submap_ = prep;
   }
   return prep;
 }
@@ -661,8 +664,7 @@ std::optional<gtsam::Pose3> LoopCloser::computeLoopConstraint(
     const bool graph_ok = res_graph.converged && (fit_graph.overlap >= kMinLoopOverlap) &&
                           std::isfinite(fit_graph.fitness) &&
                           (fit_graph.fitness <= config_.loop_fitness_score_threshold);
-    if (!btc_drift_ok || graph_ok || (!res_fine.converged && res_graph.converged) ||
-        (res_graph.converged && fit_graph.overlap > fit.overlap)) {
+    if (!btc_drift_ok || graph_ok || (res_graph.converged && fit_graph.overlap > fit.overlap)) {
       res_fine = res_graph;
       fit = fit_graph;
       seed_used = "graph";

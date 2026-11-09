@@ -132,8 +132,10 @@ class Odometry {
     if (stats_.imu_accepted++ == 0) first_imu_ns_ = t_ns;
     // The last kInitImuSamples before initialization set gravity (init may
     // come long after the first sample: it waits for a dense sweep).
-    init_imu_.emplace_back(t_ns, gyro, acc);
-    if (init_imu_.size() > kInitImuSamples) init_imu_.pop_front();
+    if (!initialized_) {
+      init_imu_.emplace_back(t_ns, gyro, acc);
+      if (init_imu_.size() > kInitImuSamples) init_imu_.pop_front();
+    }
     imu_buff_.emplace_back(t_ns, gyro, acc);
     imu_hist_.emplace_back(t_ns, acc);
     process();
@@ -352,6 +354,7 @@ class Odometry {
     covered_until_ = sweep.end_ns;
     pending_final_.push_back(std::move(sweep));
     sweeps_.pop_front();
+    init_imu_.clear();
     initialized_ = true;
     return 1;
   }
@@ -388,9 +391,16 @@ class Odometry {
 
   double pointVariance() const { return cfg_.point_noise_std * cfg_.point_noise_std; }
 
+  // Latest timestamp known to have been promoted into the measurement buffer
+  // (either the last sampled point, or the end of a promoted empty sweep).
+  int64_t bufferedUntil() const {
+    return pt_buff_.empty() ? empty_covered_until_
+                            : std::max(empty_covered_until_, pt_buff_.back().time_ns);
+  }
+
   // collectMeasurements() would stop for lack of points.
   bool needPoints() const {
-    return pt_buff_.empty() || pt_buff_.back().time_ns <= spline_->maxTimeNs() + dt_ns_;
+    return bufferedUntil() <= spline_->maxTimeNs() + dt_ns_;
   }
 
   // Selects the sweep's measurement points (BIEVR's downsampling and informed
@@ -424,6 +434,9 @@ class Odometry {
     for (size_t i : selected) {
       pt_buff_.emplace_back(Eigen::Vector3d(sweep.points[i]), sweep.times[i], pointVariance());
     }
+    if (selected.empty()) {
+      empty_covered_until_ = std::max(empty_covered_until_, sweep.end_ns);
+    }
     pending_final_.push_back(std::move(sweep));
   }
 
@@ -435,9 +448,7 @@ class Odometry {
     // Gap: no point up to the next knot, but the arrived sweeps (or a later
     // point) show LiDAR has nothing there. Step one knot on IMU alone.
     const bool point_before_next = !pt_buff_.empty() && pt_buff_.front().time_ns <= next;
-    const int64_t lidar_known =
-        std::max(covered_until_, pt_buff_.empty() ? covered_until_ : pt_buff_.front().time_ns);
-    if (!point_before_next && lidar_known > next) {
+    if (!point_before_next && covered_until_ > next) {
       if (imu_buff_.empty() || imu_buff_.back().time_ns < next) return false;
       estimator_.propRCP(next);
       ++stats_.gap_knots;
@@ -445,10 +456,8 @@ class Odometry {
       return true;
     }
 
-    if (pt_buff_.empty()) return false;
+    if (pt_buff_.empty() || bufferedUntil() <= next) return false;
     const int64_t pt_min_time = pt_buff_.front().time_ns;
-    const int64_t pt_max_time = pt_buff_.back().time_ns;
-    if (pt_max_time <= next) return false;
     if (pt_min_time > spline_->maxTimeNs()) {
       if (imu_buff_.empty() || imu_buff_.back().time_ns < next) return false;
       estimator_.propRCP(next);
@@ -606,6 +615,7 @@ class Odometry {
   SplineState* spline_ = nullptr;
   bool initialized_ = false;
   int64_t covered_until_ = std::numeric_limits<int64_t>::min();  // LiDAR seen up to here
+  int64_t empty_covered_until_ = std::numeric_limits<int64_t>::min();  // empty sweeps seen up to here
 
   std::deque<ImuData> init_imu_;
   std::deque<std::pair<int64_t, Eigen::Vector3d>> imu_hist_;  // raw acc, for checkImuPosterior

@@ -19,13 +19,10 @@ struct ImuData {
     Eigen::Matrix<double, 6, 24> H;
     Eigen::Matrix<double, 3, 2> H_grav = Eigen::Matrix<double, 3, 2>::Zero();  // resbie: d acc / d gravity tangent
     Eigen::Matrix<double, 6, 1> imu_itp;
-    ImuData(){}
     ImuData(const int64_t s, const Eigen::Vector3d& w, const Eigen::Vector3d& a)
       : time_ns(s), gyro(w), accel(a) {}
 
-    ImuData(const ImuData& other) : time_ns(other.time_ns), gyro(other.gyro), accel(other.accel),
-    H(other.H), H_grav(other.H_grav), imu_itp(other.imu_itp) {
-    }
+    ImuData(const ImuData& other) = default;
     ImuData& operator=(const ImuData& other) = default;
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 };

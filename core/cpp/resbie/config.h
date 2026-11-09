@@ -71,14 +71,7 @@ struct Config {
   MapAssociationConfig association; // huber_delta_m
 
   // map (BIEVR bump-image map)
-  bievr::BIEVRMap::Config map = [] {
-    bievr::BIEVRMap::Config m;
-    m.px_size = 0.05;
-    m.voxel_size = 0.5;
-    m.norm_tol_deg = 3.0;
-    m.max_size = 1500000;
-    return m;
-  }();
+  bievr::BIEVRMap::Config map{};
   size_t init_min_voxels = 100;  // distinct map voxels the seeding sweep must cover
 };
 

@@ -4,8 +4,8 @@
 // FrontEnd: RESPLE's spline filter on BIEVR's map. IMU and LiDAR in; each
 //   finished sweep out as a LIO result: (stamp, pose, points deskewed into the IMU
 //   frame there).
-// BackEnd: BIEVR's loop closer (Scan Context, ICP, GTSAM graph with IMU
-//   factors). IMU and the front end's LIO results in; loop-closed keyframes out.
+// BackEnd: BIEVR's loop closer (BTC, small_gicp, GTSAM graph with IMU
+//   factors and GNC). IMU and the front end's LIO results in; loop-closed keyframes out.
 //
 // Each owns its configuration and drains its own outputs. Both are synchronous:
 // every push returns after all processing it triggered has finished, so
@@ -497,19 +497,13 @@ py::dict frontEndDefaultConfig() {
 // Same for the back end (flat keys); resbie.BackEnd.DEFAULT_CONFIG.
 py::dict backEndDefaultConfig() {
   const bievr::LoopCloser::Config lc;
-  const auto& sc = lc.scan_context;
   return py::dict(
       py::arg("keyframe_meter_gap") = lc.keyframe_meter_gap,
       py::arg("keyframe_deg_gap") = lc.keyframe_deg_gap,
       py::arg("keyframe_filter_size") = lc.keyframe_filter_size,
-      py::arg("icp_filter_size") = lc.icp_filter_size, py::arg("sc_num_rings") = sc.num_rings,
-      py::arg("sc_num_sectors") = sc.num_sectors, py::arg("sc_max_radius") = sc.max_radius,
-      py::arg("sc_lidar_height") = sc.lidar_height,
-      py::arg("sc_num_exclude_recent") = sc.num_exclude_recent,
-      py::arg("sc_num_candidates") = sc.num_candidates,
-      py::arg("sc_search_ratio") = sc.search_ratio,
-      py::arg("sc_dist_threshold") = sc.dist_threshold,
-      py::arg("sc_tree_making_period") = sc.tree_making_period,
+      py::arg("icp_filter_size") = lc.icp_filter_size,
+      py::arg("sc_max_radius") = lc.sc_max_radius,
+      py::arg("sc_num_exclude_recent") = lc.sc_num_exclude_recent,
       py::arg("loop_fitness_score_threshold") = lc.loop_fitness_score_threshold,
       py::arg("loop_max_correction_z") = lc.loop_max_correction_z,
       py::arg("prior_noise_score") = lc.prior_noise_score,

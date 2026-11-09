@@ -13,7 +13,7 @@ changed from upstream.
 - **From BIEVR:** the map, the point selection and the loop closer. Per-voxel
   oriented height images with sub-voxel gradients (sharp maps, fine
   structure), BIEVR's voxel downsampling plus informed sampling, Huber
-  weighting, and Scan Context + GTSAM pose-graph loop closure.
+  weighting, and GTSAM pose-graph loop closure (with BTC + `small_gicp` and GNC).
 - **Dropped:** RESPLE's ikd-tree and ROS layer; BIEVR's LiDAR-only LM
   registration, IMU preintegration window, static bias init and pipeline.
 
@@ -210,7 +210,7 @@ some ambiguity at the start.
 - `vendor/resple`: edited copies of the RESPLE headers, from upstream
   `2f8b09e` (`resple/include`).
 - `vendor/bievr`: edited copies of the BIEVR map, preprocess, and the pgo
-  and scancontext modules, from upstream `b458505`
+  module, from upstream `b458505`
   (`BIEVR-LIO-SLAM`, with the loop closer made synchronous).
 - `vendor/btc`: Binary Triangle Combined (BTC) descriptor and 6-DoF loop
   detector (`BTC.h`, `BTC.cpp`) with per-query vote deduplication, density
@@ -232,9 +232,8 @@ enumerate the delta:
   LM registration is removed (its bump-image sampler is in `bievr_map.h`);
   log++ is replaced by a one-sink logger (`bievr_lio/log.h`); the loop closer
   is synchronous only, carries the IMU (velocity and bias states,
-  CombinedImuFactor, gravity-only prior), verifies loops with GICP over local
-  odometry submaps and GNC at `finish()`, and Scan Context keeps only loop
-  detection.
+  CombinedImuFactor, gravity-only prior), detects loops with BTC, and verifies
+  them with GICP over local odometry submaps and GNC at `finish()`.
 
 ## Point density
 
@@ -273,7 +272,8 @@ Front end, sections by function:
 | `map` | `pixel_size_m`, `voxel_size_m`, `normal_tolerance_deg`, `max_size` (voxels; least recently used ones are evicted beyond it), `init_min_voxels` |
 
 Back end, flat keys: `keyframe_meter_gap`,
-`keyframe_deg_gap`, `keyframe_filter_size`; Scan Context (`sc_*`); ICP
+`keyframe_deg_gap`, `keyframe_filter_size`; loop search (`sc_max_radius`,
+`sc_num_exclude_recent`); GICP
 (`icp_filter_size`, `loop_fitness_score_threshold`,
 `loop_max_correction_z`); the graph's noises (`prior_noise_score`,
 `odom_noise_*`, `loop_noise_*`), iSAM2 (`isam_relinearize_*`) and IMU

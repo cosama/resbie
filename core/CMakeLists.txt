@@ -25,7 +25,6 @@ pybind11_add_module(_core NO_EXTRAS
   cpp/bindings.cpp
   "${BIEVR}/src/bievr_map.cpp"
   "${BIEVR}/src/preprocess.cpp"
-  "${BIEVR}/modules/scancontext/src/scan_context.cpp"
   "${BIEVR}/modules/pgo/src/loop_closer.cpp"
   "${BTC}/BTC.cpp"
 )
@@ -34,7 +33,6 @@ target_include_directories(_core PRIVATE
   cpp
   "${RESPLE}"
   "${BIEVR}/include"
-  "${BIEVR}/modules/scancontext/include"
   "${BIEVR}/modules/pgo/include"
   "${BTC}"
   "${CMAKE_CURRENT_SOURCE_DIR}/vendor/small_gicp/include"

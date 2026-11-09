@@ -1,8 +1,8 @@
 #ifndef BIEVR_PGO_LOOP_CLOSER_H_
 #define BIEVR_PGO_LOOP_CLOSER_H_
 
-// Scan Context loop closure + GTSAM pose graph, running downstream of the
-// odometry. addFrame() runs keyframing, loop detection, ICP and iSAM2 inline,
+// BTC loop closure + small_gicp + GTSAM pose graph, running downstream of the
+// odometry. addFrame() runs keyframing, loop detection, GICP and iSAM2 inline,
 // so a replay is deterministic.
 // resbie: the graph also holds the IMU. Consecutive keyframes are linked by a
 // CombinedImuFactor (preintegrated raw IMU, bias random walk) with gravity
@@ -26,7 +26,6 @@
 #include <gtsam/nonlinear/Values.h>
 
 #include "bievr_lio/common.h"
-#include "bievr_scancontext/scan_context.h"
 
 class STDescManager;
 
@@ -48,7 +47,8 @@ class LoopCloser {
     double keyframe_filter_size = 0.4;  // voxel leaf of the stored keyframe cloud [m]
     double icp_filter_size = 0.4;       // voxel leaf of the loop-closure submap [m]
 
-    ScanContext::Config scan_context;
+    double sc_max_radius = 80.0;        // >= 95.0 selects outdoor BTC preset [m]
+    int sc_num_exclude_recent = 30;     // recent keyframes excluded from loop search
 
     double loop_fitness_score_threshold = 0.3;  // reject loops scoring above this
     // Reject a loop whose ICP result would move the current keyframe vertically by more than this [m].

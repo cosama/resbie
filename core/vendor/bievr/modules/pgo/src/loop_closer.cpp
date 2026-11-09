@@ -81,7 +81,7 @@ double deg2rad(double deg) { return deg * M_PI / 180.0; }
 double headingOf(const Eigen::Matrix3d& R) { return std::atan2(R(1, 0), R(0, 0)); }
 
 // resbie: a pose's gravity-aligned frame: same position and heading, level.
-// Scan Context assumes a level cloud with z up; the body frame can be tilted or
+// BTC assumes a level cloud with z up; the body frame can be tilted or
 // mounted upside down (H420's imu_link is rolled by pi).
 gtsam::Pose3 levelFrame(const gtsam::Pose3& pose) {
   return gtsam::Pose3(gtsam::Rot3::Yaw(headingOf(pose.rotation().matrix())), pose.translation());
@@ -161,7 +161,7 @@ small_gicp::PointCloud buildLocalSubmap(const std::vector<LoopCloser::Cloud::Ptr
 
 ConfigSetting makeBtcConfig(const LoopCloser::Config& config) {
   ConfigSetting btc;
-  const bool outdoor = (config.scan_context.max_radius >= 95.0);
+  const bool outdoor = (config.sc_max_radius >= 95.0);
   if (!outdoor) {
     btc.useful_corner_num_ = 100;
     btc.plane_detection_thre_ = 0.01f;
@@ -175,14 +175,12 @@ ConfigSetting makeBtcConfig(const LoopCloser::Config& config) {
     btc.proj_dis_min_ = -1.0f;
     btc.proj_dis_max_ = 5.0f;
     btc.summary_min_thre_ = 6.0f;
-    btc.line_filter_enable_ = 0;
-    btc.touch_filter_enable_ = 0;
     btc.descriptor_near_num_ = 15.0f;
     btc.descriptor_min_len_ = 1.5f;
     btc.descriptor_max_len_ = 30.0f;
     btc.non_max_suppression_radius_ = 2.0f;
     btc.std_side_resolution_ = 0.2f;
-    btc.skip_near_num_ = config.scan_context.num_exclude_recent;
+    btc.skip_near_num_ = config.sc_num_exclude_recent;
     btc.candidate_num_ = 30;
     btc.rough_dis_threshold_ = 0.015f;
     btc.similarity_threshold_ = 0.45f;
@@ -202,14 +200,12 @@ ConfigSetting makeBtcConfig(const LoopCloser::Config& config) {
     btc.proj_dis_min_ = -1.0f;
     btc.proj_dis_max_ = 10.0f;
     btc.summary_min_thre_ = 6.0f;
-    btc.line_filter_enable_ = 0;
-    btc.touch_filter_enable_ = 0;
     btc.descriptor_near_num_ = 15.0f;
     btc.descriptor_min_len_ = 2.0f;
     btc.descriptor_max_len_ = 50.0f;
     btc.non_max_suppression_radius_ = 3.0f;
     btc.std_side_resolution_ = 0.2f;
-    btc.skip_near_num_ = config.scan_context.num_exclude_recent;
+    btc.skip_near_num_ = config.sc_num_exclude_recent;
     btc.candidate_num_ = 50;
     btc.rough_dis_threshold_ = 0.015f;
     btc.similarity_threshold_ = 0.40f;
@@ -295,19 +291,34 @@ bool LoopCloser::addFrame(uint64_t stamp, const Transform& T_W_I, const PointsVi
   integrateKeyframe(stamp, T_W_I, velocity, cloud);
 
   const int current = static_cast<int>(keyframe_clouds_.size()) - 1;
-  const small_gicp::PointCloud raw_btc_submap =
-      buildLocalSubmap(btc_keyframe_clouds_, keyframe_odom_poses_, current, kSubmapKfRadius);
+  if (current > kSubmapKfRadius) {
+    btc_keyframe_clouds_[current - kSubmapKfRadius - 1].reset();
+  }
   const Eigen::Matrix3d& R_level_curr = keyframe_level_rotations_.at(current);
+  const gtsam::Pose3& anchor_odom = keyframe_odom_poses_[current];
+  const double max_dist_sq = kSubmapMaxDistM * kSubmapMaxDistM;
   pcl::PointCloud<pcl::PointXYZI>::Ptr plbtc(new pcl::PointCloud<pcl::PointXYZI>());
-  plbtc->points.resize(raw_btc_submap.size());
-  for (size_t i = 0; i < raw_btc_submap.size(); ++i) {
-    const Eigen::Vector3d p_level = R_level_curr * raw_btc_submap.point(i).head<3>();
-    pcl::PointXYZI pt;
-    pt.x = static_cast<float>(p_level.x());
-    pt.y = static_cast<float>(p_level.y());
-    pt.z = static_cast<float>(p_level.z());
-    pt.intensity = 0.0f;
-    plbtc->points[i] = pt;
+  for (int i = -kSubmapKfRadius; i <= 0; ++i) {
+    const int near = current + i;
+    if (near < 0 || !btc_keyframe_clouds_[near]) continue;
+    const gtsam::Pose3 rel_odom =
+        (near == current) ? gtsam::Pose3::Identity()
+                          : anchor_odom.between(keyframe_odom_poses_[near]);
+    if (rel_odom.translation().squaredNorm() > max_dist_sq) continue;
+    const Eigen::Matrix3d R_lvl_rel = R_level_curr * rel_odom.rotation().matrix();
+    const Eigen::Vector3d t_lvl_rel = R_level_curr * rel_odom.translation();
+    const auto& near_cloud = *btc_keyframe_clouds_[near];
+    plbtc->points.reserve(plbtc->points.size() + near_cloud.size());
+    for (const auto& src_pt : near_cloud.points) {
+      const Eigen::Vector3d p_level =
+          R_lvl_rel * Eigen::Vector3d(src_pt.x, src_pt.y, src_pt.z) + t_lvl_rel;
+      pcl::PointXYZI pt;
+      pt.x = static_cast<float>(p_level.x());
+      pt.y = static_cast<float>(p_level.y());
+      pt.z = static_cast<float>(p_level.z());
+      pt.intensity = 0.0f;
+      plbtc->points.push_back(pt);
+    }
   }
   plbtc->width = static_cast<uint32_t>(plbtc->points.size());
   plbtc->height = 1;
@@ -318,24 +329,23 @@ bool LoopCloser::addFrame(uint64_t stamp, const Transform& T_W_I, const PointsVi
   std::pair<int, double> search_result(-1, 0.0);
   std::pair<Eigen::Vector3d, Eigen::Matrix3d> loop_transform(
       Eigen::Vector3d::Zero(), Eigen::Matrix3d::Identity());
-  std::vector<std::pair<STD, STD>> loop_std_pair;
-  std_manager_->SearchLoop(stds_vec, search_result, loop_transform, loop_std_pair,
+  std_manager_->SearchLoop(stds_vec, search_result, loop_transform,
                            std_manager_->plane_cloud_vec_.back());
   std_manager_->AddSTDescs(stds_vec);
 
   if (!std_manager_->last_verified_candidates_.empty()) {
     int accepted_from = -1;
     int primary_tries = 0;
-    bool added_early_bridge = false;
+    int early_bridge_tries = 0;
     for (const auto& vc : std_manager_->last_verified_candidates_) {
-      const bool is_early_bridge = (accepted_from >= 0) && (vc.frame_id + 200 <= accepted_from);
-      if (accepted_from >= 0 && (!is_early_bridge || added_early_bridge)) {
-        continue;
+      if (accepted_from >= 0) {
+        if (vc.frame_id + 200 > accepted_from) continue;
+        if (early_bridge_tries >= 3) break;
+        ++early_bridge_tries;
+      } else {
+        if (primary_tries >= 3) break;
+        ++primary_tries;
       }
-      if (accepted_from < 0 && primary_tries >= 3) {
-        continue;
-      }
-      ++primary_tries;
       ++num_candidates_;
       const LoopCandidate candidate{vc.frame_id, current};
       const Eigen::Matrix3d& R_level_cand = keyframe_level_rotations_.at(candidate.from);
@@ -345,7 +355,6 @@ bool LoopCloser::addFrame(uint64_t stamp, const Transform& T_W_I, const PointsVi
       const double yaw_diff_rad = headingOf(vc.transform.second);
       LOG(I, "[resbie::pgo] Loop candidate found: from kf=" << candidate.from << " to kf=" << candidate.to
              << ", btc_score=" << vc.score
-             << ", sc_dist=" << (1.0 - vc.score)
              << ", yaw_diff=" << (yaw_diff_rad * 180.0 / M_PI) << " deg");
       if (const auto constraint = computeLoopConstraint(candidate, btc_seed)) {
         graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(X(candidate.from), X(candidate.to),
@@ -362,7 +371,7 @@ bool LoopCloser::addFrame(uint64_t stamp, const Transform& T_W_I, const PointsVi
         if (accepted_from < 0) {
           accepted_from = candidate.from;
         } else {
-          added_early_bridge = true;
+          break;
         }
       } else {
         ++num_rejected_;

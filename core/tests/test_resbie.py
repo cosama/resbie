@@ -272,7 +272,8 @@ def test_front_end_rejects_unknown_keys(tmp_path, extra):
 @pytest.mark.parametrize(
     "config",
     [{"enable": False}, {"loop_closure": {"keyframe_meter_gap": 2.0}}, {"knot_hz": 100},
-     {"max_speed_mps": 30.0}, {"use_sc_yaw_guess": False}, {"icp_max_correspondence_distance": 5.0}],
+     {"max_speed_mps": 30.0}, {"use_sc_yaw_guess": False}, {"sc_num_rings": 20},
+     {"icp_max_correspondence_distance": 5.0}],
 )
 def test_back_end_rejects_unknown_keys(config):
     with pytest.raises(ValueError):
@@ -309,7 +310,7 @@ def test_front_end_rejects_bad_ranges(tmp_path, lidar):
 
 @pytest.mark.parametrize(
     "config",
-    [{"acc_noise_std": -1.0}, {"sc_num_rings": 0}, {"icp_filter_size": -0.1},
+    [{"acc_noise_std": -1.0}, {"sc_max_radius": 0.0}, {"icp_filter_size": -0.1},
      {"keyframe_filter_size": 0.0}, {"loop_noise_cauchy_c": 0.0}, {"gyro_noise_std": [0.1, 0.1]}],
 )
 def test_back_end_rejects_bad_values(config):
@@ -338,7 +339,7 @@ def test_wrong_types_are_value_errors(tmp_path):
     with pytest.raises(ValueError):
         resbie.FrontEnd([_config(tmp_path), {"spline": {"knot_hz": "fast"}}])
     with pytest.raises(ValueError):
-        resbie.BackEnd({"sc_num_rings": "many"})
+        resbie.BackEnd({"sc_max_radius": "far"})
 
 
 def test_log_level_rejects_unknown_names():

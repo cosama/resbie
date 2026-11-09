@@ -21,15 +21,8 @@ inline constexpr const char* kLoopClosureKeys[] = {
     "keyframe_deg_gap",
     "keyframe_filter_size",
     "icp_filter_size",
-    "sc_num_rings",
-    "sc_num_sectors",
     "sc_max_radius",
-    "sc_lidar_height",
     "sc_num_exclude_recent",
-    "sc_num_candidates",
-    "sc_search_ratio",
-    "sc_dist_threshold",
-    "sc_tree_making_period",
     "loop_fitness_score_threshold",
     "loop_max_correction_z",
     "prior_noise_score",
@@ -66,16 +59,8 @@ inline bool loadLoopClosureConfig(const std::vector<std::string>& documents,
   ok &= ci::read(yaml, "keyframe_filter_size", c.keyframe_filter_size, Min::kPositive);
   ok &= ci::read(yaml, "icp_filter_size", c.icp_filter_size, Min::kPositive);
 
-  auto& sc = c.scan_context;
-  ok &= ci::read(yaml, "sc_num_rings", sc.num_rings, Min::kPositive);
-  ok &= ci::read(yaml, "sc_num_sectors", sc.num_sectors, Min::kPositive);
-  ok &= ci::read(yaml, "sc_max_radius", sc.max_radius, Min::kPositive);
-  ok &= ci::read(yaml, "sc_lidar_height", sc.lidar_height);
-  ok &= ci::read(yaml, "sc_num_exclude_recent", sc.num_exclude_recent, Min::kZero);
-  ok &= ci::read(yaml, "sc_num_candidates", sc.num_candidates, Min::kPositive);
-  ok &= ci::read(yaml, "sc_search_ratio", sc.search_ratio, Min::kPositive);
-  ok &= ci::read(yaml, "sc_dist_threshold", sc.dist_threshold, Min::kPositive);
-  ok &= ci::read(yaml, "sc_tree_making_period", sc.tree_making_period, Min::kPositive);
+  ok &= ci::read(yaml, "sc_max_radius", c.sc_max_radius, Min::kPositive);
+  ok &= ci::read(yaml, "sc_num_exclude_recent", c.sc_num_exclude_recent, Min::kZero);
 
   ok &= ci::read(yaml, "loop_fitness_score_threshold", c.loop_fitness_score_threshold, Min::kPositive);
   ok &= ci::read(yaml, "loop_max_correction_z", c.loop_max_correction_z, Min::kPositive);
